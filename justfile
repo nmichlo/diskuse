@@ -3,6 +3,12 @@ check:
     uvx --from pre-commit pre-commit run --all-files
     cargo test
     cargo deny check
+    cargo about generate --locked about.hbs | diff -u THIRD_PARTY_LICENSES.txt -
+
+# rewrite THIRD_PARTY_LICENSES.txt, after a dependency change. needs
+# cargo-about, see about.toml
+licenses:
+    cargo about generate --locked about.hbs > THIRD_PARTY_LICENSES.txt
 
 # benchmarks, see bench/README.md
 

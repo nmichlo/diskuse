@@ -35,11 +35,25 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # THIRD_PARTY_LICENSES.txt ships in every wheel and archive, so it must match
+  # Cargo.lock. regenerate it with `just licenses`.
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # a prebuilt binary, not a cargo install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      - run: cargo about generate --locked about.hbs | diff -u THIRD_PARTY_LICENSES.txt -
+
   # The branch-protection gate; see nmichlo/.github/actions/gate for why it
   # exists. `always()` is required, or the gate is skipped when what it guards
   # fails -- and a skipped required check counts as success.
   test:
-    needs: [rust, deny]
+    needs: [rust, deny, licenses]
     if: always()
     runs-on: ubuntu-latest
     steps:

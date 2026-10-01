@@ -1,0 +1,39 @@
+# The PyPI package: a wheel holding only the disksweep binary, for
+# `uvx disksweep` and `pipx install disksweep`. No Python code.
+
+[build-system]
+# 1.9.3: the first to put `license-files` in the sdist too
+requires = ["maturin>=1.9.3,<2"]
+build-backend = "maturin"
+
+[project]
+name = "disksweep"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-*", "THIRD_PARTY_LICENSES.txt"]
+# a bin wheel is `py3-none-<platform>`: no Python code runs
+requires-python = ">=3.8"
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: System :: Filesystems",
+]
+# from Cargo.toml. CI stamps its version from the release tag
+dynamic = ["version", "description"]
+
+[project.urls]
+Repository = "https://github.com/nmichlo/disksweep"
+Issues = "https://github.com/nmichlo/disksweep/issues"
+
+[tool.maturin]
+bindings = "bin"
+# here, not in Cargo's release profile, so local release builds keep symbols
+# for profiling
+strip = true
+
+# ruff reads `requires-python` above, which is for the wheel. bench/run.py is
+# the only Python here, a dev script that needs 3.10
+[tool.ruff]
+target-version = "py310"

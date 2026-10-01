@@ -7,6 +7,21 @@ A read-only disk usage browser for macOS and Linux, built for speed.
 disksweep never deletes, renames or writes your files. It can only show you
 where the space went. Deleting is done by hand, in Finder or your file manager.
 
+## Install
+
+Prebuilt for macOS and Linux, on x86_64 and arm64:
+
+```sh
+uvx disksweep scan .          # run once, without installing
+uv tool install disksweep
+pipx install disksweep
+cargo binstall disksweep      # prebuilt, from GitHub Releases
+cargo install disksweep       # builds from source
+```
+
+Or download a `.tar.gz` from
+[GitHub Releases](https://github.com/nmichlo/disksweep/releases).
+
 ## Status
 
 Pre-release. The commands so far:
@@ -90,6 +105,11 @@ volume and real path). The files contain directory names and the names of the
 largest files, so they are created with mode 0600, and the directory, if
 missing, with mode 0700. To clear the cache, delete the directory. This cache
 directory is the only place disksweep ever writes.
+
+## Benchmarks
+
+Results land before 0.1.0. The method is in
+[bench/README.md](https://github.com/nmichlo/disksweep/blob/main/bench/README.md).
 
 ## License
 

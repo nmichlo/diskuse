@@ -9,6 +9,18 @@ description = "Read-only disk usage browser for macOS and Linux, built for speed
 readme = "README.md"
 keywords = ["disk", "du", "disk-usage", "cli", "tui"]
 categories = ["command-line-utilities", "filesystem"]
+# what crates.io gets: the sources of every target, so it builds and tests.
+# bench/ and the repo tooling stay in git. the bench-gen example is kept, or
+# cargo warns that its target is missing.
+include = [
+    "/src",
+    "/tests",
+    "/examples",
+    "/README.md",
+    "/LICENSE-*",
+    "/THIRD_PARTY_LICENSES.txt",
+]
+
 
 [dependencies]
 boxcar = "0.2.14"

@@ -1,0 +1,70 @@
+name: release
+
+# NB: `targets`, `bindings`, `bin-archives` are inputs of release-rust.yaml that
+# exist only once nathan/release-rust-inputs is merged into nmichlo/.github.
+# until then this workflow fails at startup.
+
+# both triggers are required: a tag pushed with GITHUB_TOKEN does not start
+# another workflow, so the bump and the release have to live in one run. it is
+# `push` to main rather than a closed pull request because a PR from a fork gets
+# a read-only token, so its merge could never push the tag.
+on:
+  push: {branches: [main], tags: ['v*']}
+
+# least privilege: jobs that need more declare it themselves, and a job-level
+# `permissions:` replaces this one rather than adding to it.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # a reusable workflow cannot hold more permission than its caller. this one
+    # pushes tags and creates releases (`contents`), and publishes to crates.io
+    # over OIDC (`id-token`). omitting either fails the whole run at startup.
+    # the version comes from the tag: Cargo.toml's 0.0.0 is stamped at build time.
+    permissions:
+      contents: write
+      id-token: write
+    uses: nmichlo/.github/.github/workflows/release-rust.yaml@main
+    with:
+      package-name: disksweep
+      # a binary-only wheel (pyproject.toml), and per-target tarballs of the
+      # same binary on the GitHub release, for `cargo binstall`
+      bindings: bin
+      bin-archives: true
+      # no Windows: disksweep is macOS and Linux only
+      targets: >-
+        [
+          {"runs-on": "macos-15", "target": "aarch64"},
+          {"runs-on": "macos-15-intel", "target": "x86_64"},
+          {"runs-on": "ubuntu-latest", "target": "x86_64"},
+          {"runs-on": "ubuntu-latest", "target": "aarch64"}
+        ]
+    # no secrets: publishing is OIDC, and release-rust.yaml declares none.
+
+  # This job cannot live in the shared reusable workflow. PyPI matches the
+  # `job_workflow_ref` OIDC claim, which names the file a job is WRITTEN in,
+  # so a job inside release-rust.yaml can never match this repo's publisher:
+  # pypa/gh-action-pypi-publish#166. It downloads the `wheels-*` artifacts the
+  # reusable workflow uploaded.
+  #
+  # The filename is part of the claim, so the trusted publisher on PyPI (and on
+  # crates.io, which checks `workflow_ref`) must name this file exactly.
+  python-publish:
+    name: Publish to PyPI
+    needs: [release]
+    # empty when the merge asked for no release, so nothing was built
+    if: needs.release.outputs.version != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/disksweep
+    permissions:
+      id-token: write  # for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
