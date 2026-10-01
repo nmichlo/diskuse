@@ -1,21 +1,22 @@
 //! The full-screen browser: three columns, the parent dir, the current dir
 //! and the selected child, each largest first, like OmniDiskSweeper. A scan
 //! runs on its own thread meanwhile; a saved scan, if any, shows until the
-//! fresh one is done.
+//! fresh one is done. `d` lists the dirs the scan could not read instead.
 //!
 //! Subdirectories and their sizes come from the tree. Files are not in the
 //! tree, so a dir is listed from disk when first shown, and the listing is
 //! kept until another scan's tree is shown.
 
-use crate::report::{count_denied, format_size, largest_first, suffix};
-use crate::reveal::{self, Desktop};
+use crate::access::{reason, terminal_app};
+use crate::report::{format_size, largest_first, suffix};
+use crate::reveal::Desktop;
 use crate::scan::{ScanError, ScanOptions, scan_live};
 use crate::store::{CacheDir, Saved};
 use crate::sys::{self, Kind};
 use crate::tree::{ChildIndex, Progress, Record, Totals, Tree, join};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use std::collections::HashMap;
@@ -26,47 +27,28 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
-/// How often the view catches up with a running scan.
-const TICK: Duration = Duration::from_secs(1);
+const HELP: &str = "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  q quit";
+const PANEL_HELP: &str = "arrows/jk scroll  d close  q quit";
 
-const HELP: &str = "arrows/hjkl move  r reveal  o open  R rescan  / filter  q quit";
-
-/// Browses `root` full screen until the user quits. Shows the saved scan
-/// of `root` at once, if any, while a fresh scan runs, then saves that.
-pub fn browse(root: &Path) -> io::Result<()> {
-    // fail before taking over the terminal
-    drop(sys::open_root(root).map_err(io::Error::from)?);
-    let cache = CacheDir::from_env();
-    let saved = cache
-        .as_ref()
-        .ok()
-        .and_then(|c| c.load(root).ok().flatten());
-    let display = root.display().to_string();
-    let mut b = Browser::new(root, &display, Desktop::from_env(), saved, cache.ok());
-    b.scan();
-    // restores the terminal on panic too
-    let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut b);
-    ratatui::restore();
-    result
+/// What a browser takes from its environment, given so tests can fix it.
+#[derive(Clone)]
+pub struct Env {
+    pub desktop: Desktop,
+    /// The terminal app, named in Full Disk Access hints.
+    pub terminal: String,
+    /// Where a finished scan is saved, if anywhere.
+    pub cache: Option<CacheDir>,
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, b: &mut Browser) -> io::Result<()> {
-    let mut tick = Instant::now();
-    loop {
-        terminal.draw(|f| b.draw(f, SystemTime::now()))?;
-        if event::poll(TICK.saturating_sub(tick.elapsed()))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && b.key(key, &mut reveal::spawn).is_break()
-        {
-            return Ok(());
-        }
-        if tick.elapsed() >= TICK {
-            b.poll();
-            tick = Instant::now();
+impl Env {
+    /// The environment of this process.
+    pub fn from_env() -> Self {
+        Self {
+            desktop: Desktop::from_env(),
+            terminal: terminal_app(std::env::var("TERM_PROGRAM").ok().as_deref()),
+            cache: CacheDir::from_env().ok(),
         }
     }
 }
@@ -77,9 +59,9 @@ pub struct Browser {
     root: PathBuf,
     /// The root as the title shows it.
     display: String,
-    desktop: Desktop,
-    /// Where a finished scan is saved, if anywhere.
-    cache: Option<CacheDir>,
+    env: Env,
+    /// Bytes in use on the volume, when the root is a volume's root.
+    used: Option<u64>,
     /// `None` until the running scan has listed the root.
     view: Option<View>,
     scan: Option<Scan>,
@@ -106,6 +88,8 @@ pub struct Browser {
     typing: bool,
     /// Shown in the footer until the next key.
     message: Option<String>,
+    /// The first row of the denied list drawn, while it is shown.
+    panel: Option<usize>,
 }
 
 /// A tree as shown, with what drawing it needs.
@@ -113,7 +97,8 @@ struct View {
     tree: Tree,
     totals: Totals,
     index: ChildIndex,
-    denied: usize,
+    /// Path and record id of every denied dir, by path.
+    denied: Vec<(Vec<u8>, u32)>,
     status: Status,
 }
 
@@ -128,10 +113,15 @@ enum Status {
 
 impl View {
     fn new(tree: Tree, status: Status) -> Self {
+        let ids = 0..tree.len() as u32;
+        let mut denied: Vec<_> = (ids.filter(|&i| tree.record(i).flags & Record::DENIED != 0))
+            .map(|i| (tree.dir_path(i), i))
+            .collect();
+        denied.sort_unstable();
         Self {
             totals: tree.totals(),
             index: tree.child_index(),
-            denied: count_denied(&tree),
+            denied,
             tree,
             status,
         }
@@ -167,19 +157,20 @@ enum Item {
 impl Browser {
     /// Shows `saved`, if any, until [`Browser::scan`] and
     /// [`Browser::poll`] bring a fresh scan. `display` is the root as the
-    /// title shows it.
+    /// title shows it. `used` is the bytes in use on the volume, when
+    /// `root` is a volume's root, for the not accounted for line.
     pub fn new(
         root: &Path,
         display: &str,
-        desktop: Desktop,
+        env: Env,
         saved: Option<Saved>,
-        cache: Option<CacheDir>,
+        used: Option<u64>,
     ) -> Self {
         let mut b = Self {
             root: root.into(),
             display: display.into(),
-            desktop,
-            cache,
+            env,
+            used,
             view: None,
             scan: None,
             files: HashMap::new(),
@@ -193,6 +184,7 @@ impl Browser {
             filter: String::new(),
             typing: false,
             message: None,
+            panel: None,
         };
         if let Some(saved) = saved {
             b.show(View::new(saved.tree, Status::Saved(saved.modified)));
@@ -232,7 +224,7 @@ impl Browser {
             };
             match done {
                 Ok(tree) => {
-                    if let Some(cache) = &self.cache
+                    if let Some(cache) = &self.env.cache
                         && let Err(e) = cache.save(&self.root, &tree, false)
                     {
                         self.message = Some(format!("warning: scan not saved: {e}"));
@@ -264,6 +256,17 @@ impl Browser {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return ControlFlow::Break(());
         }
+        if let Some(offset) = &mut self.panel {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => *offset = offset.saturating_sub(1),
+                // clamped when drawn
+                KeyCode::Down | KeyCode::Char('j') => *offset += 1,
+                KeyCode::Char('d') | KeyCode::Esc => self.panel = None,
+                KeyCode::Char('q') => return ControlFlow::Break(()),
+                _ => {}
+            }
+            return ControlFlow::Continue(());
+        }
         match key.code {
             KeyCode::Up => self.step(false),
             KeyCode::Down => self.step(true),
@@ -291,6 +294,7 @@ impl Browser {
                 self.scan();
             }
             KeyCode::Char('/') => self.typing = true,
+            KeyCode::Char('d') => self.panel = Some(0),
             KeyCode::Char('q') | KeyCode::Esc => return ControlFlow::Break(()),
             _ => {}
         }
@@ -298,31 +302,48 @@ impl Browser {
         ControlFlow::Continue(())
     }
 
-    /// Draws the title, the three columns and the footer. `now` dates a
-    /// saved scan.
+    /// The root as given.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether the root is shown with nothing open over it, so going up
+    /// would leave the browser.
+    pub(crate) fn at_root(&self) -> bool {
+        self.trail.is_empty() && !self.typing && self.panel.is_none()
+    }
+
+    /// Draws the title, the three columns or the denied list, and the
+    /// footer. `now` dates a saved scan.
     pub fn draw(&mut self, frame: &mut Frame, now: SystemTime) {
+        let footer: Vec<String> = self
+            .unaccounted()
+            .into_iter()
+            .chain([self.footer()])
+            .collect();
         let [top, body, bottom] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(footer.len() as u16),
         ])
         .areas(frame.area());
         let [left, mid, right] = Layout::horizontal([Constraint::Fill(1); 3])
             .spacing(1)
             .areas(body);
-        let (title, footer, d) = (self.title(now), self.footer(), self.dir());
+        let (title, d) = (self.title(now), self.dir());
         let buf = frame.buffer_mut();
         buf.set_stringn(top.x, top.y, title, top.width.into(), Style::new());
-        buf.set_stringn(
-            bottom.x,
-            bottom.y,
-            footer,
-            bottom.width.into(),
-            Style::new(),
-        );
+        for (y, line) in (bottom.y..).zip(footer) {
+            buf.set_stringn(bottom.x, y, line, bottom.width.into(), Style::new());
+        }
         let Some(view) = &self.view else {
             return;
         };
+        if let Some(offset) = &mut self.panel {
+            let terminal = &self.env.terminal;
+            *offset = panel(buf, body, view, terminal, *offset);
+            return;
+        }
         if let [.., parent, _] = self.dirs[..] {
             let rows = &self.rows[&parent];
             let at = rows.iter().position(|r| r.item == Item::Dir(d)).unwrap();
@@ -507,7 +528,7 @@ impl Browser {
         let mut path = view.tree.dir_path(self.dir());
         join(&mut path, name);
         let path = PathBuf::from(OsString::from_vec(path));
-        self.message = match self.desktop.command(&path, reveal) {
+        self.message = match self.env.desktop.command(&path, reveal) {
             Some((program, args)) => run(program, &args)
                 .err()
                 .map(|e| format!("cannot run {program}: {e}")),
@@ -521,7 +542,7 @@ impl Browser {
             return format!("{root}  scanning...");
         };
         let total = format_size(view.totals.size[0]);
-        let partial = match view.denied {
+        let partial = match view.denied.len() {
             0 => String::new(),
             n => format!("  (partial: {n} denied)"),
         };
@@ -538,9 +559,22 @@ impl Browser {
     fn footer(&self) -> String {
         match &self.message {
             Some(message) => message.clone(),
+            None if self.panel.is_some() => PANEL_HELP.into(),
             None if self.typing || !self.filter.is_empty() => format!("/{}", self.filter),
             None => HELP.into(),
         }
+    }
+
+    /// The bytes the volume uses beyond those a finished scan of its root
+    /// found: snapshots, purgeable space, denied dirs. None if the scan
+    /// found more, which clones that share blocks can cause.
+    fn unaccounted(&self) -> Option<String> {
+        let view = self.view.as_ref().filter(|v| v.status == Status::Done)?;
+        let lost = self
+            .used?
+            .checked_sub(view.totals.size[0])
+            .filter(|&n| n > 0)?;
+        Some(format!("not accounted for: {}", format_size(lost)))
     }
 }
 
@@ -597,8 +631,13 @@ fn column(
         let text = match row.item {
             Item::Dir(k) => {
                 let flags = view.totals.flags[k as usize];
-                let marker = suffix(view.tree.record(k), flags);
-                format!("{size:>10}  {label}/{marker}")
+                // something below was denied, so the size is a lower bound
+                let plus = match flags & Record::PARTIAL {
+                    0 => ' ',
+                    _ => '+',
+                };
+                let marker = suffix(view.tree.record(k), flags & !Record::PARTIAL);
+                format!("{size:>10}{plus} {label}/{marker}")
             }
             Item::File(_) => format!("{size:>10}  {label}"),
         };
@@ -616,6 +655,26 @@ fn column(
         );
         buf.set_stringn(area.x, y, text, area.width.into(), style);
     }
+}
+
+/// Draws the denied dirs of `view` from row `offset`, each with why it
+/// could not be read. Returns `offset`, clamped so the last row is drawn
+/// as low as it can be.
+fn panel(buf: &mut Buffer, area: Rect, view: &View, terminal: &str, offset: usize) -> usize {
+    let head = match view.denied.len() {
+        0 => "every directory could be read".into(),
+        n => format!("{n} directories could not be read, so their contents are not counted:"),
+    };
+    buf.set_stringn(area.x, area.y, head, area.width.into(), Style::new());
+    let height = usize::from(area.height.saturating_sub(1));
+    let offset = offset.min(view.denied.len().saturating_sub(height));
+    let lines = (area.y + 1..area.bottom()).zip(&view.denied[offset..]);
+    for (y, (path, id)) in lines {
+        let why = reason(view.tree.record(*id), terminal);
+        let text = format!("{}  {why}", String::from_utf8_lossy(path));
+        buf.set_stringn(area.x, y, text, area.width.into(), Style::new());
+    }
+    offset
 }
 
 /// The first row to draw, moved from `offset` as little as possible so
@@ -667,7 +726,12 @@ mod tests {
     fn a_running_scan_shows_lower_bounds() {
         let dir = tempfile::tempdir().unwrap();
         let tree = Builder::new(dir.path().as_os_str().as_bytes());
-        let mut b = Browser::new(dir.path(), "/scan", Desktop::None, None, None);
+        let env = Env {
+            desktop: Desktop::None,
+            terminal: "Terminal".into(),
+            cache: None,
+        };
+        let mut b = Browser::new(dir.path(), "/scan", env, None, None);
         assert!(tree.progress().snapshot().is_none());
         assert_eq!(draw(&mut b), screen("/scan  scanning...", &[]));
 

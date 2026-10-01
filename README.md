@@ -27,6 +27,7 @@ Or download a `.tar.gz` from
 Pre-release. The commands so far:
 
 ```sh
+disksweep
 disksweep <path>
 disksweep scan <path> [--threads N] [-r] [--json [--depth N]] [--top N]
 disksweep show <path> [-r] [--json [--depth N]] [--top N]
@@ -68,6 +69,22 @@ as `scan` printed it with the same flags. `show -r` needs a scan made with
 
 ## Browse
 
+`disksweep` with no path lists the volumes, one per row:
+
+```text
+volumes
+ 800.6 GiB used of  926.4 GiB   125.7 GiB free  /
+  10.0 GiB used of   64.0 GiB    54.0 GiB free  /Volumes/USB
+```
+
+Enter browses the selected volume. Esc, or Backspace at its top, goes back to
+the list. Hidden and pseudo filesystems are left out: on macOS every
+`nobrowse` mount, like `/dev` and the system's helper volumes; on Linux every
+mount of size 0, like `/proc`, and `tmpfs`, `devtmpfs`, `overlay`, `squashfs`
+and `efivarfs`. `/` is always listed. On macOS it stands for the whole main
+disk: a scan of `/` also covers the hidden Data volume, where your files are,
+and the used bytes of an APFS volume are those of its whole container.
+
 `disksweep <path>` browses `<path>` full screen, in three columns: the parent
 directory, the current one, and a preview of the selected item. Each lists
 directories and files together, largest first.
@@ -94,12 +111,43 @@ the sizes grow, about once a second, until the scan is done and saved. If
 | `o`                  | Open the selected item                                 |
 | `R`                  | Rescan all of `<path>`                                 |
 | `/`                  | Filter the current column by text; Esc clears          |
+| `d`                  | List the directories that could not be read, and why   |
 | `q`, Esc             | Quit                                                   |
 
 Reveal and open run `open -R` and `open` on macOS, and `xdg-open` on Linux,
 which opens the folder of the item for reveal. Over SSH, or on Linux without
 a display, they run nothing and show the full path instead. Only all of
 `<path>` can be rescanned for now, not a single directory.
+
+A directory that could not be read is marked `(denied: EACCES)`, and every
+directory above it has a `+` after its size, since the size is then a lower
+bound:
+
+```text
+  36.0 KiB+ a/
+   4.0 KiB  locked/ (denied: EACCES)
+```
+
+Once a scan of a volume's root is done, a line under the columns says how
+many of the volume's used bytes the scan did not find, if any:
+`not accounted for: 41.2 GiB`. On macOS these are mostly snapshots,
+purgeable space, the system's hidden volumes and denied directories.
+
+## Full Disk Access
+
+macOS keeps some folders from every app without Full Disk Access: Mail,
+Messages, Safari, Time Machine and other apps' data. A scan without it lists
+them as denied, with `needs Full Disk Access for <your terminal>` in the `d`
+list. `EACCES` instead means plain Unix permissions; `sudo` can read those.
+
+Before its first scan of a volume, or of a path that holds or is in your home
+directory, disksweep reads `~/Desktop`, `~/Documents` and `~/Downloads` once,
+so any macOS popups asking for them appear together, before the scan. Then it
+tries a folder only Full Disk Access can read. If that fails, it says which
+terminal app needs access, and `o` opens the settings pane. To grant it, turn
+on your terminal app in System Settings > Privacy & Security > Full Disk
+Access, then quit and reopen it. `c` scans without it. disksweep never asks
+for `sudo`.
 
 ## JSON
 

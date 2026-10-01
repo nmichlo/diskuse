@@ -81,7 +81,7 @@ pub(crate) fn largest_files(tree: &Tree, n: usize) -> Vec<(u64, Vec<u8>)> {
 }
 
 /// How many directories could not be read.
-pub(crate) fn count_denied(tree: &Tree) -> usize {
+fn count_denied(tree: &Tree) -> usize {
     tree.records
         .iter()
         .filter(|r| r.flags & Record::DENIED != 0)

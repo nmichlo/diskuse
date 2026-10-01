@@ -35,6 +35,7 @@ const RECORD_LEN: usize = 32;
 
 /// The directory saved scans live in. Only built from the environment, so
 /// the store cannot write anywhere else.
+#[derive(Clone)]
 pub struct CacheDir(PathBuf);
 
 /// A scan read back by [`CacheDir::load`].

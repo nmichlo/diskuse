@@ -4,14 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(
-    version,
-    about,
-    args_conflicts_with_subcommands = true,
-    arg_required_else_help = true
-)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
-    /// Browse PATH full screen while it is scanned
+    /// Browse PATH full screen while it is scanned. Without PATH, pick a
+    /// volume to browse first.
     path: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -94,16 +90,19 @@ fn main() -> ExitCode {
             _,
         ) => scan(&path, threads, reader, &output),
         (Some(Command::Show { path, output }), _) => show(&path, &output),
-        // clap requires a path or a subcommand
-        (None, path) => browse(&path.unwrap()),
+        (None, path) => browse(path.as_deref()),
     }
 }
 
-fn browse(path: &Path) -> ExitCode {
-    match disksweep::browse(path) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+fn browse(path: Option<&Path>) -> ExitCode {
+    match (disksweep::browse(path), path) {
+        (Ok(()), _) => ExitCode::SUCCESS,
+        (Err(e), Some(path)) => {
             eprintln!("disksweep: {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
+        (Err(e), None) => {
+            eprintln!("disksweep: cannot list volumes: {e}");
             ExitCode::FAILURE
         }
     }

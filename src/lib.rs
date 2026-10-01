@@ -5,6 +5,8 @@
 
 #![deny(unsafe_code)]
 
+mod access;
+mod app;
 mod browse;
 mod json;
 mod report;
@@ -13,10 +15,14 @@ mod scan;
 mod store;
 mod sys;
 mod tree;
+mod volumes;
 
-pub use browse::{Browser, browse};
+pub use access::FullDiskAccess;
+pub use app::{App, Preflight, browse};
+pub use browse::{Browser, Env};
 pub use json::json;
 pub use report::report;
 pub use scan::{Reader, ScanError, ScanOptions, scan, scan_live};
 pub use store::{CacheDir, Saved};
 pub use tree::{ChildIndex, LARGEST, LargeFile, Progress, Record, Totals, Tree};
+pub use volumes::{Mount, mounts};

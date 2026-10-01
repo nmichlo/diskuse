@@ -3,15 +3,19 @@
 //! Directory readers live in their own files and all yield [`Entry`].
 //! [`read_dir`] picks the fastest one for the OS.
 
+#[cfg(not(target_os = "macos"))]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 mod portable;
 
+use crate::volumes::Mount;
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{FileType, OFlags};
 use rustix::io::{Errno, Result};
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use std::ffi::CStr;
+use std::io;
 use std::path::Path;
 
 /// The flags of every open: read-only, directories only, never through a
@@ -100,6 +104,15 @@ pub fn volume_id(path: &Path) -> Result<u128> {
     return macos::volume_uuid(path);
     #[cfg(not(target_os = "macos"))]
     Ok(u128::from(rustix::fs::statvfs(path)?.f_fsid))
+}
+
+/// Every mounted filesystem: `getfsstat` on macOS, `/proc/self/mountinfo`
+/// elsewhere.
+pub fn mounts() -> io::Result<Vec<Mount>> {
+    #[cfg(target_os = "macos")]
+    return macos::mounts();
+    #[cfg(not(target_os = "macos"))]
+    linux::mounts()
 }
 
 /// Stops this process from downloading iCloud placeholder files while it

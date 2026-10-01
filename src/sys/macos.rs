@@ -8,12 +8,13 @@
 #![allow(unsafe_code)]
 
 use super::{Entry, Kind, dir_stat, portable};
+use crate::volumes::Mount;
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::io::{Errno, Result};
 use std::cell::RefCell;
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, CString, OsString, c_char, c_int};
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 // Not in the libc crate.
@@ -274,6 +275,47 @@ pub fn volume_uuid(path: &Path) -> Result<u128> {
         20 => u128::from_be_bytes(buf[4..].try_into().unwrap()),
         _ => 0,
     })
+}
+
+/// Every mount, from the kernel's cached sizes (`MNT_NOWAIT`), so a hung
+/// network mount cannot block the list.
+pub fn mounts() -> io::Result<Vec<Mount>> {
+    // SAFETY: a null buffer only asks for the count.
+    let n = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // room for a few mounted between the two calls
+    let mut buf: Vec<libc::statfs> = Vec::with_capacity(n as usize + 8);
+    let size = c_int::try_from(buf.capacity() * size_of::<libc::statfs>()).unwrap();
+    // SAFETY: `buf` has room for `size` bytes of `statfs` entries.
+    let n = unsafe { libc::getfsstat(buf.as_mut_ptr(), size, libc::MNT_NOWAIT) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: getfsstat filled the first `n` entries, at most the capacity.
+    unsafe { buf.set_len(n as usize) };
+    let mounts = buf.iter().map(|s| {
+        let block = u64::from(s.f_bsize);
+        Mount {
+            point: OsString::from_vec(c_str(&s.f_mntonname)).into(),
+            fs: String::from_utf8_lossy(&c_str(&s.f_fstypename)).into(),
+            hidden: s.f_flags & libc::MNT_DONTBROWSE as u32 != 0,
+            total: s.f_blocks * block,
+            used: s.f_blocks.saturating_sub(s.f_bfree) * block,
+            free: s.f_bavail * block,
+        }
+    });
+    Ok(mounts.collect())
+}
+
+/// The bytes of a NUL-terminated `char` array, without the NUL.
+fn c_str(chars: &[c_char]) -> Vec<u8> {
+    chars
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect()
 }
 
 pub fn keep_placeholders_remote() {
