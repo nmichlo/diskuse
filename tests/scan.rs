@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{fixture, own_bytes};
+use common::{append, file, fixture, own_bytes};
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, openat, renameat, unlinkat};
 use std::fs::{self, File};
@@ -302,4 +302,120 @@ fn reclaimable_excludes_blocks_shared_with_a_clone() {
     ]
     .concat();
     assert_eq!(scan(root, &["-r"]), expected);
+}
+
+/// Creates `a/b/new` (12288) in the fixture, deletes `a/f1`, and grows
+/// `big/f` by 4096 in place.
+fn change(f: &common::Fixture) {
+    let root = f.dir.path();
+    file(&root.join("a/b/new"), 12288);
+    fs::remove_file(root.join("a/f1")).unwrap();
+    // no dir entry changes, which a replay of dir changes misses
+    append(&root.join("big/f"), 4096);
+}
+
+/// The `--json` output of the fixture after [`change`].
+fn changed_json(f: &common::Fixture) -> String {
+    let d = f.dir_bytes;
+    let big = 1572864 + 4096 + d;
+    let a = 8192 + 8192 + 12288 + 12288 + 3 * d;
+    let a_own = 8192 + d;
+    let own = 8192 + f.sym_bytes + d;
+    let mut kids = vec![leaf("big", big, big, ""), leaf("empty", d, d, "")];
+    match rustix::process::geteuid().is_root() {
+        true => {
+            kids.insert(1, leaf("a", a, a_own, ""));
+            root(f.dir.path(), own + big + a + d, own, "", &kids)
+        }
+        false => {
+            let partial = r#","partial":true"#;
+            kids.insert(1, leaf("a", a + d, a_own, partial));
+            kids.push(leaf("locked", d, d, r#","denied":"EACCES""#));
+            root(f.dir.path(), own + big + a + 3 * d, own, partial, &kids)
+        }
+    }
+}
+
+/// Changes made while disksweep is not running. On macOS the second scan
+/// replays them onto the saved one; elsewhere it is a full scan.
+#[test]
+fn scan_brings_a_saved_scan_up_to_date() {
+    let f = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
+    change(&f);
+    let updated = ok(disksweep(cache.path(), "scan", f.dir.path(), &["--json"]));
+    let full = ok(disksweep(
+        cache.path(),
+        "scan",
+        f.dir.path(),
+        &["--json", "--full"],
+    ));
+    let expected = changed_json(&f);
+    assert_eq!([updated, full], [expected.clone(), expected]);
+}
+
+/// A saved scan that cannot be brought up to date is scanned again. Had it
+/// been used, the changes since would be missing.
+#[test]
+fn scan_is_full_without_a_usable_saved_scan() {
+    let corruptions: [fn(&mut Vec<u8>); 3] = [
+        // no record of changes to replay from
+        |bytes| bytes[6..14].fill(0),
+        |bytes| bytes[4] += 1,
+        |bytes| {
+            bytes.pop();
+        },
+    ];
+    for (i, corrupt) in corruptions.into_iter().enumerate() {
+        let f = fixture();
+        let cache = tempfile::tempdir().unwrap();
+        ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
+        let [saved] = &saved(cache.path())[..] else {
+            panic!("not one saved file");
+        };
+        let mut bytes = fs::read(saved).unwrap();
+        corrupt(&mut bytes);
+        fs::write(saved, bytes).unwrap();
+        change(&f);
+        let out = ok(disksweep(cache.path(), "scan", f.dir.path(), &["--json"]));
+        assert_eq!(out, changed_json(&f), "corruption {i}");
+    }
+}
+
+/// ```text
+/// root/
+///   a/f          4096
+///   a/b/g        8192   removed with b/
+///   a/b/c/h      4096
+/// ```
+///
+/// then `new/f` (4096) and `new/sub/g` (8192) created.
+#[cfg(target_os = "macos")]
+#[test]
+fn update_adds_new_subdirs_and_drops_removed_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    fs::create_dir_all(path.join("a/b/c")).unwrap();
+    file(&path.join("a/f"), 4096);
+    file(&path.join("a/b/g"), 8192);
+    file(&path.join("a/b/c/h"), 4096);
+    let opts = disksweep::ScanOptions::default();
+    let tree = disksweep::scan(path, &opts).unwrap();
+    fs::remove_dir_all(path.join("a/b")).unwrap();
+    fs::create_dir_all(path.join("new/sub")).unwrap();
+    file(&path.join("new/f"), 4096);
+    file(&path.join("new/sub/g"), 8192);
+
+    let tree = disksweep::update(path, tree, &opts, None).expect("macOS recorded the changes");
+    let d = own_bytes(path);
+    let sub = leaf("sub", 8192 + d, 8192 + d, r#","children":[]"#);
+    let new = format!(
+        r#"{{"name":"new","size":{},"own":{},"children":[{sub}]}}"#,
+        12288 + 2 * d,
+        4096 + d
+    );
+    let a = leaf("a", 4096 + d, 4096 + d, r#","children":[]"#);
+    let expected = root(path, 16384 + 4 * d, d, "", &[new, a]);
+    assert_eq!(disksweep::json(&tree, false, 3, None), expected);
 }

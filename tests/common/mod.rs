@@ -24,6 +24,16 @@ pub fn file(path: &Path, len: usize) {
     );
 }
 
+/// Appends `len` bytes to the file at `path` in place: no entry of its
+/// directory changes.
+pub fn append(path: &Path, len: usize) {
+    let before = fs::metadata(path).unwrap().blocks() * 512;
+    let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(&vec![0xcd; len]).unwrap();
+    let allocated = fs::metadata(path).unwrap().blocks() * 512;
+    assert_eq!(allocated, before + len as u64);
+}
+
 /// Allocated bytes of a directory or symlink itself (APFS: 0, ext4: 4096).
 pub fn own_bytes(path: &Path) -> u64 {
     fs::symlink_metadata(path).unwrap().blocks() * 512

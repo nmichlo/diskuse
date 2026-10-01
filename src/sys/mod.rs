@@ -1,8 +1,11 @@
 //! The only module that makes raw OS calls. Every open is read-only.
 //!
 //! Directory readers live in their own files and all yield [`Entry`].
-//! [`read_dir`] picks the fastest one for the OS.
+//! [`read_dir`] picks the fastest one for the OS. [`watch`] reports
+//! changes, on macOS only.
 
+#[cfg(target_os = "macos")]
+mod fsevents;
 #[cfg(not(target_os = "macos"))]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -11,12 +14,13 @@ mod portable;
 
 use crate::volumes::Mount;
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
-use rustix::fs::{FileType, OFlags};
+use rustix::fs::{AtFlags, FileType, OFlags, Stat};
 use rustix::io::{Errno, Result};
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use std::ffi::CStr;
 use std::io;
 use std::path::Path;
+use std::sync::mpsc::Sender;
 
 /// The flags of every open: read-only, directories only, never through a
 /// symlink, never inherited by a child process.
@@ -75,11 +79,84 @@ pub fn open_child(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd> {
 }
 
 pub fn dir_stat(fd: BorrowedFd<'_>) -> Result<DirStat> {
-    let st = rustix::fs::fstat(fd)?;
-    Ok(DirStat {
-        dev: st.st_dev as u64,
-        bytes: st.st_blocks as u64 * 512,
-    })
+    rustix::fs::fstat(fd).map(DirStat::of)
+}
+
+/// [`dir_stat`] of `name` in the open dir `parent`, by `lstat`, so of a
+/// dir that cannot be opened too.
+pub fn child_stat(parent: BorrowedFd<'_>, name: &CStr) -> Result<DirStat> {
+    rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map(DirStat::of)
+}
+
+impl DirStat {
+    // the fields are `u64` on Linux, signed on macOS
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_cast))]
+    fn of(st: Stat) -> Self {
+        Self {
+            dev: st.st_dev as u64,
+            bytes: st.st_blocks as u64 * 512,
+        }
+    }
+}
+
+/// One change the OS recorded, from [`watch`].
+pub struct Event {
+    /// Increases with every change on the system.
+    pub id: u64,
+    pub what: What,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum What {
+    /// Something at this absolute path was created, removed, renamed or
+    /// written to.
+    Changed(Box<[u8]>),
+    /// The OS merged the changes below this path: list all of it again.
+    Rescan(Box<[u8]>),
+    /// The end of the changes recorded before the watch started. Later ones
+    /// are live.
+    HistoryDone,
+    /// Changes were lost, or the watched path itself moved: only a full
+    /// scan is right.
+    Lost,
+}
+
+/// Watches a path until dropped.
+#[cfg(target_os = "macos")]
+pub use fsevents::Stream;
+#[cfg(not(target_os = "macos"))]
+pub enum Stream {}
+
+/// Sends the changes below `path`, an absolute path with no symlinks, with
+/// event ids after `since`, first the recorded ones, then live ones, in
+/// batches to `tx`. `None` where the OS keeps no record of changes, so on
+/// Linux always.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn watch(path: &CStr, since: u64, tx: Sender<Vec<Event>>) -> Option<Stream> {
+    #[cfg(target_os = "macos")]
+    return fsevents::Stream::start(path, since, tx);
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+/// The id of the latest change on the system, for [`watch`], or 0 where
+/// the OS keeps no record of changes.
+pub fn event_id() -> u64 {
+    #[cfg(target_os = "macos")]
+    return fsevents::current_event_id();
+    #[cfg(not(target_os = "macos"))]
+    0
+}
+
+/// An id of the record of changes of device `dev`, or 0 if it keeps none.
+/// When it differs from an earlier one, the record was purged, erased or
+/// wrapped, so earlier event ids mean nothing in it.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn event_store(dev: u64) -> u128 {
+    #[cfg(target_os = "macos")]
+    return fsevents::store_uuid(dev);
+    #[cfg(not(target_os = "macos"))]
+    0
 }
 
 /// Whether `path` is still there, by one `lstat`, which never follows a

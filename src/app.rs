@@ -14,7 +14,8 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-/// How often the view catches up with a running scan.
+/// How often the view catches up with a running scan or with changes on
+/// disk.
 const TICK: Duration = Duration::from_secs(1);
 
 /// Lists the folders macOS asks about and probes for Full Disk Access:
@@ -141,8 +142,13 @@ impl App {
         app
     }
 
-    /// Catches up with a running scan. Returns whether one still runs.
+    /// Catches up with a running scan, or with changes on disk. Returns
+    /// whether a scan still runs.
     pub fn poll(&mut self) -> bool {
+        // a parked browser keeps up too, so changes do not pile up
+        if let Some(b) = &mut self.parked {
+            b.poll();
+        }
         match &mut self.screen {
             Screen::Browse(b) => b.poll(),
             _ => false,

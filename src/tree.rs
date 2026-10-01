@@ -2,6 +2,10 @@
 //! child's index is always greater than its parent's. Files are not stored;
 //! their bytes are folded into their directory's `own`. Only the
 //! [`LARGEST`] largest files are kept, by name.
+//!
+//! An update ([`crate::update`]) appends the dirs new since, so the order
+//! holds, and flags the ones gone [`Record::REMOVED`] rather than moving
+//! any record. A full scan starts afresh.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -18,7 +22,8 @@ pub struct Record {
     pub parent: u32,
     /// Id for [`Tree::name`].
     pub name: u32,
-    /// [`Record::DENIED`] and [`Record::OTHER_DEVICE`] bits.
+    /// [`Record::DENIED`], [`Record::OTHER_DEVICE`] and [`Record::REMOVED`]
+    /// bits.
     pub flags: u32,
     /// The errno of a [`Record::DENIED`] directory, else 0.
     pub errno: u16,
@@ -38,6 +43,9 @@ impl Record {
     pub const OTHER_DEVICE: u32 = 1 << 1;
     /// Only in [`Totals::flags`]: some descendant is [`Record::DENIED`].
     pub const PARTIAL: u32 = 1 << 2;
+    /// Gone since the scan, like everything below it. Its `own` is 0, and
+    /// [`Tree::child_index`] leaves it out. No other bit is set.
+    pub const REMOVED: u32 = 1 << 3;
 }
 
 /// Per-record values that depend on descendants.
@@ -79,6 +87,20 @@ pub struct LargeFile {
 /// more.
 pub(crate) type Names = Arc<boxcar::Vec<Box<[u8]>>>;
 
+/// The record id of the dir that counts each multiply-linked file, by
+/// `(dev, ino)`, so it is counted once, and once again after that dir is
+/// listed again.
+pub(crate) type Links = HashMap<(u64, u64), u32>;
+
+/// Where a tree stands in the OS's record of changes: it has every change
+/// up to event `id` of the record `store` ([`crate::sys::event_store`]).
+/// Zeros where the OS keeps no record, which no update can start from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Since {
+    pub id: u64,
+    pub store: u128,
+}
+
 #[derive(Debug)]
 pub struct Tree {
     pub(crate) records: Vec<Record>,
@@ -86,6 +108,8 @@ pub struct Tree {
     pub(crate) names: Names,
     /// In no particular order.
     pub(crate) largest: Vec<LargeFile>,
+    pub(crate) links: Links,
+    pub(crate) since: Since,
 }
 
 impl Tree {
@@ -157,23 +181,105 @@ impl Tree {
         }
     }
 
+    /// The children of every record not [`Record::REMOVED`].
     pub fn child_index(&self) -> ChildIndex {
         let n = self.records.len();
+        let there = |r: &&Record| r.flags & Record::REMOVED == 0;
         let mut start = vec![0u32; n + 1];
-        for r in &self.records[1..] {
+        for r in self.records[1..].iter().filter(there) {
             start[r.parent as usize + 1] += 1;
         }
         for i in 1..=n {
             start[i] += start[i - 1];
         }
         let mut next = start.clone();
-        let mut kids = vec![0u32; n.saturating_sub(1)];
+        let mut kids = vec![0u32; start[n] as usize];
         for (i, r) in self.records.iter().enumerate().skip(1) {
-            let slot = &mut next[r.parent as usize];
-            kids[*slot as usize] = i as u32;
-            *slot += 1;
+            if there(&r) {
+                let slot = &mut next[r.parent as usize];
+                kids[*slot as usize] = i as u32;
+                *slot += 1;
+            }
         }
         ChildIndex { start, kids }
+    }
+
+    /// Whether `id` or a dir above it is [`Record::REMOVED`].
+    pub(crate) fn gone(&self, id: u32) -> bool {
+        let mut i = id;
+        loop {
+            let r = &self.records[i as usize];
+            if r.flags & Record::REMOVED != 0 {
+                return true;
+            }
+            if i == 0 {
+                return false;
+            }
+            i = r.parent;
+        }
+    }
+
+    /// Flags `id` [`Record::REMOVED`]. [`Tree::prune`] removes what is
+    /// below it.
+    pub(crate) fn remove(&mut self, id: u32) {
+        self.records[id as usize] = Record {
+            flags: Record::REMOVED,
+            errno: 0,
+            own: 0,
+            own_private: 0,
+            ..self.records[id as usize]
+        };
+    }
+
+    /// Removes every record below a removed one, and the links and largest
+    /// files of removed records. One forward pass, as parents come first.
+    pub(crate) fn prune(&mut self) {
+        for i in 1..self.records.len() {
+            let parent = self.records[i].parent as usize;
+            if self.records[parent].flags & Record::REMOVED != 0 {
+                self.remove(i as u32);
+            }
+        }
+        let removed = |id: u32| self.records[id as usize].flags & Record::REMOVED != 0;
+        self.links.retain(|_, &mut dir| !removed(dir));
+        self.largest.retain(|f| !removed(f.dir));
+    }
+
+    /// Appends a name, without looking for an equal one, which would need
+    /// a map of every name.
+    pub(crate) fn push_name(&mut self, name: &[u8]) -> u32 {
+        u32::try_from(self.names.push(name.into())).expect("over 2^32 names")
+    }
+
+    /// Appends `sub`, a scan of a new subdirectory of `parent`, whose
+    /// [`Tree::links`] ids already count from [`Tree::len`].
+    pub(crate) fn graft(&mut self, parent: u32, sub: Tree) {
+        let base = u32::try_from(self.records.len()).expect("over 2^32 directories");
+        let names = u32::try_from(self.names.count()).expect("over 2^32 names");
+        // every name, the root's too: it is the subdirectory's
+        for (_, name) in sub.names.iter() {
+            self.names.push(name.clone());
+        }
+        let records = sub.records.iter().enumerate().map(|(i, r)| Record {
+            parent: if i == 0 { parent } else { r.parent + base },
+            name: r.name + names,
+            ..*r
+        });
+        self.records.extend(records);
+        self.offer(sub.largest.into_iter().map(|f| LargeFile {
+            dir: f.dir + base,
+            ..f
+        }));
+    }
+
+    /// Adds `files` to the largest files, keeping the [`LARGEST`] largest.
+    pub(crate) fn offer(&mut self, files: impl IntoIterator<Item = LargeFile>) {
+        self.largest.extend(files);
+        if self.largest.len() > LARGEST {
+            self.largest
+                .select_nth_unstable_by(LARGEST, |a, b| b.cmp(a));
+            self.largest.truncate(LARGEST);
+        }
     }
 }
 
@@ -226,6 +332,8 @@ impl Progress {
             records,
             names: Arc::clone(&self.names),
             largest,
+            links: Links::new(),
+            since: Since::default(),
         })
     }
 }
@@ -312,7 +420,7 @@ impl Builder {
         }
     }
 
-    pub fn finish(self) -> Tree {
+    pub fn finish(self, links: Links, since: Since) -> Tree {
         Tree {
             // a copy, as a `Progress` may still share the records
             records: self.records.iter().map(|(_, r)| *r).collect(),
@@ -322,6 +430,8 @@ impl Builder {
                 .into_iter()
                 .map(|Reverse(f)| f)
                 .collect(),
+            links,
+            since,
         }
     }
 }

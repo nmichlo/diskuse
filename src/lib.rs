@@ -17,6 +17,7 @@ mod store;
 mod sys;
 mod tree;
 mod volumes;
+mod watch;
 
 pub use access::FullDiskAccess;
 pub use app::{App, Preflight, browse};
@@ -27,3 +28,4 @@ pub use scan::{Reader, ScanError, ScanOptions, scan, scan_live};
 pub use store::{CacheDir, Saved};
 pub use tree::{ChildIndex, LARGEST, LargeFile, Progress, Record, Totals, Tree};
 pub use volumes::{Mount, mounts};
+pub use watch::update;

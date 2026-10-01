@@ -29,7 +29,7 @@ Pre-release. The commands so far:
 ```sh
 disksweep [-r]
 disksweep [-r] <path>
-disksweep scan <path> [--threads N] [-r] [--json [--depth N]] [--top N]
+disksweep scan <path> [--full] [--threads N] [-r] [--json [--depth N]] [--top N]
 disksweep show <path> [-r] [--json [--depth N]] [--top N]
 ```
 
@@ -67,6 +67,38 @@ largest files:
 as `scan` printed it with the same flags. `show -r` needs a scan made with
 `-r`.
 
+## Incremental scans
+
+On macOS, `scan` starts from the saved scan of `<path>`, if there is one. macOS
+records every change to a volume (FSEvents), so disksweep asks for the changes
+below `<path>` since the saved scan, lists only the directories they touched
+again, and scans any new subdirectories. A file that grows in place counts as
+a change too. The output is the same as a full scan's, and the result is saved
+again.
+
+```text
+disksweep scan ~/src          # the first time: a full scan
+disksweep scan ~/src          # later: only what changed since
+disksweep scan ~/src --full   # always a full scan
+```
+
+It falls back to a full scan when:
+
+- there is no saved scan, or it is damaged or from another disksweep version;
+- the saved scan was made with `-r` and this one is not, or the other way;
+- macOS no longer has the changes since then, lost some, or its record was
+  reset, as after erasing the disk;
+- `<path>` itself was moved or deleted, or macOS says to scan all of it again.
+
+If macOS says to rescan only a directory below `<path>`, only that directory
+is scanned again. Changes inside the cache directory are ignored.
+
+The largest files list (`--top`, `t`) keeps the 1000 largest files from the
+full scan, plus those of the directories listed again. A full scan finds the
+others again.
+
+On Linux every `scan` is a full scan.
+
 ## Browse
 
 `disksweep` with no path lists the volumes, one per row:
@@ -100,7 +132,10 @@ directories and files together, largest first.
 It scans while you browse. The title says `scanning... at least <size>` and
 the sizes grow, about once a second, until the scan is done and saved. If
 `<path>` was scanned before, the saved scan shows at once, marked
-`saved 5 min ago`, until the fresh scan is done.
+`saved 5 min ago`, until the fresh scan is done. On macOS that saved scan is
+brought up to date like an [incremental scan](#incremental-scans), usually in
+under a second, instead of scanning again. Then, while disksweep is open,
+sizes follow changes on disk, about once a second.
 
 | Key                  | Action                                                 |
 | -------------------- | ------------------------------------------------------ |

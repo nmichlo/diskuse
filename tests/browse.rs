@@ -19,6 +19,8 @@ use std::fs;
 use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 const WIDTH: usize = 100;
@@ -682,4 +684,67 @@ fn reveals_and_opens_a_largest_file() {
     assert_eq!(runs, [(open.clone(), vec!["-R".into(), big.into()])]);
     let runs = press(&mut b, &[KeyCode::Char('j'), KeyCode::Char('o')]);
     assert_eq!(runs, [(open, vec![f3.into()])]);
+}
+
+/// Polls `b` until it draws `expected`, for at most 3 s.
+#[cfg(target_os = "macos")]
+fn shows_within_3s(b: &mut Browser, expected: &Buffer) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        b.poll();
+        let drawn = draw(b, SystemTime::now());
+        if drawn == *expected {
+            return;
+        }
+        if Instant::now() > deadline {
+            assert_eq!(drawn, *expected, "not shown within 3 s");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `root/a/` with `keep` (4096) and `gone` (8192), browsed from a saved
+/// scan brought up to date, then changed while shown.
+#[cfg(target_os = "macos")]
+#[test]
+fn follows_changes_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("a")).unwrap();
+    file(&root.join("a/keep"), 4096);
+    file(&root.join("a/gone"), 8192);
+    let d = common::own_bytes(root);
+    // the root lists only `a/`, previewed
+    let shown = |files: &[(u64, &str)]| {
+        let a = d + files.iter().map(|&(size, _)| size).sum::<u64>();
+        let title = format!("/live  {}", kib(a + d));
+        let files: Vec<String> = files
+            .iter()
+            .map(|&(size, name)| row(&kib(size), name))
+            .collect();
+        screen(&title, [&[], &[row(&kib(a), "a/")], &files], None, 0, HELP)
+    };
+    let saved = Saved {
+        tree: disksweep::scan(root, &ScanOptions::default()).unwrap(),
+        reclaimable: false,
+        modified: SystemTime::now(),
+    };
+    let mut b = Browser::new(root, "/live", env(Desktop::None), Some(saved), None, false);
+    b.scan();
+    while b.poll() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        draw(&mut b, SystemTime::now()),
+        shown(&[(8192, "gone"), (4096, "keep")])
+    );
+
+    file(&root.join("a/new"), 4096);
+    let expected = shown(&[(8192, "gone"), (4096, "keep"), (4096, "new")]);
+    shows_within_3s(&mut b, &expected);
+    fs::remove_file(root.join("a/gone")).unwrap();
+    shows_within_3s(&mut b, &shown(&[(4096, "keep"), (4096, "new")]));
+    // in place: no entry of `a/` changes
+    common::append(&root.join("a/keep"), 4096);
+    shows_within_3s(&mut b, &shown(&[(8192, "keep"), (4096, "new")]));
 }

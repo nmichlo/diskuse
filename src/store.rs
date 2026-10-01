@@ -1,25 +1,29 @@
 //! Saved scans, one file per scanned root, so `show` can print a result
-//! without scanning. The only module that writes files, and only inside
-//! [`CacheDir`].
+//! without scanning, and the next `scan` can start from it. The only module
+//! that writes files, and only inside [`CacheDir`].
 //!
 //! The format is little-endian and versioned, with no migrations: a file of
 //! another version is ignored, and the next scan replaces it.
 //!
 //! ```text
 //! magic     b"DSWP"
-//! version   u8 = 1
+//! version   u8 = 2
 //! flags     u8: bit 0 = scanned with reclaimable sizes
-//! event_id  u64, 0 for now
+//! event_id  u64: the tree has every change up to this event, 0 if the OS
+//!           keeps no record of changes
+//! store     u128: the id of that record, 0 if none
 //! root      u32 len + bytes: the canonical root
 //! records   u32 count, then 32 bytes each: parent u32, name u32,
 //!           flags u32, errno u16, 0 u16, own u64, own_private u64
 //! names     u32 count, then u16 len + bytes each, for name ids from 1;
 //!           id 0 is the root's, which `load` sets to the path asked for
 //! largest   u32 count, then bytes u64, dir u32, u16 len + name bytes each
+//! links     u32 count, then dev u64, ino u64, dir u32 each: the dir that
+//!           counts each multiply-linked file
 //! ```
 
 use crate::sys;
-use crate::tree::{LargeFile, Record, Tree};
+use crate::tree::{LargeFile, Links, Record, Since, Tree};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -29,7 +33,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"DSWP";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const RECLAIMABLE: u8 = 1 << 0;
 const RECORD_LEN: usize = 32;
 
@@ -48,6 +52,11 @@ pub struct Saved {
 }
 
 impl CacheDir {
+    /// The directory itself, which [`crate::update`] ignores changes in.
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
     /// `$DISKSWEEP_CACHE_DIR` if set, else `~/Library/Caches/disksweep` on
     /// macOS, and `$XDG_CACHE_HOME/disksweep` or `~/.cache/disksweep`
     /// elsewhere. Not created until a save.
@@ -139,7 +148,8 @@ fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> Vec<u8> {
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(if reclaimable { RECLAIMABLE } else { 0 });
-    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&tree.since.id.to_le_bytes());
+    out.extend_from_slice(&tree.since.store.to_le_bytes());
     let root = canonical.as_os_str().as_bytes();
     out.extend_from_slice(&len32(root.len()).to_le_bytes());
     out.extend_from_slice(root);
@@ -165,6 +175,12 @@ fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> Vec<u8> {
         out.extend_from_slice(&f.dir.to_le_bytes());
         put16(&mut out, &f.name);
     }
+    out.extend_from_slice(&len32(tree.links.len()).to_le_bytes());
+    for (&(dev, ino), &dir) in &tree.links {
+        out.extend_from_slice(&dev.to_le_bytes());
+        out.extend_from_slice(&ino.to_le_bytes());
+        out.extend_from_slice(&dir.to_le_bytes());
+    }
     out
 }
 
@@ -188,7 +204,10 @@ fn decode(bytes: &[u8], canonical: &Path, root: &Path, modified: SystemTime) -> 
         return None;
     }
     let flags = b.u8()?;
-    let _event_id = b.u64()?;
+    let since = Since {
+        id: b.u64()?,
+        store: b.u128()?,
+    };
     let len = b.u32()? as usize;
     // guards against FNV collisions
     if b.take(len)? != canonical.as_os_str().as_bytes() {
@@ -229,6 +248,13 @@ fn decode(bytes: &[u8], canonical: &Path, root: &Path, modified: SystemTime) -> 
         largest.push(LargeFile { bytes, dir, name });
     }
 
+    let count = b.u32()? as usize;
+    let mut links = Links::with_capacity(count.min(b.0.len() / 20));
+    for _ in 0..count {
+        let key = (b.u64()?, b.u64()?);
+        links.insert(key, b.u32()?);
+    }
+
     let (first, rest) = records.split_first()?;
     let valid = b.0.is_empty()
         && first.parent == Record::NO_PARENT
@@ -237,12 +263,15 @@ fn decode(bytes: &[u8], canonical: &Path, root: &Path, modified: SystemTime) -> 
             // a parent always comes before its children
             (r.parent as usize) <= i && r.name != 0 && (r.name as usize) < names.count()
         })
-        && largest.iter().all(|f| (f.dir as usize) < records.len());
+        && largest.iter().all(|f| (f.dir as usize) < records.len())
+        && links.values().all(|&dir| (dir as usize) < records.len());
     valid.then_some(Saved {
         tree: Tree {
             records,
             names: Arc::new(names),
             largest,
+            links,
+            since,
         },
         reclaimable: flags & RECLAIMABLE != 0,
         modified,
@@ -273,5 +302,9 @@ impl<'a> Bytes<'a> {
 
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn u128(&mut self) -> Option<u128> {
+        Some(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
     }
 }

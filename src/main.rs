@@ -18,9 +18,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Print the size of PATH and of each of its direct children, and save
-    /// the result for `show`.
+    /// the result for `show`. On macOS, a saved scan of PATH is brought up
+    /// to date from the changes since, when macOS recorded them.
     Scan {
         path: PathBuf,
+        /// Scan all of PATH, even if a saved scan could be brought up to date
+        #[arg(long)]
+        full: bool,
         /// Worker threads [default: available parallelism]
         #[arg(long)]
         threads: Option<NonZeroUsize>,
@@ -98,12 +102,13 @@ fn main() -> ExitCode {
         (
             Some(Command::Scan {
                 path,
+                full,
                 threads,
                 reader,
                 output,
             }),
             _,
-        ) => scan(&path, threads, reader, &output),
+        ) => scan(&path, full, threads, reader, &output),
         (Some(Command::Show { path, output }), _) => show(&path, &output),
         (None, path) => browse(path.as_deref(), cli.reclaimable.on()),
     }
@@ -125,6 +130,7 @@ fn browse(path: Option<&Path>, reclaimable: bool) -> ExitCode {
 
 fn scan(
     path: &Path,
+    full: bool,
     threads: Option<NonZeroUsize>,
     reader: disksweep::Reader,
     output: &Output,
@@ -134,7 +140,15 @@ fn scan(
         reclaimable: output.reclaimable(),
         reader,
     };
-    let tree = match disksweep::scan(path, &opts) {
+    let cache = disksweep::CacheDir::from_env();
+    // a saved scan that cannot be read is replaced, like a missing one
+    let saved = (cache.as_ref().ok())
+        .filter(|_| !full)
+        .and_then(|cache| cache.load(path).ok().flatten())
+        .filter(|saved| saved.reclaimable == opts.reclaimable);
+    let updated =
+        saved.and_then(|saved| disksweep::update(path, saved.tree, &opts, cache.as_ref().ok()));
+    let tree = match updated.map_or_else(|| disksweep::scan(path, &opts), Ok) {
         Ok(tree) => tree,
         Err(e) => {
             eprintln!("disksweep: {}: {e}", path.display());
@@ -143,8 +157,7 @@ fn scan(
     };
     output.print(&tree);
     // the printed result stands even if it cannot be saved
-    let saved =
-        disksweep::CacheDir::from_env().and_then(|cache| cache.save(path, &tree, opts.reclaimable));
+    let saved = cache.and_then(|cache| cache.save(path, &tree, opts.reclaimable));
     if let Err(e) = saved {
         eprintln!("disksweep: warning: scan not saved: {e}");
     }

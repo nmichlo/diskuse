@@ -1,9 +1,11 @@
 //! The full-screen browser: three columns, the parent dir, the current dir
 //! and the selected child, each largest first, like OmniDiskSweeper. A scan
 //! runs on its own thread meanwhile; a saved scan, if any, shows until the
-//! fresh one is done. `d` lists the dirs the scan could not read instead,
-//! and `t` the largest files. With reclaimable sizes (`-r`), each size has
-//! a second column, the bytes deleting the item alone frees.
+//! fresh one is done, or on macOS, until it is brought up to date from the
+//! changes since. Then the tree follows changes on disk ([`crate::watch`]).
+//! `d` lists the dirs the scan could not read instead, and `t` the largest
+//! files. With reclaimable sizes (`-r`), each size has a second column, the
+//! bytes deleting the item alone frees.
 //!
 //! Subdirectories and their sizes come from the tree. Files are not in the
 //! tree, so a dir is listed from disk when first shown, and the listing is
@@ -16,7 +18,8 @@ use crate::reveal::Desktop;
 use crate::scan::{ScanError, ScanOptions, scan_live};
 use crate::store::{CacheDir, Saved};
 use crate::sys::{self, Kind};
-use crate::tree::{ChildIndex, LARGEST, Progress, Record, Totals, Tree, join};
+use crate::tree::{ChildIndex, LARGEST, Progress, Record, Since, Totals, Tree, join};
+use crate::watch::{Poll, Watch};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -73,6 +76,8 @@ pub struct Browser {
     /// `None` until the running scan has listed the root.
     view: Option<View>,
     scan: Option<Scan>,
+    /// Changes on disk below the root, since the tree shown.
+    watch: Option<Watch>,
     /// Listings by record id, kept until another scan's tree is shown.
     files: HashMap<u32, Files>,
     /// Sorted rows by record id, for the view shown.
@@ -218,6 +223,7 @@ impl Browser {
             reclaimable,
             view: None,
             scan: None,
+            watch: None,
             files: HashMap::new(),
             rows: HashMap::new(),
             trail: Vec::new(),
@@ -232,20 +238,36 @@ impl Browser {
             panel: None,
             top: None,
         };
-        if let Some(saved) = saved.filter(|s| s.reclaimable || !reclaimable) {
+        if let Some(mut saved) = saved.filter(|s| s.reclaimable || !reclaimable) {
+            // updating it would mix its reclaimable sizes with zeros
+            if saved.reclaimable != reclaimable {
+                saved.tree.since = Since::default();
+            }
             b.show(saved.tree, Status::Saved(saved.modified));
         }
         b
     }
 
-    /// Starts scanning the root on another thread.
+    /// Starts bringing the root up to date: from the saved scan shown, if
+    /// the OS recorded the changes since, else by scanning it on another
+    /// thread.
     pub fn scan(&mut self) {
+        if let Some(view) = &self.view
+            && let Status::Saved(_) = view.status
+        {
+            self.watch = Watch::start(&self.root, &view.tree, self.env.cache.as_ref());
+        }
+        if self.watch.is_none() {
+            self.full_scan();
+        }
+    }
+
+    /// Scans all of the root on another thread.
+    fn full_scan(&mut self) {
+        self.watch = None;
         let (tx, started) = mpsc::channel();
         let root = self.root.clone();
-        let opts = ScanOptions {
-            reclaimable: self.reclaimable,
-            ..ScanOptions::default()
-        };
+        let opts = self.options();
         let thread = thread::spawn(move || {
             scan_live(&root, &opts, |p| {
                 // the receiver only goes away with the browser
@@ -261,10 +283,11 @@ impl Browser {
 
     /// Catches up with the running scan: shows a snapshot of it, unless a
     /// saved scan is shown, or once it is done, its tree, and saves that.
-    /// Returns whether a scan still runs.
+    /// Without a scan, applies the changes on disk since the last poll.
+    /// Returns whether a scan, or the update of a saved scan, still runs.
     pub fn poll(&mut self) -> bool {
         let Some(scan) = &mut self.scan else {
-            return false;
+            return self.follow();
         };
         if scan.thread.is_finished() {
             let scan = self.scan.take().unwrap();
@@ -274,11 +297,10 @@ impl Browser {
             };
             match done {
                 Ok(tree) => {
-                    if let Some(cache) = &self.env.cache
-                        && let Err(e) = cache.save(&self.root, &tree, self.reclaimable)
-                    {
-                        self.message = Some(format!("warning: scan not saved: {e}"));
-                    }
+                    self.save(&tree);
+                    // from where the scan started, so it sees the changes
+                    // made while it ran
+                    self.watch = Watch::start(&self.root, &tree, self.env.cache.as_ref());
                     self.show(tree, Status::Done);
                 }
                 Err(e) => self.message = Some(format!("cannot scan: {e}")),
@@ -358,7 +380,7 @@ impl Browser {
                 self.files.clear();
                 self.rows.clear();
                 self.current.clear();
-                self.scan();
+                self.full_scan();
             }
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Char('d') => self.panel = Some(0),
@@ -448,6 +470,56 @@ impl Browser {
         }) = self.current.get(self.cursor)
         {
             column(buf, right, view, &self.files[&k], &self.rows[&k], 0, None);
+        }
+    }
+
+    /// Applies the changes on disk since the last poll to the tree shown,
+    /// once the watch has replayed those from before it started. Returns
+    /// whether a saved scan is still being brought up to date.
+    fn follow(&mut self) -> bool {
+        let Some(watch) = &mut self.watch else {
+            return false;
+        };
+        let replaying = matches!(&self.view, Some(v) if matches!(v.status, Status::Saved(_)));
+        let changes = match watch.poll() {
+            Poll::Wait => return replaying,
+            Poll::Lost => {
+                self.full_scan();
+                return true;
+            }
+            Poll::Changes(changes) => changes,
+        };
+        if changes.is_empty() && !replaying {
+            return false;
+        }
+        let View {
+            mut tree, status, ..
+        } = self.view.take().expect("a watch follows a view");
+        if tree.apply(&changes, &self.options()).is_none() {
+            self.show(tree, status);
+            self.full_scan();
+            return true;
+        }
+        // later runs replay from here
+        if replaying {
+            self.save(&tree);
+        }
+        self.show(tree, Status::Done);
+        false
+    }
+
+    fn options(&self) -> ScanOptions {
+        ScanOptions {
+            reclaimable: self.reclaimable,
+            ..ScanOptions::default()
+        }
+    }
+
+    fn save(&mut self, tree: &Tree) {
+        if let Some(cache) = &self.env.cache
+            && let Err(e) = cache.save(&self.root, tree, self.reclaimable)
+        {
+            self.message = Some(format!("warning: scan not saved: {e}"));
         }
     }
 
