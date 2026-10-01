@@ -82,7 +82,7 @@ pub(crate) enum Poll {
 
 /// A stream of the changes below a root, from where a tree of it stands.
 pub(crate) struct Watch {
-    _stream: sys::Stream,
+    stream: sys::Stream,
     rx: Receiver<Vec<Event>>,
     /// The real root and cache dir, without a trailing `/`, so `/` is `""`.
     root: Vec<u8>,
@@ -96,6 +96,8 @@ pub(crate) struct Watch {
     last: Instant,
     /// The replay ended and the stream went quiet once.
     settled: bool,
+    /// [`sys::Stream::flush`] ran after the replay ended.
+    flushed: bool,
 }
 
 impl Watch {
@@ -124,7 +126,7 @@ impl Watch {
             cache.map(|c| std::fs::canonicalize(c.path()).unwrap_or_else(|_| c.path().into()));
         let now = Instant::now();
         Some(Self {
-            _stream: stream,
+            stream,
             rx,
             root: trim(&real),
             cache: cache.as_deref().map(trim),
@@ -134,6 +136,7 @@ impl Watch {
             replayed: None,
             last: now,
             settled: false,
+            flushed: false,
         })
     }
 
@@ -146,6 +149,16 @@ impl Watch {
         let now = Instant::now();
         if self.lost {
             return Poll::Lost;
+        }
+        if !self.settled && self.replayed.is_some() && !self.flushed {
+            // the replay ends with what the service has seen, so changes made
+            // just before may still be on their way: ask for them, then wait
+            // for quiet as usual
+            self.flushed = true;
+            self.stream.flush();
+            while let Ok(batch) = self.rx.try_recv() {
+                self.add(batch);
+            }
         }
         if !self.settled {
             let Some(replayed) = self.replayed else {

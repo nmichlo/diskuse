@@ -58,6 +58,7 @@ unsafe extern "C" {
     fn FSEventStreamSetDispatchQueue(stream: StreamRef, queue: Queue);
     fn FSEventStreamStart(stream: StreamRef) -> u8;
     fn FSEventStreamStop(stream: StreamRef);
+    fn FSEventStreamFlushSync(stream: StreamRef);
     fn FSEventStreamInvalidate(stream: StreamRef);
     fn FSEventStreamRelease(stream: StreamRef);
     fn FSEventsGetCurrentEventId() -> u64;
@@ -113,6 +114,15 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// Delivers every event that happened before the call, held back by the
+    /// latency or still with the FSEvents service, before returning.
+    pub fn flush(&self) {
+        // SAFETY: `stream` is started and stays valid until `Drop`; the
+        // callback runs on our queue, not on this thread, so this cannot
+        // wait on itself.
+        unsafe { FSEventStreamFlushSync(self.stream) }
+    }
+
     /// Sends the changes below `path` with event ids after `since`, first
     /// the recorded ones, then live ones, in batches to `tx`.
     pub fn start(path: &CStr, since: u64, tx: Sender<Vec<Event>>) -> Option<Self> {
