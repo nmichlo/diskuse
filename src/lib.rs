@@ -9,6 +9,7 @@ mod access;
 mod app;
 mod browse;
 mod json;
+mod labels;
 mod report;
 pub mod reveal;
 mod scan;

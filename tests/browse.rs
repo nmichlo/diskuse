@@ -1,8 +1,10 @@
 //! The screens, drawn into a 100x20 test terminal and compared cell by cell.
 
+#![allow(clippy::disallowed_methods)] // fixtures create and delete files
+
 mod common;
 
-use common::{Fixture, fixture, kib};
+use common::{Fixture, file, fixture, kib};
 use disksweep::reveal::Desktop;
 use disksweep::{App, Browser, Env, FullDiskAccess, Mount, Saved, ScanOptions};
 use ratatui::backend::TestBackend;
@@ -13,6 +15,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::{Frame, Terminal};
 use std::cmp::Reverse;
 use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -22,7 +25,12 @@ const WIDTH: usize = 100;
 const HEIGHT: usize = 20;
 /// `(x, width)` of the parent, current and preview columns.
 const COLUMNS: [(usize, usize); 3] = [(0, 33), (34, 32), (67, 33)];
-const HELP: &str = "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  q quit";
+/// A wider terminal, for rows too long for 100 columns.
+const WIDE: usize = 130;
+const WIDE_COLUMNS: [(usize, usize); 3] = [(0, 43), (44, 42), (87, 43)];
+const HELP: &str =
+    "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  q quit";
+const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  q quit";
 const GIB: u64 = 1 << 30;
 
 /// An expected screen: `title`, the rows of each column, and `footer`.
@@ -35,32 +43,42 @@ fn screen(
     current: usize,
     footer: &str,
 ) -> Buffer {
-    let mut lines = vec![vec![' '; WIDTH]; HEIGHT];
+    screen_in(WIDTH, COLUMNS, title, columns, parent, current, footer)
+}
+
+/// [`screen`] in a terminal `width` wide, with columns at `layout`.
+fn screen_in(
+    width: usize,
+    layout: [(usize, usize); 3],
+    title: &str,
+    columns: [&[String]; 3],
+    parent: Option<usize>,
+    current: usize,
+    footer: &str,
+) -> Buffer {
+    let mut lines = vec![vec![' '; width]; HEIGHT];
     let mut put = |y: usize, x: usize, width: usize, text: &str| {
         for (i, c) in text.chars().take(width).enumerate() {
             lines[y][x + i] = c;
         }
     };
-    put(0, 0, WIDTH, title);
-    for (rows, (x, width)) in columns.iter().zip(COLUMNS) {
+    put(0, 0, width, title);
+    for (rows, (x, width)) in columns.iter().zip(layout) {
         for (y, row) in rows.iter().take(HEIGHT - 2).enumerate() {
             put(y + 1, x, width, row);
         }
     }
-    put(HEIGHT - 1, 0, WIDTH, footer);
+    put(HEIGHT - 1, 0, width, footer);
     let lines: Vec<String> = lines.into_iter().map(String::from_iter).collect();
     let mut buf = Buffer::with_lines(lines);
     let row =
         |i: usize, (x, width): (usize, usize)| Rect::new(x as u16, 1 + i as u16, width as u16, 1);
     if let Some(i) = parent {
-        buf.set_style(
-            row(i, COLUMNS[0]),
-            Style::new().add_modifier(Modifier::BOLD),
-        );
+        buf.set_style(row(i, layout[0]), Style::new().add_modifier(Modifier::BOLD));
     }
     if current < columns[1].len() {
         buf.set_style(
-            row(current, COLUMNS[1]),
+            row(current, layout[1]),
             Style::new().add_modifier(Modifier::REVERSED),
         );
     }
@@ -69,6 +87,12 @@ fn screen(
 
 fn row(size: &str, name: &str) -> String {
     format!("{size:>10}  {name}")
+}
+
+/// A row with a reclaimable size too, as `-r` shows it.
+#[cfg(target_os = "macos")]
+fn row_r(size: &str, reclaimable: &str, name: &str) -> String {
+    format!("{size:>10} {reclaimable:>10}  {name}")
 }
 
 /// A dir with something denied below it.
@@ -150,7 +174,11 @@ fn first_view(e: &Expected, title: &str, footer: &str) -> Buffer {
 }
 
 fn render(draw: impl FnOnce(&mut Frame)) -> Buffer {
-    let mut terminal = Terminal::new(TestBackend::new(WIDTH as u16, HEIGHT as u16)).unwrap();
+    render_in(WIDTH, draw)
+}
+
+fn render_in(width: usize, draw: impl FnOnce(&mut Frame)) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width as u16, HEIGHT as u16)).unwrap();
     terminal.draw(draw).unwrap();
     terminal.backend().buffer().clone()
 }
@@ -192,7 +220,13 @@ fn press_app(app: &mut App, k: &[KeyCode]) -> Runs {
 
 /// A browser of the fixture after a real scan of it has finished.
 fn scanned(root: &Path, desktop: Desktop) -> Browser {
-    let mut b = Browser::new(root, "/fixture", env(desktop), None, None);
+    scanned_as(root, "/fixture", desktop, false)
+}
+
+/// A browser of `root`, titled `display`, after a real scan of it, with
+/// reclaimable sizes if `reclaimable`.
+fn scanned_as(root: &Path, display: &str, desktop: Desktop, reclaimable: bool) -> Browser {
+    let mut b = Browser::new(root, display, env(desktop), None, None, reclaimable);
     b.scan();
     while b.poll() {
         std::thread::sleep(Duration::from_millis(1));
@@ -262,6 +296,7 @@ fn shows_a_saved_scan_with_its_age() {
         env(Desktop::None),
         Some(saved),
         None,
+        false,
     );
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + 5 * 60);
     let title = format!("{}  saved 5 min ago", e.title);
@@ -395,7 +430,7 @@ fn lists_the_volumes() {
         mount("/proc".as_ref(), "proc", false, 0, 0, 0),
         mount("/run".as_ref(), "tmpfs", false, 2 * GIB, 1 << 20, 2 * GIB),
     ];
-    let mut app = App::new(None, mounts, env(Desktop::Mac), None);
+    let mut app = App::new(None, mounts, env(Desktop::Mac), None, false);
     let lines = [
         "volumes",
         " 800.0 GiB used of  926.0 GiB   126.0 GiB free  /",
@@ -414,7 +449,13 @@ fn lists_the_volumes() {
 fn enter_volume(f: &Fixture, used: u64, access: FullDiskAccess) -> App {
     let volume = mount(f.dir.path(), "apfs", false, 100 * GIB, used, 50 * GIB);
     let preflight = Box::new(move || access);
-    let mut app = App::new(None, vec![volume], env(Desktop::Mac), Some(preflight));
+    let mut app = App::new(
+        None,
+        vec![volume],
+        env(Desktop::Mac),
+        Some(preflight),
+        false,
+    );
     press_app(&mut app, &[KeyCode::Enter]);
     app
 }
@@ -486,4 +527,159 @@ fn browses_at_once_with_full_disk_access() {
         .title
         .replacen("/fixture", &f.dir.path().display().to_string(), 1);
     assert_eq!(draw_app(&mut app), first_view(&e, &title, HELP));
+}
+
+/// `-r` adds the reclaimable bytes after each size.
+#[cfg(target_os = "macos")]
+#[test]
+fn shows_reclaimable_sizes() {
+    let dir = common::clones();
+    let mut b = scanned_as(dir.path(), "/clones", Desktop::None, true);
+    // as `scan -r` prints them; APFS dirs allocate 0 B
+    let root = [
+        row_r("1.0 MiB", "0 B", "clone/"),
+        row_r("1.0 MiB", "0 B", "orig/"),
+        row_r("1.0 MiB", "1.0 MiB", "solo/"),
+    ];
+    let clone = [row_r("1.0 MiB", "0 B", "f")];
+    let expected = screen("/clones  3.0 MiB", [&[], &root, &clone], None, 0, HELP);
+    assert_eq!(draw(&mut b, SystemTime::now()), expected);
+}
+
+/// ```text
+/// root/
+///   rust/Cargo.toml          4096
+///   rust/target/x           16384   [cache: cargo], beside Cargo.toml
+///   node_modules/m          12288   [cache: npm]
+///   target/t                 8192   no label, no Cargo.toml beside it
+///   __pycache__/p            4096   [cache: python]
+///   .venv/pyvenv.cfg            0   [cache: venv]
+///   venv/                           no label, no pyvenv.cfg
+/// ```
+#[test]
+fn labels_dirs_tools_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for d in [
+        "rust/target",
+        "node_modules",
+        "target",
+        "__pycache__",
+        ".venv",
+        "venv",
+    ] {
+        fs::create_dir_all(root.join(d)).unwrap();
+    }
+    let files = [
+        ("rust/Cargo.toml", 4096),
+        ("rust/target/x", 16384),
+        ("node_modules/m", 12288),
+        ("target/t", 8192),
+        ("__pycache__/p", 4096),
+        (".venv/pyvenv.cfg", 0),
+    ];
+    for (path, len) in files {
+        file(&root.join(path), len);
+    }
+    let d = common::own_bytes(root);
+    let mut b = scanned_as(root, "/labels", Desktop::None, false);
+    let rows = [
+        row(&kib(20480 + 2 * d), "rust/"),
+        row(&kib(12288 + d), "node_modules/  [cache: npm]"),
+        row(&kib(8192 + d), "target/"),
+        row(&kib(4096 + d), "__pycache__/  [cache: python]"),
+        row(&kib(d), ".venv/  [cache: venv]"),
+        row(&kib(d), "venv/"),
+    ];
+    let rust = [
+        row(&kib(16384 + d), "target/  [cache: cargo]"),
+        row("4.0 KiB", "Cargo.toml"),
+    ];
+    let title = format!("/labels  {}", kib(45056 + 8 * d));
+    let expected = screen_in(
+        WIDE,
+        WIDE_COLUMNS,
+        &title,
+        [&[], &rows, &rust],
+        None,
+        0,
+        HELP,
+    );
+    assert_eq!(render_in(WIDE, |f| b.draw(f, SystemTime::now())), expected);
+}
+
+/// The fixture with one of the hard links `a/h1` and `a/h2` removed, as
+/// which of the two a scan keeps among the largest depends on the order
+/// the directory lists them in.
+fn one_link() -> Fixture {
+    let f = fixture();
+    fs::remove_file(f.dir.path().join("a/h2")).unwrap();
+    f
+}
+
+/// The `t` screen of [`one_link`] from the file at `from`, which is
+/// selected.
+fn top_files(f: &Fixture, from: usize) -> Buffer {
+    let mut files = vec![
+        (1572864, "big/f"),
+        (12288, "a/b/c/f3"),
+        (8192, "a/b/f2"),
+        (8192, "a/h1"),
+        (8192, "top"),
+        (4096, "a/f1"),
+    ];
+    if f.sym_bytes > 0 {
+        files.push((f.sym_bytes, "sym"));
+    }
+    files.sort_by_key(|&(size, path)| (Reverse(size), path));
+    let rows: Vec<String> = files[from..]
+        .iter()
+        .map(|&(size, path)| match size {
+            1572864 => row("1.5 MiB", path),
+            _ => row(&kib(size), path),
+        })
+        .collect();
+    let mut lines = vec![expected(f).title];
+    lines.extend(rows);
+    let mut lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    lines.resize(HEIGHT - 1, "");
+    lines.push(TOP_HELP);
+    plain(&lines, Some(1))
+}
+
+#[test]
+fn lists_the_largest_files() {
+    let f = one_link();
+    let mut b = scanned(f.dir.path(), Desktop::None);
+    press(&mut b, &[KeyCode::Char('t')]);
+    assert_eq!(draw(&mut b, SystemTime::now()), top_files(&f, 0));
+
+    press(&mut b, &[KeyCode::Char('t')]);
+    let e = expected(&f);
+    assert_eq!(
+        draw(&mut b, SystemTime::now()),
+        first_view(&e, &e.title, HELP)
+    );
+}
+
+#[test]
+fn drops_a_largest_file_deleted_since_the_scan() {
+    let f = one_link();
+    let mut b = scanned(f.dir.path(), Desktop::None);
+    fs::remove_file(f.dir.path().join("big/f")).unwrap();
+    press(&mut b, &[KeyCode::Char('t')]);
+    assert_eq!(draw(&mut b, SystemTime::now()), top_files(&f, 1));
+}
+
+#[test]
+fn reveals_and_opens_a_largest_file() {
+    let f = one_link();
+    let root = f.dir.path();
+    let mut b = scanned(root, Desktop::Mac);
+    let (big, f3) = (root.join("big/f"), root.join("a/b/c/f3"));
+    let runs = press(&mut b, &[KeyCode::Char('t'), KeyCode::Char('r')]);
+    let open = "/usr/bin/open".to_string();
+    assert_eq!(runs, [(open.clone(), vec!["-R".into(), big.into()])]);
+    let runs = press(&mut b, &[KeyCode::Char('j'), KeyCode::Char('o')]);
+    assert_eq!(runs, [(open, vec![f3.into()])]);
 }

@@ -38,6 +38,31 @@ pub fn kib(bytes: u64) -> String {
     }
 }
 
+/// ```text
+/// root/
+///   orig/f      1 MiB
+///   clone/f     `cp -c` of orig/f: shares all its blocks
+///   solo/f      1 MiB, unshared
+/// ```
+#[cfg(target_os = "macos")]
+pub fn clones() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for d in ["orig", "clone", "solo"] {
+        fs::create_dir(root.join(d)).unwrap();
+    }
+    file(&root.join("orig/f"), 1 << 20);
+    file(&root.join("solo/f"), 1 << 20);
+    let cp = std::process::Command::new("/bin/cp")
+        .arg("-c")
+        .arg(root.join("orig/f"))
+        .arg(root.join("clone/f"))
+        .status()
+        .unwrap();
+    assert!(cp.success());
+    dir
+}
+
 /// Makes the locked dirs readable again before the temp dir is removed.
 pub struct Unlock(Vec<PathBuf>);
 

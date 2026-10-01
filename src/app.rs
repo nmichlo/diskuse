@@ -22,8 +22,8 @@ const TICK: Duration = Duration::from_secs(1);
 pub type Preflight = Box<dyn FnOnce() -> FullDiskAccess>;
 
 /// Browses `path` full screen until the user quits, or without a path,
-/// starts on the volume list.
-pub fn browse(path: Option<&Path>) -> io::Result<()> {
+/// starts on the volume list. `reclaimable` adds reclaimable sizes.
+pub fn browse(path: Option<&Path>, reclaimable: bool) -> io::Result<()> {
     let mounts = match path {
         Some(path) => {
             // fail before taking over the terminal
@@ -41,7 +41,7 @@ pub fn browse(path: Option<&Path>) -> io::Result<()> {
         .filter(|home| cfg!(target_os = "macos") && path.is_none_or(|p| on_home_path(p, home)))
         .map(|home| Box::new(move || access::preflight(&home)) as Preflight);
     // the preflight runs here, before the terminal is taken over
-    let mut app = App::new(path, mounts, Env::from_env(), preflight);
+    let mut app = App::new(path, mounts, Env::from_env(), preflight, reclaimable);
     // restores the terminal on panic too
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
@@ -88,6 +88,8 @@ pub struct App {
     /// The browser left for the volume list, kept so going back into its
     /// volume does not scan it again.
     parked: Option<Box<Browser>>,
+    /// Browsers scan with reclaimable sizes and show them.
+    reclaimable: bool,
 }
 
 enum Screen {
@@ -109,12 +111,13 @@ struct Target {
 impl App {
     /// Browses `path`, or without one, lists the volumes among `mounts`.
     /// `preflight`, if given, runs before the first scan, so here if there
-    /// is a `path`.
+    /// is a `path`. `reclaimable` is for [`Browser::new`].
     pub fn new(
         path: Option<&Path>,
         mounts: Vec<Mount>,
         env: Env,
         preflight: Option<Preflight>,
+        reclaimable: bool,
     ) -> Self {
         let mut app = Self {
             env,
@@ -124,6 +127,7 @@ impl App {
             preflight,
             screen: Screen::Volumes,
             parked: None,
+            reclaimable,
         };
         if let Some(path) = path {
             let real = std::fs::canonicalize(path).ok();
@@ -237,7 +241,8 @@ impl App {
         let saved = cache.and_then(|c| c.load(&target.root).ok().flatten());
         let display = target.root.display().to_string();
         let env = self.env.clone();
-        let mut b = Browser::new(&target.root, &display, env, saved, target.used);
+        let reclaimable = self.reclaimable;
+        let mut b = Browser::new(&target.root, &display, env, saved, target.used, reclaimable);
         b.scan();
         Box::new(b)
     }

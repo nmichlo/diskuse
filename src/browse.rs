@@ -1,19 +1,22 @@
 //! The full-screen browser: three columns, the parent dir, the current dir
 //! and the selected child, each largest first, like OmniDiskSweeper. A scan
 //! runs on its own thread meanwhile; a saved scan, if any, shows until the
-//! fresh one is done. `d` lists the dirs the scan could not read instead.
+//! fresh one is done. `d` lists the dirs the scan could not read instead,
+//! and `t` the largest files. With reclaimable sizes (`-r`), each size has
+//! a second column, the bytes deleting the item alone frees.
 //!
 //! Subdirectories and their sizes come from the tree. Files are not in the
 //! tree, so a dir is listed from disk when first shown, and the listing is
 //! kept until another scan's tree is shown.
 
 use crate::access::{reason, terminal_app};
-use crate::report::{format_size, largest_first, suffix};
+use crate::labels;
+use crate::report::{format_size, largest_files, largest_first, suffix};
 use crate::reveal::Desktop;
 use crate::scan::{ScanError, ScanOptions, scan_live};
 use crate::store::{CacheDir, Saved};
 use crate::sys::{self, Kind};
-use crate::tree::{ChildIndex, Progress, Record, Totals, Tree, join};
+use crate::tree::{ChildIndex, LARGEST, Progress, Record, Totals, Tree, join};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,6 +24,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
+use std::fmt::Write;
 use std::io;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -29,8 +33,10 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-const HELP: &str = "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  q quit";
+const HELP: &str =
+    "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  q quit";
 const PANEL_HELP: &str = "arrows/jk scroll  d close  q quit";
+const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  q quit";
 
 /// What a browser takes from its environment, given so tests can fix it.
 #[derive(Clone)]
@@ -62,6 +68,8 @@ pub struct Browser {
     env: Env,
     /// Bytes in use on the volume, when the root is a volume's root.
     used: Option<u64>,
+    /// Scans with reclaimable sizes and shows them (`-r`).
+    reclaimable: bool,
     /// `None` until the running scan has listed the root.
     view: Option<View>,
     scan: Option<Scan>,
@@ -90,6 +98,8 @@ pub struct Browser {
     message: Option<String>,
     /// The first row of the denied list drawn, while it is shown.
     panel: Option<usize>,
+    /// The largest files list, while it is shown.
+    top: Option<Top>,
 }
 
 /// A tree as shown, with what drawing it needs.
@@ -99,7 +109,11 @@ struct View {
     index: ChildIndex,
     /// Path and record id of every denied dir, by path.
     denied: Vec<(Vec<u8>, u32)>,
+    /// `(bytes, path)` of the largest files, largest first.
+    largest: Vec<(u64, Vec<u8>)>,
     status: Status,
+    /// Shows reclaimable sizes.
+    reclaimable: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -112,7 +126,7 @@ enum Status {
 }
 
 impl View {
-    fn new(tree: Tree, status: Status) -> Self {
+    fn new(tree: Tree, status: Status, reclaimable: bool) -> Self {
         let ids = 0..tree.len() as u32;
         let mut denied: Vec<_> = (ids.filter(|&i| tree.record(i).flags & Record::DENIED != 0))
             .map(|i| (tree.dir_path(i), i))
@@ -122,8 +136,10 @@ impl View {
             totals: tree.totals(),
             index: tree.child_index(),
             denied,
+            largest: largest_files(&tree, LARGEST),
             tree,
             status,
+            reclaimable,
         }
     }
 }
@@ -135,15 +151,20 @@ struct Scan {
     thread: JoinHandle<Result<Tree, ScanError>>,
 }
 
-/// The files of a dir, `(name, allocated bytes)`: every entry but
-/// subdirectories.
-type Files = Vec<(Box<[u8]>, u64)>;
+/// The files of a dir, `(name, allocated bytes, reclaimable bytes)`:
+/// every entry but subdirectories. Reclaimable bytes are 0 unless asked
+/// for.
+type Files = Vec<(Box<[u8]>, u64, u64)>;
 
 /// One row of a column.
 #[derive(Clone, Copy, PartialEq)]
 struct Row {
     size: u64,
+    /// Reclaimable bytes, 0 unless asked for.
+    private: u64,
     item: Item,
+    /// From [`labels::label`], for a dir.
+    label: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -154,23 +175,47 @@ enum Item {
     File(u32),
 }
 
+/// The largest files list: rows of [`View::largest`] that are still there.
+#[derive(Default)]
+struct Top {
+    /// The selected index among the rows still there.
+    cursor: usize,
+    /// The first of those rows drawn.
+    offset: usize,
+    /// Whether each file checked is still there, by path. Each is checked
+    /// once while the list is shown, when first drawn.
+    there: HashMap<Vec<u8>, bool>,
+}
+
+impl Top {
+    /// The paths of `view`'s largest files not found gone.
+    fn paths<'a>(&'a self, view: &'a View) -> impl Iterator<Item = &'a [u8]> {
+        let paths = view.largest.iter().map(|(_, path)| &path[..]);
+        paths.filter(|p| self.there.get(*p) != Some(&false))
+    }
+}
+
 impl Browser {
     /// Shows `saved`, if any, until [`Browser::scan`] and
     /// [`Browser::poll`] bring a fresh scan. `display` is the root as the
     /// title shows it. `used` is the bytes in use on the volume, when
     /// `root` is a volume's root, for the not accounted for line.
+    /// `reclaimable` scans with reclaimable sizes and shows them; then
+    /// `saved` only shows if it has them too.
     pub fn new(
         root: &Path,
         display: &str,
         env: Env,
         saved: Option<Saved>,
         used: Option<u64>,
+        reclaimable: bool,
     ) -> Self {
         let mut b = Self {
             root: root.into(),
             display: display.into(),
             env,
             used,
+            reclaimable,
             view: None,
             scan: None,
             files: HashMap::new(),
@@ -185,9 +230,10 @@ impl Browser {
             typing: false,
             message: None,
             panel: None,
+            top: None,
         };
-        if let Some(saved) = saved {
-            b.show(View::new(saved.tree, Status::Saved(saved.modified)));
+        if let Some(saved) = saved.filter(|s| s.reclaimable || !reclaimable) {
+            b.show(saved.tree, Status::Saved(saved.modified));
         }
         b
     }
@@ -196,8 +242,12 @@ impl Browser {
     pub fn scan(&mut self) {
         let (tx, started) = mpsc::channel();
         let root = self.root.clone();
+        let opts = ScanOptions {
+            reclaimable: self.reclaimable,
+            ..ScanOptions::default()
+        };
         let thread = thread::spawn(move || {
-            scan_live(&root, &ScanOptions::default(), |p| {
+            scan_live(&root, &opts, |p| {
                 // the receiver only goes away with the browser
                 let _ = tx.send(p);
             })
@@ -225,11 +275,11 @@ impl Browser {
             match done {
                 Ok(tree) => {
                     if let Some(cache) = &self.env.cache
-                        && let Err(e) = cache.save(&self.root, &tree, false)
+                        && let Err(e) = cache.save(&self.root, &tree, self.reclaimable)
                     {
                         self.message = Some(format!("warning: scan not saved: {e}"));
                     }
-                    self.show(View::new(tree, Status::Done));
+                    self.show(tree, Status::Done);
                 }
                 Err(e) => self.message = Some(format!("cannot scan: {e}")),
             }
@@ -240,7 +290,7 @@ impl Browser {
         }
         let saved = matches!(&self.view, Some(v) if matches!(v.status, Status::Saved(_)));
         if !saved && let Some(tree) = scan.progress.as_ref().and_then(Progress::snapshot) {
-            self.show(View::new(tree, Status::Scanning));
+            self.show(tree, Status::Scanning);
         }
         true
     }
@@ -267,6 +317,24 @@ impl Browser {
             }
             return ControlFlow::Continue(());
         }
+        if let Some(top) = &mut self.top {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => top.cursor = top.cursor.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let n = (self.view.as_ref()).map_or(0, |v| top.paths(v).count());
+                    top.cursor = (top.cursor + 1).min(n.saturating_sub(1));
+                }
+                KeyCode::Char(c @ ('r' | 'o')) => {
+                    let path = (self.view.as_ref()).and_then(|v| top.paths(v).nth(top.cursor));
+                    let path = path.map(<[u8]>::to_vec);
+                    self.reveal(path, c == 'r', run);
+                }
+                KeyCode::Char('t') | KeyCode::Esc => self.top = None,
+                KeyCode::Char('q') => return ControlFlow::Break(()),
+                _ => {}
+            }
+            return ControlFlow::Continue(());
+        }
         match key.code {
             KeyCode::Up => self.step(false),
             KeyCode::Down => self.step(true),
@@ -283,8 +351,7 @@ impl Browser {
             KeyCode::Char('j') => self.step(true),
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.enter(),
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
-            KeyCode::Char('r') => self.reveal(true, run),
-            KeyCode::Char('o') => self.reveal(false, run),
+            KeyCode::Char(c @ ('r' | 'o')) => self.reveal(self.cursor_path(), c == 'r', run),
             // a running scan is not restarted
             KeyCode::Char('R') if self.scan.is_none() => {
                 self.view = None;
@@ -295,6 +362,7 @@ impl Browser {
             }
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Char('d') => self.panel = Some(0),
+            KeyCode::Char('t') => self.top = Some(Top::default()),
             KeyCode::Char('q') | KeyCode::Esc => return ControlFlow::Break(()),
             _ => {}
         }
@@ -310,11 +378,11 @@ impl Browser {
     /// Whether the root is shown with nothing open over it, so going up
     /// would leave the browser.
     pub(crate) fn at_root(&self) -> bool {
-        self.trail.is_empty() && !self.typing && self.panel.is_none()
+        self.trail.is_empty() && !self.typing && self.panel.is_none() && self.top.is_none()
     }
 
-    /// Draws the title, the three columns or the denied list, and the
-    /// footer. `now` dates a saved scan.
+    /// Draws the title, the three columns, the denied list or the largest
+    /// files, and the footer. `now` dates a saved scan.
     pub fn draw(&mut self, frame: &mut Frame, now: SystemTime) {
         let footer: Vec<String> = self
             .unaccounted()
@@ -342,6 +410,10 @@ impl Browser {
         if let Some(offset) = &mut self.panel {
             let terminal = &self.env.terminal;
             *offset = panel(buf, body, view, terminal, *offset);
+            return;
+        }
+        if let Some(top) = &mut self.top {
+            top_files(buf, body, view, top);
             return;
         }
         if let [.., parent, _] = self.dirs[..] {
@@ -379,8 +451,9 @@ impl Browser {
         }
     }
 
-    /// Shows `view`, keeping the place in the tree where it still exists.
-    fn show(&mut self, view: View) {
+    /// Shows `tree`, keeping the place in it where that still exists.
+    fn show(&mut self, tree: Tree, status: Status) {
+        let view = View::new(tree, status, self.reclaimable);
         // record ids, so listings, carry over between snapshots of one scan
         if self
             .view
@@ -457,15 +530,34 @@ impl Browser {
         if self.rows.contains_key(&d) {
             return;
         }
-        let files = self.files.entry(d).or_insert_with(|| list(&view.tree, d));
-        let dirs = view.index.children(d).iter().map(|&k| Row {
-            size: view.totals.size[k as usize],
-            item: Item::Dir(k),
+        let private = self.reclaimable;
+        let files = (self.files.entry(d)).or_insert_with(|| list(&view.tree, d, private));
+        let path = view.tree.dir_path(d);
+        // the root's name is the whole path
+        let parent = Path::new(OsStr::from_bytes(view.tree.name(view.tree.record(d).name)));
+        let parent = parent.file_name().unwrap_or_default().as_bytes();
+        let sibling = |file: &str| files.iter().any(|f| *f.0 == *file.as_bytes());
+        let dirs = view.index.children(d).iter().map(|&k| {
+            let name = view.tree.name(view.tree.record(k).name);
+            let inside = |file: &str| {
+                let mut path = path.clone();
+                join(&mut path, name);
+                join(&mut path, file.as_bytes());
+                sys::exists(Path::new(OsStr::from_bytes(&path)))
+            };
+            Row {
+                size: view.totals.size[k as usize],
+                private: view.totals.private[k as usize],
+                item: Item::Dir(k),
+                label: labels::label(name, parent, sibling, inside),
+            }
         });
         let mut rows: Vec<Row> = (files.iter().enumerate())
-            .map(|(i, &(_, size))| Row {
+            .map(|(i, &(_, size, private))| Row {
                 size,
+                private,
                 item: Item::File(i as u32),
+                label: None,
             })
             .chain(dirs)
             .collect();
@@ -519,14 +611,25 @@ impl Browser {
         self.offset = 0;
     }
 
-    /// Shows the selected item in the file manager, or opens it. Without a
-    /// desktop, the footer shows its path instead.
-    fn reveal(&mut self, reveal: bool, run: &mut dyn FnMut(&str, &[OsString]) -> io::Result<()>) {
-        let (Some(view), Some((_, name))) = (&self.view, self.at_cursor()) else {
-            return;
-        };
+    /// The path of the row at the cursor.
+    fn cursor_path(&self) -> Option<Vec<u8>> {
+        let (view, (_, name)) = (self.view.as_ref()?, self.at_cursor()?);
         let mut path = view.tree.dir_path(self.dir());
         join(&mut path, name);
+        Some(path)
+    }
+
+    /// Shows `path`, if any, in the file manager, or opens it. Without a
+    /// desktop, the footer shows the path instead.
+    fn reveal(
+        &mut self,
+        path: Option<Vec<u8>>,
+        reveal: bool,
+        run: &mut dyn FnMut(&str, &[OsString]) -> io::Result<()>,
+    ) {
+        let Some(path) = path else {
+            return;
+        };
         let path = PathBuf::from(OsString::from_vec(path));
         self.message = match self.env.desktop.command(&path, reveal) {
             Some((program, args)) => run(program, &args)
@@ -560,6 +663,7 @@ impl Browser {
         match &self.message {
             Some(message) => message.clone(),
             None if self.panel.is_some() => PANEL_HELP.into(),
+            None if self.top.is_some() => TOP_HELP.into(),
             None if self.typing || !self.filter.is_empty() => format!("/{}", self.filter),
             None => HELP.into(),
         }
@@ -586,9 +690,10 @@ fn name<'a>(view: &'a View, files: &'a Files, item: Item) -> &'a [u8] {
     }
 }
 
-/// Lists the files of dir `d` from disk. Empty if it cannot be read, or the
-/// scan did not go into it, so neither does the browser.
-fn list(tree: &Tree, d: u32) -> Files {
+/// Lists the files of dir `d` from disk, with reclaimable bytes if
+/// `private`. Empty if it cannot be read, or the scan did not go into it,
+/// so neither does the browser.
+fn list(tree: &Tree, d: u32, private: bool) -> Files {
     let mut files = Vec::new();
     if tree.record(d).flags & (Record::DENIED | Record::OTHER_DEVICE) != 0 {
         return files;
@@ -604,9 +709,9 @@ fn list(tree: &Tree, d: u32) -> Files {
     };
     if let Ok(fd) = fd {
         // a listing cut short keeps what it got
-        let _ = sys::read_dir(&fd, false, |e| {
+        let _ = sys::read_dir(&fd, private, |e| {
             if e.kind != Kind::Dir {
-                files.push((e.name.to_bytes().into(), e.bytes));
+                files.push((e.name.to_bytes().into(), e.bytes, e.private));
             }
         });
     }
@@ -626,20 +731,27 @@ fn column(
 ) {
     let lines = (area.y..area.bottom()).zip(rows.iter().enumerate().skip(offset));
     for (y, (i, row)) in lines {
-        let size = format_size(row.size);
         let label = String::from_utf8_lossy(name(view, files, row.item));
+        let flags = match row.item {
+            Item::Dir(k) => view.totals.flags[k as usize],
+            Item::File(_) => 0,
+        };
+        // something below was denied, so the sizes are lower bounds
+        let plus = match flags & Record::PARTIAL {
+            0 => ' ',
+            _ => '+',
+        };
+        let mut sizes = format!("{:>10}{plus}", format_size(row.size));
+        if view.reclaimable {
+            write!(sizes, "{:>10}{plus}", format_size(row.private)).unwrap();
+        }
         let text = match row.item {
             Item::Dir(k) => {
-                let flags = view.totals.flags[k as usize];
-                // something below was denied, so the size is a lower bound
-                let plus = match flags & Record::PARTIAL {
-                    0 => ' ',
-                    _ => '+',
-                };
                 let marker = suffix(view.tree.record(k), flags & !Record::PARTIAL);
-                format!("{size:>10}{plus} {label}/{marker}")
+                let cache = row.label.map(|l| format!("  [{l}]")).unwrap_or_default();
+                format!("{sizes} {label}/{marker}{cache}")
             }
-            Item::File(_) => format!("{size:>10}  {label}"),
+            Item::File(_) => format!("{sizes} {label}"),
         };
         let style = match mark {
             Some((at, style)) if at == i => style,
@@ -675,6 +787,68 @@ fn panel(buf: &mut Buffer, area: Rect, view: &View, terminal: &str, offset: usiz
         buf.set_stringn(area.x, y, text, area.width.into(), Style::new());
     }
     offset
+}
+
+/// Draws the largest files of `view` still there, as paths below the root,
+/// from `top`'s offset, the one at its cursor reversed. A file is checked
+/// with one `lstat` when first drawn, and left out if gone.
+fn top_files(buf: &mut Buffer, area: Rect, view: &View, top: &mut Top) {
+    if view.largest.is_empty() && view.status == Status::Scanning {
+        buf.set_stringn(
+            area.x,
+            area.y,
+            "scanning...",
+            area.width.into(),
+            Style::new(),
+        );
+        return;
+    }
+    let height = usize::from(area.height);
+    top.offset = scroll(top.offset, top.cursor, height);
+    // every row down to the last drawn is checked
+    let mut shown = Vec::new();
+    for (size, path) in &view.largest {
+        if shown.len() == top.offset + height {
+            break;
+        }
+        let there = match top.there.get(path) {
+            Some(&there) => there,
+            None => {
+                let there = sys::exists(Path::new(OsStr::from_bytes(path)));
+                top.there.insert(path.clone(), there);
+                there
+            }
+        };
+        if there {
+            shown.push((*size, &path[..]));
+        }
+    }
+    // the list may have ended above the cursor
+    top.cursor = top.cursor.min(shown.len().saturating_sub(1));
+    top.offset = scroll(top.offset, top.cursor, height);
+    let root = view.tree.name(0).len();
+    let lines = (area.y..area.bottom()).zip(shown.iter().enumerate().skip(top.offset));
+    for (y, (i, &(size, path))) in lines {
+        let below = path[root..].strip_prefix(b"/").unwrap_or(&path[root..]);
+        let text = format!(
+            "{:>10}  {}",
+            format_size(size),
+            String::from_utf8_lossy(below)
+        );
+        let style = match i == top.cursor {
+            true => Style::new().add_modifier(Modifier::REVERSED),
+            false => Style::new(),
+        };
+        buf.set_style(
+            Rect {
+                y,
+                height: 1,
+                ..area
+            },
+            style,
+        );
+        buf.set_stringn(area.x, y, text, area.width.into(), style);
+    }
 }
 
 /// The first row to draw, moved from `offset` as little as possible so
@@ -731,7 +905,7 @@ mod tests {
             terminal: "Terminal".into(),
             cache: None,
         };
-        let mut b = Browser::new(dir.path(), "/scan", env, None, None);
+        let mut b = Browser::new(dir.path(), "/scan", env, None, None, false);
         assert!(tree.progress().snapshot().is_none());
         assert_eq!(draw(&mut b), screen("/scan  scanning...", &[]));
 
@@ -747,10 +921,7 @@ mod tests {
         tree.push(dir(Record::NO_PARENT, 0, 0));
         tree.push(dir(0, ids[0], 4096));
         tree.push(dir(1, ids[1], 8192));
-        b.show(View::new(
-            tree.progress().snapshot().unwrap(),
-            Status::Scanning,
-        ));
+        b.show(tree.progress().snapshot().unwrap(), Status::Scanning);
         // the columns start at x 34 and 67
         let a = format!("{:34}{:<33}{}", "", "  12.0 KiB  a/", "   8.0 KiB  x/");
         let expected = screen("/scan  scanning... at least 12.0 KiB", &[&a]);

@@ -27,8 +27,8 @@ Or download a `.tar.gz` from
 Pre-release. The commands so far:
 
 ```sh
-disksweep
-disksweep <path>
+disksweep [-r]
+disksweep [-r] <path>
 disksweep scan <path> [--threads N] [-r] [--json [--depth N]] [--top N]
 disksweep show <path> [-r] [--json [--depth N]] [--top N]
 ```
@@ -112,6 +112,7 @@ the sizes grow, about once a second, until the scan is done and saved. If
 | `R`                  | Rescan all of `<path>`                                 |
 | `/`                  | Filter the current column by text; Esc clears          |
 | `d`                  | List the directories that could not be read, and why   |
+| `t`                  | Show or hide the largest files under `<path>`          |
 | `q`, Esc             | Quit                                                   |
 
 Reveal and open run `open -R` and `open` on macOS, and `xdg-open` on Linux,
@@ -127,6 +128,48 @@ bound:
   36.0 KiB+ a/
    4.0 KiB  locked/ (denied: EACCES)
 ```
+
+`t` lists the largest files the scan found under `<path>`, up to 1000, one
+per row with its path below `<path>`. Up and Down move, and `r` and `o`
+reveal and open the selected file. Each file is checked with one `lstat`
+when first shown, and left out if it is gone. Closing and reopening the list
+checks again. During a scan it lists the largest files found so far.
+
+```text
+   1.2 GiB  target/release/deps/libfoo.rlib
+ 640.0 MiB  .git/objects/pack/pack-1a2b.pack
+```
+
+On macOS, `disksweep -r` scans with reclaimable sizes, like `scan -r`, and
+shows them in a second column after each size. A saved scan made without
+`-r` is not shown first in this mode; the fresh scan is.
+
+```text
+   1.0 MiB        0 B  clone/
+   1.0 MiB    1.0 MiB  solo/
+```
+
+Directories that tools rebuild on demand get a label after the name:
+
+```text
+ 412.3 MiB  node_modules/  [cache: npm]
+```
+
+| Directory            | Label           | Only when                               |
+| -------------------- | --------------- | --------------------------------------- |
+| `node_modules`       | `cache: npm`    |                                         |
+| `target`             | `cache: cargo`  | a `Cargo.toml` is next to it            |
+| `.gradle`            | `cache: gradle` |                                         |
+| `__pycache__`        | `cache: python` |                                         |
+| `.venv`, `venv`      | `cache: venv`   | it holds a `pyvenv.cfg`                 |
+| `DerivedData`        | `cache: xcode`  |                                         |
+| `.cache`             | `cache`         |                                         |
+| `Caches`             | `cache`         | it is in a directory named `Library`    |
+
+A label never deletes anything. To delete a labelled directory, reveal it
+with `r` and delete it by hand. Labels come from the listing a directory is
+in, so they cost no extra reads, except the venv rule: one `lstat` of
+`pyvenv.cfg` per venv shown.
 
 Once a scan of a volume's root is done, a line under the columns says how
 many of the volume's used bytes the scan did not find, if any:

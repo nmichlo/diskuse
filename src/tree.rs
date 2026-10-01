@@ -192,7 +192,7 @@ pub(crate) struct Builder {
     names: Names,
     /// Name ids by name. Only interning takes the lock, never reading.
     ids: Mutex<HashMap<Box<[u8]>, u32>>,
-    pub largest: Largest,
+    pub largest: Arc<Largest>,
 }
 
 /// Read access to a tree while [`crate::scan_live`] builds it.
@@ -200,12 +200,13 @@ pub(crate) struct Builder {
 pub struct Progress {
     records: Arc<boxcar::Vec<Record>>,
     names: Names,
+    largest: Arc<Largest>,
 }
 
 impl Progress {
-    /// The tree so far, without largest files, or `None` before the root
-    /// is listed. Directories not yet listed are not in it yet, so every
-    /// size is a lower bound.
+    /// The tree so far, with the largest files found so far, or `None`
+    /// before the root is listed. Directories not yet listed are not in it
+    /// yet, so every size is a lower bound.
     pub fn snapshot(&self) -> Option<Tree> {
         // up to the first slot another thread is still writing. A parent
         // is pushed before its children, so every parent is in the prefix.
@@ -216,10 +217,15 @@ impl Progress {
             .take_while(|&(k, (i, _))| k == i)
             .map(|(_, (_, r))| *r)
             .collect();
+        // a file's dir may be past the prefix
+        let largest = (self.largest.heap.lock().unwrap().iter())
+            .filter(|f| (f.0.dir as usize) < records.len())
+            .map(|Reverse(f)| f.clone())
+            .collect();
         (!records.is_empty()).then(|| Tree {
             records,
             names: Arc::clone(&self.names),
-            largest: Vec::new(),
+            largest,
         })
     }
 }
@@ -273,7 +279,7 @@ impl Builder {
             records: Arc::default(),
             names: Arc::new(names),
             ids: Mutex::default(),
-            largest: Largest::default(),
+            largest: Arc::default(),
         }
     }
 
@@ -302,6 +308,7 @@ impl Builder {
         Progress {
             records: Arc::clone(&self.records),
             names: Arc::clone(&self.names),
+            largest: Arc::clone(&self.largest),
         }
     }
 
@@ -310,11 +317,8 @@ impl Builder {
             // a copy, as a `Progress` may still share the records
             records: self.records.iter().map(|(_, r)| *r).collect(),
             names: self.names,
-            largest: self
-                .largest
-                .heap
-                .into_inner()
-                .unwrap()
+            // taken, as a `Progress` may still share the heap
+            largest: std::mem::take(&mut *self.largest.heap.lock().unwrap())
                 .into_iter()
                 .map(|Reverse(f)| f)
                 .collect(),

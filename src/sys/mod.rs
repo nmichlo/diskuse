@@ -82,6 +82,13 @@ pub fn dir_stat(fd: BorrowedFd<'_>) -> Result<DirStat> {
     })
 }
 
+/// Whether `path` is still there, by one `lstat`, which never follows a
+/// final symlink. Only "no such file" counts as gone; any other error
+/// cannot tell, so counts as there.
+pub fn exists(path: &Path) -> bool {
+    !matches!(rustix::fs::lstat(path), Err(Errno::NOENT | Errno::NOTDIR))
+}
+
 /// Calls `f` for every entry of the open directory `fd`, with the fastest
 /// reader for the OS. `private` asks for [`Entry::private`].
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]

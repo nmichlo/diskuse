@@ -284,29 +284,11 @@ fn scan_handles_chains_deeper_than_path_max() {
     assert_eq!(outs, [expected.clone(), expected]);
 }
 
-/// ```text
-/// root/
-///   orig/f      1 MiB
-///   clone/f     `cp -c` of orig/f: shares all its blocks
-///   solo/f      1 MiB, unshared
-/// ```
 #[cfg(target_os = "macos")]
 #[test]
 fn reclaimable_excludes_blocks_shared_with_a_clone() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::clones();
     let root = dir.path();
-    for d in ["orig", "clone", "solo"] {
-        fs::create_dir(root.join(d)).unwrap();
-    }
-    common::file(&root.join("orig/f"), 1 << 20);
-    common::file(&root.join("solo/f"), 1 << 20);
-    let cp = Command::new("/bin/cp")
-        .arg("-c")
-        .arg(root.join("orig/f"))
-        .arg(root.join("clone/f"))
-        .status()
-        .unwrap();
-    assert!(cp.success());
     // Both copies still allocate 1 MiB each, like du says, but APFS counts
     // the shared blocks as private to neither, so deleting either alone
     // frees 0 B. The root's 1 MiB is a sum over files, so it also leaves

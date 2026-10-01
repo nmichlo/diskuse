@@ -9,6 +9,8 @@ struct Cli {
     /// Browse PATH full screen while it is scanned. Without PATH, pick a
     /// volume to browse first.
     path: Option<PathBuf>,
+    #[command(flatten)]
+    reclaimable: Reclaimable,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -37,14 +39,30 @@ enum Command {
     },
 }
 
-/// Flags `scan` and `show` share, so `show` can print what `scan` did.
+/// `-r`, which only macOS has.
 #[derive(Args)]
-struct Output {
+struct Reclaimable {
     /// Add a column of reclaimable bytes: the space deleting each item
     /// alone frees, while clones of its files elsewhere remain
     #[cfg(target_os = "macos")]
     #[arg(short, long)]
     reclaimable: bool,
+}
+
+impl Reclaimable {
+    fn on(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.reclaimable;
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+}
+
+/// Flags `scan` and `show` share, so `show` can print what `scan` did.
+#[derive(Args)]
+struct Output {
+    #[command(flatten)]
+    reclaimable: Reclaimable,
     /// Print JSON instead of text
     #[arg(long)]
     json: bool,
@@ -59,10 +77,7 @@ struct Output {
 
 impl Output {
     fn reclaimable(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        return self.reclaimable;
-        #[cfg(not(target_os = "macos"))]
-        false
+        self.reclaimable.on()
     }
 
     fn print(&self, tree: &disksweep::Tree) {
@@ -90,12 +105,12 @@ fn main() -> ExitCode {
             _,
         ) => scan(&path, threads, reader, &output),
         (Some(Command::Show { path, output }), _) => show(&path, &output),
-        (None, path) => browse(path.as_deref()),
+        (None, path) => browse(path.as_deref(), cli.reclaimable.on()),
     }
 }
 
-fn browse(path: Option<&Path>) -> ExitCode {
-    match (disksweep::browse(path), path) {
+fn browse(path: Option<&Path>, reclaimable: bool) -> ExitCode {
+    match (disksweep::browse(path, reclaimable), path) {
         (Ok(()), _) => ExitCode::SUCCESS,
         (Err(e), Some(path)) => {
             eprintln!("disksweep: {}: {e}", path.display());
