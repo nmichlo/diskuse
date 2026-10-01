@@ -147,6 +147,7 @@ version = "0.0.0"
 dependencies = [
  "boxcar",
  "clap",
+ "libc",
  "rayon",
  "rustix",
  "tempfile",

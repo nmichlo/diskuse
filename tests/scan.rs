@@ -23,6 +23,10 @@ fn scan(path: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// Extra args for each directory reader. On macOS this checks the bulk
+/// reader against the portable one.
+const READERS: [&[&str]; 2] = [&[], &["--reader", "portable"]];
+
 /// Writes a file of `len` bytes and requires the filesystem to allocate
 /// exactly `len` bytes for it, which the expected sizes below rely on.
 fn file(path: &Path, len: usize) {
@@ -173,7 +177,9 @@ fn fixture() -> Fixture {
 #[test]
 fn scan_reports_exact_sizes() {
     let f = fixture();
-    assert_eq!(scan(f.dir.path(), &[]), f.expected);
+    for reader in READERS {
+        assert_eq!(scan(f.dir.path(), reader), f.expected, "{reader:?}");
+    }
 }
 
 #[test]
@@ -251,7 +257,7 @@ fn scan_handles_chains_deeper_than_path_max() {
     )
     .unwrap();
     make_chain(&root, 4096);
-    let out = scan(dir.path(), &[]);
+    let outs = READERS.map(|reader| scan(dir.path(), reader));
     remove_chain(&root);
 
     let path = dir.path().display();
@@ -260,5 +266,43 @@ fn scan_handles_chains_deeper_than_path_max() {
         4096 => format!("  16.0 MiB  {path}\n  16.0 MiB  d/\n   4.0 KiB  [files]\n"),
         d => panic!("unexpected dir size {d}"),
     };
-    assert_eq!(out, expected);
+    assert_eq!(outs, [expected.clone(), expected]);
+}
+
+/// ```text
+/// root/
+///   orig/f      1 MiB
+///   clone/f     `cp -c` of orig/f: shares all its blocks
+///   solo/f      1 MiB, unshared
+/// ```
+#[cfg(target_os = "macos")]
+#[test]
+fn reclaimable_excludes_blocks_shared_with_a_clone() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for d in ["orig", "clone", "solo"] {
+        fs::create_dir(root.join(d)).unwrap();
+    }
+    file(&root.join("orig/f"), 1 << 20);
+    file(&root.join("solo/f"), 1 << 20);
+    let cp = Command::new("/bin/cp")
+        .arg("-c")
+        .arg(root.join("orig/f"))
+        .arg(root.join("clone/f"))
+        .status()
+        .unwrap();
+    assert!(cp.success());
+    // Both copies still allocate 1 MiB each, like du says, but APFS counts
+    // the shared blocks as private to neither, so deleting either alone
+    // frees 0 B. The root's 1 MiB is a sum over files, so it also leaves
+    // out the shared blocks, which deleting the whole root would free.
+    // APFS dirs allocate 0 B.
+    let expected = [
+        &format!("   3.0 MiB     1.0 MiB  {}\n", root.display()),
+        "   1.0 MiB         0 B  clone/\n",
+        "   1.0 MiB         0 B  orig/\n",
+        "   1.0 MiB     1.0 MiB  solo/\n",
+    ]
+    .concat();
+    assert_eq!(scan(root, &["-r"]), expected);
 }

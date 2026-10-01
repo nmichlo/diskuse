@@ -5,17 +5,22 @@ use crate::tree::{Record, Tree};
 use std::fmt::Write;
 
 /// The root's total, then its direct children and its own files, largest
-/// first, ties by name bytes.
-pub fn report(tree: &Tree) -> String {
+/// first, ties by name bytes. `reclaimable` adds a second size column, the
+/// bytes not shared with a clone.
+pub fn report(tree: &Tree, reclaimable: bool) -> String {
     let totals = tree.totals();
     let index = tree.child_index();
     let denied = (0..tree.len() as u32)
         .filter(|&i| tree.record(i).flags & Record::DENIED != 0)
         .count();
+    let sizes = |size: u64, private: u64| match reclaimable {
+        true => format!("{:>10}  {:>10}", format_size(size), format_size(private)),
+        false => format!("{:>10}", format_size(size)),
+    };
 
     let mut out = format!(
-        "{:>10}  {}",
-        format_size(totals.size[0]),
+        "{}  {}",
+        sizes(totals.size[0], totals.private[0]),
         String::from_utf8_lossy(tree.name(tree.record(0).name))
     );
     if denied > 0 {
@@ -23,8 +28,8 @@ pub fn report(tree: &Tree) -> String {
     }
     out.push('\n');
 
-    // (size, name bytes for the tie-break, label)
-    let mut rows: Vec<(u64, &[u8], String)> = index
+    // (size, private, name bytes for the tie-break, label)
+    let mut rows: Vec<(u64, u64, &[u8], String)> = index
         .children(0)
         .iter()
         .map(|&i| {
@@ -35,16 +40,17 @@ pub fn report(tree: &Tree) -> String {
                 String::from_utf8_lossy(name),
                 suffix(r, totals.flags[i as usize])
             );
-            (totals.size[i as usize], name, label)
+            let i = i as usize;
+            (totals.size[i], totals.private[i], name, label)
         })
         .collect();
-    let files = tree.record(0).own;
-    if files > 0 {
-        rows.push((files, b"[files]", "[files]".into()));
+    let root = tree.record(0);
+    if root.own > 0 {
+        rows.push((root.own, root.own_private, b"[files]", "[files]".into()));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
-    for (size, _, label) in rows {
-        writeln!(out, "{:>10}  {label}", format_size(size)).unwrap();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(b.2)));
+    for (size, private, _, label) in rows {
+        writeln!(out, "{}  {label}", sizes(size, private)).unwrap();
     }
     out
 }

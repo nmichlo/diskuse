@@ -9,5 +9,5 @@ mod sys;
 mod tree;
 
 pub use report::report;
-pub use scan::{ScanError, ScanOptions, scan};
+pub use scan::{Reader, ScanError, ScanOptions, scan};
 pub use tree::{ChildIndex, Record, Totals, Tree};

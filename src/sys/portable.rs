@@ -28,6 +28,8 @@ pub fn read_dir(fd: BorrowedFd<'_>, mut f: impl FnMut(Entry<'_>)) -> Result<()> 
             dev: st.st_dev as u64,
             nlink: st.st_nlink as u64,
             bytes: st.st_blocks as u64 * 512,
+            mount: false,
+            private: 0,
         });
     }
     Ok(())

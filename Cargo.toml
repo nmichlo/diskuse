@@ -16,6 +16,9 @@ clap = { version = "4.6.7", features = ["derive"] }
 rayon = "1.12.0"
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 

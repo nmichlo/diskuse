@@ -1,8 +1,10 @@
 //! The only module that makes raw OS calls. Every open is read-only.
 //!
-//! Directory readers live in their own files and all yield [`Entry`], so a
-//! platform-specific reader can replace [`portable`] behind [`read_dir`].
+//! Directory readers live in their own files and all yield [`Entry`].
+//! [`read_dir`] picks the fastest one for the OS.
 
+#[cfg(target_os = "macos")]
+mod macos;
 mod portable;
 
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -36,6 +38,14 @@ pub struct Entry<'a> {
     pub nlink: u64,
     /// Allocated bytes (`st_blocks * 512`), not the apparent length.
     pub bytes: u64,
+    /// A mount point, as far as the reader can tell. On macOS the Data
+    /// volume has the same `st_dev` as `/`, so only the macOS reader can
+    /// see that boundary.
+    pub mount: bool,
+    /// Of `bytes`, those freed by deleting this entry alone: all of them,
+    /// unless some are shared with a clone. Only the macOS reader fills it,
+    /// and only when asked; otherwise 0.
+    pub private: u64,
 }
 
 /// What `fstat` says about an open directory.
@@ -68,9 +78,27 @@ pub fn dir_stat(fd: BorrowedFd<'_>) -> Result<DirStat> {
     })
 }
 
-/// Calls `f` for every entry of the open directory `fd`.
-pub fn read_dir(fd: impl AsFd, f: impl FnMut(Entry<'_>)) -> Result<()> {
+/// Calls `f` for every entry of the open directory `fd`, with the fastest
+/// reader for the OS. `private` asks for [`Entry::private`].
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn read_dir(fd: impl AsFd, private: bool, f: impl FnMut(Entry<'_>)) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return macos::read_dir(fd.as_fd(), private, f);
+    #[cfg(not(target_os = "macos"))]
     portable::read_dir(fd.as_fd(), f)
+}
+
+/// [`read_dir`] with `readdir` plus `lstat`, the reader every unix has.
+pub fn read_dir_portable(fd: impl AsFd, f: impl FnMut(Entry<'_>)) -> Result<()> {
+    portable::read_dir(fd.as_fd(), f)
+}
+
+/// Stops this process from downloading iCloud placeholder files while it
+/// reads, so a scan never fills the disk it measures. macOS only. Failure
+/// only means such files may download, so it is ignored.
+pub fn keep_placeholders_remote() {
+    #[cfg(target_os = "macos")]
+    macos::keep_placeholders_remote();
 }
 
 /// Raises the soft open-file limit to `min(hard, 65536)`. The walk keeps a

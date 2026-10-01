@@ -19,6 +19,9 @@ pub struct Record {
     /// Allocated bytes of the directory itself plus all its non-directory
     /// entries. Hard links count once per scan.
     pub own: u64,
+    /// Of `own`, the bytes not shared with a clone elsewhere, so freed by
+    /// deleting. 0 unless scanned with `reclaimable` on macOS.
+    pub own_private: u64,
 }
 
 impl Record {
@@ -36,6 +39,8 @@ impl Record {
 pub struct Totals {
     /// `own` of the record plus that of all its descendants.
     pub size: Vec<u64>,
+    /// The same sum of `own_private`.
+    pub private: Vec<u64>,
     /// The record's flags plus [`Record::PARTIAL`].
     pub flags: Vec<u32>,
 }
@@ -80,17 +85,23 @@ impl Tree {
 
     pub fn totals(&self) -> Totals {
         let mut size: Vec<u64> = self.records.iter().map(|r| r.own).collect();
+        let mut private: Vec<u64> = self.records.iter().map(|r| r.own_private).collect();
         let mut flags: Vec<u32> = self.records.iter().map(|r| r.flags).collect();
         // children come after parents, so one backwards pass sees every child
         // before its parent
         for i in (1..self.records.len()).rev() {
             let p = self.records[i].parent as usize;
             size[p] += size[i];
+            private[p] += private[i];
             if flags[i] & (Record::DENIED | Record::PARTIAL) != 0 {
                 flags[p] |= Record::PARTIAL;
             }
         }
-        Totals { size, flags }
+        Totals {
+            size,
+            private,
+            flags,
+        }
     }
 
     pub fn child_index(&self) -> ChildIndex {

@@ -18,14 +18,35 @@ enum Command {
         /// Worker threads [default: available parallelism]
         #[arg(long)]
         threads: Option<NonZeroUsize>,
+        /// Add a column of reclaimable bytes: the space deleting each item
+        /// alone frees, while clones of its files elsewhere remain
+        #[cfg(target_os = "macos")]
+        #[arg(short, long)]
+        reclaimable: bool,
+        /// Directory reader, for the differential test and benchmarks
+        #[arg(long, value_enum, default_value_t, hide = true)]
+        reader: disksweep::Reader,
     },
 }
 
 fn main() -> ExitCode {
-    let Command::Scan { path, threads } = Cli::parse().command;
-    match disksweep::scan(&path, &disksweep::ScanOptions { threads }) {
+    let Command::Scan {
+        path,
+        threads,
+        #[cfg(target_os = "macos")]
+        reclaimable,
+        reader,
+    } = Cli::parse().command;
+    #[cfg(not(target_os = "macos"))]
+    let reclaimable = false;
+    let opts = disksweep::ScanOptions {
+        threads,
+        reclaimable,
+        reader,
+    };
+    match disksweep::scan(&path, &opts) {
         Ok(tree) => {
-            print!("{}", disksweep::report(&tree));
+            print!("{}", disksweep::report(&tree, reclaimable));
             ExitCode::SUCCESS
         }
         Err(e) => {
