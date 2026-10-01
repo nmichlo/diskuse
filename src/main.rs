@@ -4,10 +4,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    args_conflicts_with_subcommands = true,
+    arg_required_else_help = true
+)]
 struct Cli {
+    /// Browse PATH full screen while it is scanned
+    path: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -75,14 +82,30 @@ impl Output {
 }
 
 fn main() -> ExitCode {
-    match Cli::parse().command {
-        Command::Scan {
-            path,
-            threads,
-            reader,
-            output,
-        } => scan(&path, threads, reader, &output),
-        Command::Show { path, output } => show(&path, &output),
+    let cli = Cli::parse();
+    match (cli.command, cli.path) {
+        (
+            Some(Command::Scan {
+                path,
+                threads,
+                reader,
+                output,
+            }),
+            _,
+        ) => scan(&path, threads, reader, &output),
+        (Some(Command::Show { path, output }), _) => show(&path, &output),
+        // clap requires a path or a subcommand
+        (None, path) => browse(&path.unwrap()),
+    }
+}
+
+fn browse(path: &Path) -> ExitCode {
+    match disksweep::browse(path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("disksweep: {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
     }
 }
 

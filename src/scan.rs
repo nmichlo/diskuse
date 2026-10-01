@@ -3,7 +3,7 @@
 //! fd, so trees deeper than PATH_MAX work.
 
 use crate::sys::{self, Kind};
-use crate::tree::{Builder, Record, Tree};
+use crate::tree::{Builder, Progress, Record, Tree};
 use rustix::fd::{AsFd, OwnedFd};
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -59,6 +59,16 @@ impl std::error::Error for ScanError {}
 /// limit, since the walk holds many directory fds open at once, and on macOS
 /// it stops iCloud placeholder files from downloading.
 pub fn scan(root: &Path, opts: &ScanOptions) -> Result<Tree, ScanError> {
+    scan_live(root, opts, |_| {})
+}
+
+/// [`scan`], first handing `progress` a [`Progress`] that reads the tree
+/// while it is built, from any thread.
+pub fn scan_live(
+    root: &Path,
+    opts: &ScanOptions,
+    progress: impl FnOnce(Progress),
+) -> Result<Tree, ScanError> {
     sys::raise_fd_limit();
     sys::keep_placeholders_remote();
     let fd = sys::open_root(root).map_err(|e| ScanError::Root(e.into()))?;
@@ -79,6 +89,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Result<Tree, ScanError> {
         // a dir's own blocks are never shared with a clone
         private: if opts.reclaimable { st.bytes } else { 0 },
     };
+    progress(walk.tree.progress());
     pool.scope(|s| walk.list(s, fd, Record::NO_PARENT, 0, own));
     Ok(walk.tree.finish())
 }
@@ -187,12 +198,7 @@ impl Walk {
         if denied.is_some() {
             return;
         }
-        let ids: Vec<u32> = {
-            let mut names = self.tree.names.lock().unwrap();
-            kids.iter()
-                .map(|k| names.intern(k.name.to_bytes()))
-                .collect()
-        };
+        let ids = self.tree.intern(kids.iter().map(|k| k.name.to_bytes()));
         let fd = Arc::new(fd);
         for (kid, name) in kids.into_iter().zip(ids) {
             // like `du -x`: decided from the parent's listing, so a mount

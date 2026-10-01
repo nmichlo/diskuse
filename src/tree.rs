@@ -5,8 +5,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// How many of the largest files a scan keeps.
 pub const LARGEST: usize = 1000;
@@ -75,11 +75,15 @@ pub struct LargeFile {
     pub name: Box<[u8]>,
 }
 
+/// Names by id: append-only, so [`Progress`] reads them while a scan adds
+/// more.
+pub(crate) type Names = Arc<boxcar::Vec<Box<[u8]>>>;
+
 #[derive(Debug)]
 pub struct Tree {
     pub(crate) records: Vec<Record>,
     /// Name id 0 is the root's, never shared with a directory.
-    pub(crate) names: Vec<Box<[u8]>>,
+    pub(crate) names: Names,
     /// In no particular order.
     pub(crate) largest: Vec<LargeFile>,
 }
@@ -108,11 +112,11 @@ impl Tree {
         &self.largest
     }
 
-    /// The path of `file`: the root's name, then `/` and each name below
-    /// it.
-    pub fn path(&self, file: &LargeFile) -> Vec<u8> {
-        let mut names = vec![&file.name[..]];
-        let mut i = file.dir;
+    /// The path of directory `id`: the root's name, then `/` and each name
+    /// below it.
+    pub fn dir_path(&self, id: u32) -> Vec<u8> {
+        let mut names = Vec::new();
+        let mut i = id;
         while i != 0 {
             let r = &self.records[i as usize];
             names.push(self.name(r.name));
@@ -120,12 +124,15 @@ impl Tree {
         }
         let mut path = self.name(0).to_vec();
         for name in names.iter().rev() {
-            // `scan /` must not print `//usr`
-            if path.last() != Some(&b'/') {
-                path.push(b'/');
-            }
-            path.extend_from_slice(name);
+            join(&mut path, name);
         }
+        path
+    }
+
+    /// The path of `file`, like [`Tree::dir_path`].
+    pub fn path(&self, file: &LargeFile) -> Vec<u8> {
+        let mut path = self.dir_path(file.dir);
+        join(&mut path, &file.name);
         path
     }
 
@@ -170,27 +177,50 @@ impl Tree {
     }
 }
 
+/// Appends `name` to `path` after a `/`.
+pub(crate) fn join(path: &mut Vec<u8>, name: &[u8]) {
+    // `scan /` must not print `//usr`
+    if path.last() != Some(&b'/') {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+}
+
 /// The write side of a [`Tree`], shared by all scan threads.
 pub(crate) struct Builder {
-    records: boxcar::Vec<Record>,
-    pub names: Mutex<Names>,
+    records: Arc<boxcar::Vec<Record>>,
+    names: Names,
+    /// Name ids by name. Only interning takes the lock, never reading.
+    ids: Mutex<HashMap<Box<[u8]>, u32>>,
     pub largest: Largest,
 }
 
-pub(crate) struct Names {
-    map: HashMap<Box<[u8]>, u32>,
-    names: Vec<Box<[u8]>>,
+/// Read access to a tree while [`crate::scan_live`] builds it.
+#[derive(Clone)]
+pub struct Progress {
+    records: Arc<boxcar::Vec<Record>>,
+    names: Names,
 }
 
-impl Names {
-    pub fn intern(&mut self, name: &[u8]) -> u32 {
-        if let Some(&id) = self.map.get(name) {
-            return id;
-        }
-        let id = u32::try_from(self.names.len()).expect("over 2^32 distinct names");
-        self.names.push(name.into());
-        self.map.insert(name.into(), id);
-        id
+impl Progress {
+    /// The tree so far, without largest files, or `None` before the root
+    /// is listed. Directories not yet listed are not in it yet, so every
+    /// size is a lower bound.
+    pub fn snapshot(&self) -> Option<Tree> {
+        // up to the first slot another thread is still writing. A parent
+        // is pushed before its children, so every parent is in the prefix.
+        let records: Vec<Record> = self
+            .records
+            .iter()
+            .enumerate()
+            .take_while(|&(k, (i, _))| k == i)
+            .map(|(_, (_, r))| *r)
+            .collect();
+        (!records.is_empty()).then(|| Tree {
+            records,
+            names: Arc::clone(&self.names),
+            largest: Vec::new(),
+        })
     }
 }
 
@@ -237,13 +267,12 @@ impl Builder {
     /// `root` becomes name id 0, the root's, outside the dedup map so no
     /// directory shares it and a saved scan can drop it.
     pub fn new(root: &[u8]) -> Self {
-        let names = Names {
-            map: HashMap::new(),
-            names: vec![root.into()],
-        };
+        let names = boxcar::Vec::new();
+        names.push(root.into());
         Self {
-            records: boxcar::Vec::new(),
-            names: Mutex::new(names),
+            records: Arc::default(),
+            names: Arc::new(names),
+            ids: Mutex::default(),
             largest: Largest::default(),
         }
     }
@@ -252,10 +281,35 @@ impl Builder {
         u32::try_from(self.records.push(record)).expect("over 2^32 directories")
     }
 
+    /// The name id of each name, under one lock.
+    pub fn intern<'a>(&self, names: impl Iterator<Item = &'a [u8]>) -> Vec<u32> {
+        let mut ids = self.ids.lock().unwrap();
+        names
+            .map(|name| {
+                if let Some(&id) = ids.get(name) {
+                    return id;
+                }
+                // pushed under the lock, so a name is never stored twice
+                let id =
+                    u32::try_from(self.names.push(name.into())).expect("over 2^32 distinct names");
+                ids.insert(name.into(), id);
+                id
+            })
+            .collect()
+    }
+
+    pub fn progress(&self) -> Progress {
+        Progress {
+            records: Arc::clone(&self.records),
+            names: Arc::clone(&self.names),
+        }
+    }
+
     pub fn finish(self) -> Tree {
         Tree {
-            records: self.records.into_iter().collect(),
-            names: self.names.into_inner().unwrap().names,
+            // a copy, as a `Progress` may still share the records
+            records: self.records.iter().map(|(_, r)| *r).collect(),
+            names: self.names,
             largest: self
                 .largest
                 .heap

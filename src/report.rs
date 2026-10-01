@@ -12,9 +12,7 @@ use std::fmt::Write;
 pub fn report(tree: &Tree, reclaimable: bool, top: Option<usize>) -> String {
     let totals = tree.totals();
     let index = tree.child_index();
-    let denied = (0..tree.len() as u32)
-        .filter(|&i| tree.record(i).flags & Record::DENIED != 0)
-        .count();
+    let denied = count_denied(tree);
     let sizes = |size: u64, private: u64| match reclaimable {
         true => format!("{:>10}  {:>10}", format_size(size), format_size(private)),
         false => format!("{:>10}", format_size(size)),
@@ -82,7 +80,18 @@ pub(crate) fn largest_files(tree: &Tree, n: usize) -> Vec<(u64, Vec<u8>)> {
     files
 }
 
-fn suffix(r: &Record, flags: u32) -> String {
+/// How many directories could not be read.
+pub(crate) fn count_denied(tree: &Tree) -> usize {
+    tree.records
+        .iter()
+        .filter(|r| r.flags & Record::DENIED != 0)
+        .count()
+}
+
+/// The marker after a directory's name: ` (denied: EACCES)`,
+/// ` (other device)`, ` (partial)` or nothing. `flags` is from
+/// [`crate::Totals::flags`].
+pub(crate) fn suffix(r: &Record, flags: u32) -> String {
     if flags & Record::DENIED != 0 {
         format!(" (denied: {})", denied(r))
     } else if flags & Record::OTHER_DEVICE != 0 {
@@ -104,7 +113,7 @@ pub(crate) fn denied(r: &Record) -> String {
 }
 
 /// `n B` below 1 KiB, else one decimal in binary units.
-fn format_size(n: u64) -> String {
+pub(crate) fn format_size(n: u64) -> String {
     const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
     if n < 1024 {
         return format!("{n} B");

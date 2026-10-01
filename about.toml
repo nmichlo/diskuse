@@ -6,6 +6,7 @@ accepted = [
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "Unicode-3.0",
+    "Zlib",
 ]
 
 # the release targets: the file lists what ships, so Windows-only crates are

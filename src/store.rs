@@ -20,11 +20,13 @@
 
 use crate::sys;
 use crate::tree::{LargeFile, Record, Tree};
-use std::fs::{DirBuilder, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"DSWP";
 const VERSION: u8 = 1;
@@ -40,6 +42,8 @@ pub struct Saved {
     pub tree: Tree,
     /// Scanned with [`crate::ScanOptions::reclaimable`].
     pub reclaimable: bool,
+    /// When the scan was saved: the file's modification time.
+    pub modified: SystemTime,
 }
 
 impl CacheDir {
@@ -99,12 +103,15 @@ impl CacheDir {
     /// there is none, or it is malformed or of another version.
     pub fn load(&self, root: &Path) -> io::Result<Option<Saved>> {
         let (canonical, name) = key(root)?;
-        let bytes = match std::fs::read(self.0.join(name)) {
-            Ok(bytes) => bytes,
+        let mut file = match File::open(self.0.join(name)) {
+            Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(decode(&bytes, &canonical, root))
+        let modified = file.metadata()?.modified()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(decode(&bytes, &canonical, root, modified))
     }
 }
 
@@ -147,9 +154,8 @@ fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> Vec<u8> {
         out.extend_from_slice(&r.own_private.to_le_bytes());
     }
     // name 0 is the root as given, which `show` replaces
-    let names = &tree.names[1..];
-    out.extend_from_slice(&len32(names.len()).to_le_bytes());
-    for name in names {
+    out.extend_from_slice(&len32(tree.names.count() - 1).to_le_bytes());
+    for (_, name) in tree.names.iter().skip(1) {
         put16(&mut out, name);
     }
     out.extend_from_slice(&len32(tree.largest.len()).to_le_bytes());
@@ -175,7 +181,7 @@ fn put16(out: &mut Vec<u8>, name: &[u8]) {
 
 /// Parses a saved file, checking every id so a damaged file cannot make
 /// [`Tree`] index out of bounds.
-fn decode(bytes: &[u8], canonical: &Path, root: &Path) -> Option<Saved> {
+fn decode(bytes: &[u8], canonical: &Path, root: &Path, modified: SystemTime) -> Option<Saved> {
     let mut b = Bytes(bytes);
     if b.take(4)? != MAGIC || b.u8()? != VERSION {
         return None;
@@ -205,7 +211,7 @@ fn decode(bytes: &[u8], canonical: &Path, root: &Path) -> Option<Saved> {
     }
 
     let count = b.u32()? as usize;
-    let mut names: Vec<Box<[u8]>> = Vec::with_capacity(1 + count.min(b.0.len() / 2));
+    let names = boxcar::Vec::with_capacity(1 + count.min(b.0.len() / 2));
     names.push(root.as_os_str().as_bytes().into());
     for _ in 0..count {
         let len = b.u16()? as usize;
@@ -228,16 +234,17 @@ fn decode(bytes: &[u8], canonical: &Path, root: &Path) -> Option<Saved> {
         && first.name == 0
         && rest.iter().enumerate().all(|(i, r)| {
             // a parent always comes before its children
-            (r.parent as usize) <= i && r.name != 0 && (r.name as usize) < names.len()
+            (r.parent as usize) <= i && r.name != 0 && (r.name as usize) < names.count()
         })
         && largest.iter().all(|f| (f.dir as usize) < records.len());
     valid.then_some(Saved {
         tree: Tree {
             records,
-            names,
+            names: Arc::new(names),
             largest,
         },
         reclaimable: flags & RECLAIMABLE != 0,
+        modified,
     })
 }
 

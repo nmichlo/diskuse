@@ -27,6 +27,7 @@ Or download a `.tar.gz` from
 Pre-release. The commands so far:
 
 ```sh
+disksweep <path>
 disksweep scan <path> [--threads N] [-r] [--json [--depth N]] [--top N]
 disksweep show <path> [-r] [--json [--depth N]] [--top N]
 ```
@@ -64,6 +65,41 @@ largest files:
 `show <path>` prints the last saved scan of `<path>` without scanning, exactly
 as `scan` printed it with the same flags. `show -r` needs a scan made with
 `-r`.
+
+## Browse
+
+`disksweep <path>` browses `<path>` full screen, in three columns: the parent
+directory, the current one, and a preview of the selected item. Each lists
+directories and files together, largest first.
+
+```text
+/opt/homebrew  12.0 GiB
+  10.5 GiB  Cellar/                  1.4 GiB  llvm@20/                1.4 GiB  20.1.8/
+ 667.1 MiB  share/                 795.4 MiB  proj/
+ 439.5 MiB  Library/               490.3 MiB  go/
+ 132.1 MiB  .git/                  444.2 MiB  gcc/
+```
+
+It scans while you browse. The title says `scanning... at least <size>` and
+the sizes grow, about once a second, until the scan is done and saved. If
+`<path>` was scanned before, the saved scan shows at once, marked
+`saved 5 min ago`, until the fresh scan is done.
+
+| Key                  | Action                                                 |
+| -------------------- | ------------------------------------------------------ |
+| Up, Down, `k`, `j`   | Move                                                   |
+| Right, Enter, `l`    | Go into the selected directory                         |
+| Left, Backspace, `h` | Go to the parent directory, not above `<path>`         |
+| `r`                  | Reveal the selected item in Finder or the file manager |
+| `o`                  | Open the selected item                                 |
+| `R`                  | Rescan all of `<path>`                                 |
+| `/`                  | Filter the current column by text; Esc clears          |
+| `q`, Esc             | Quit                                                   |
+
+Reveal and open run `open -R` and `open` on macOS, and `xdg-open` on Linux,
+which opens the folder of the item for reveal. Over SSH, or on Linux without
+a display, they run nothing and show the full path instead. Only all of
+`<path>` can be rescanned for now, not a single directory.
 
 ## JSON
 
