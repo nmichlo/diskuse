@@ -1,11 +1,14 @@
 //! The only module that makes raw OS calls. Every open is read-only.
 //!
 //! Directory readers live in their own files and all yield [`Entry`].
-//! [`read_dir`] picks the fastest one for the OS. [`watch`] reports
-//! changes, on macOS only.
+//! [`read_dir`] picks the fastest one for the OS. [`watch`] reports the
+//! changes below a path, on macOS only, and [`Inotify`] those in a few
+//! dirs, on Linux only.
 
 #[cfg(target_os = "macos")]
 mod fsevents;
+#[cfg(target_os = "linux")]
+mod inotify;
 #[cfg(not(target_os = "macos"))]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -137,6 +140,43 @@ pub fn watch(path: &CStr, since: u64, tx: Sender<Vec<Event>>) -> Option<Stream> 
     return fsevents::Stream::start(path, since, tx);
     #[cfg(not(target_os = "macos"))]
     None
+}
+
+/// A change in watched dirs, from [`Inotify::read`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum Note {
+    /// Something in the dir of this watch changed.
+    Changed(i32),
+    /// The dir of this watch itself was deleted, renamed or unmounted.
+    Gone(i32),
+    /// Changes were lost: any watched dir may have changed.
+    Lost,
+}
+
+/// Watches dirs for changes, inotify on Linux.
+#[cfg(target_os = "linux")]
+pub use inotify::Inotify;
+#[cfg(not(target_os = "linux"))]
+pub enum Inotify {}
+
+/// Elsewhere there is never one.
+#[cfg(not(target_os = "linux"))]
+impl Inotify {
+    pub fn new() -> Option<Self> {
+        None
+    }
+
+    pub fn add(&self, _: &CStr, _: bool) -> Option<i32> {
+        match *self {}
+    }
+
+    pub fn remove(&self, _: i32) {
+        match *self {}
+    }
+
+    pub fn read(&self, _: impl FnMut(Note)) {
+        match *self {}
+    }
 }
 
 /// The id of the latest change on the system, for [`watch`], or 0 where

@@ -19,9 +19,7 @@ use std::fs;
 use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
-#[cfg(target_os = "macos")]
-use std::time::Instant;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const WIDTH: usize = 100;
 const HEIGHT: usize = 20;
@@ -34,6 +32,18 @@ const HELP: &str =
     "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  q quit";
 const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  q quit";
 const GIB: u64 = 1 << 30;
+/// After the total of a finished scan: its age, on Linux, where only the
+/// dirs shown follow changes.
+const SCANNED: &str = match cfg!(target_os = "macos") {
+    true => "",
+    false => "  scanned 0 s ago",
+};
+
+/// The time of day the tests' clock always gives, so a scan is dated, and
+/// drawn, then.
+fn now() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+}
 
 /// An expected screen: `title`, the rows of each column, and `footer`.
 /// `parent` is the bold row of the parent column, `current` the reversed
@@ -121,6 +131,7 @@ fn env(desktop: Desktop) -> Env {
         desktop,
         terminal: "iTerm".into(),
         cache: None,
+        inotify: true,
     }
 }
 
@@ -163,8 +174,8 @@ fn expected(f: &Fixture) -> Expected {
         b.push(row(&kib(d), denied));
     }
     let title = match as_root {
-        true => format!("/fixture  {total}"),
-        false => format!("/fixture  {total}  (partial: 2 denied)"),
+        true => format!("/fixture  {total}{SCANNED}"),
+        false => format!("/fixture  {total}  (partial: 2 denied){SCANNED}"),
     };
     Expected { title, root, a, b }
 }
@@ -190,7 +201,7 @@ fn draw(b: &mut Browser, now: SystemTime) -> Buffer {
 }
 
 fn draw_app(app: &mut App) -> Buffer {
-    render(|frame| app.draw(frame, SystemTime::now()))
+    render(|frame| app.draw(frame, now()))
 }
 
 /// The program and arguments of each command run.
@@ -230,7 +241,7 @@ fn scanned(root: &Path, desktop: Desktop) -> Browser {
 fn scanned_as(root: &Path, display: &str, desktop: Desktop, reclaimable: bool) -> Browser {
     let mut b = Browser::new(root, display, env(desktop), None, None, reclaimable);
     b.scan();
-    while b.poll() {
+    while b.poll(now()) {
         std::thread::sleep(Duration::from_millis(1));
     }
     b
@@ -241,10 +252,7 @@ fn shows_the_finished_scan() {
     let f = fixture();
     let e = expected(&f);
     let mut b = scanned(f.dir.path(), Desktop::None);
-    assert_eq!(
-        draw(&mut b, SystemTime::now()),
-        first_view(&e, &e.title, HELP)
-    );
+    assert_eq!(draw(&mut b, now()), first_view(&e, &e.title, HELP));
 }
 
 #[test]
@@ -255,7 +263,7 @@ fn enters_two_levels() {
     press(&mut b, &[KeyCode::Down, KeyCode::Right, KeyCode::Char('l')]);
     let c = [row("12.0 KiB", "f3")];
     let expected = screen(&e.title, [&e.a, &e.b, &c], Some(0), 0, HELP);
-    assert_eq!(draw(&mut b, SystemTime::now()), expected);
+    assert_eq!(draw(&mut b, now()), expected);
 
     // back up to the root, with `a/` selected
     press(
@@ -263,7 +271,7 @@ fn enters_two_levels() {
         &[KeyCode::Left, KeyCode::Char('h'), KeyCode::Char('h')],
     );
     let expected = screen(&e.title, [&[], &e.root, &e.a], None, 1, HELP);
-    assert_eq!(draw(&mut b, SystemTime::now()), expected);
+    assert_eq!(draw(&mut b, now()), expected);
 }
 
 #[test]
@@ -274,13 +282,13 @@ fn filters_the_current_column() {
     press(&mut b, &[KeyCode::Char('/'), KeyCode::Char('p')]);
     let matches = [row("8.0 KiB", "top"), row(&kib(f.dir_bytes), "empty/")];
     let expected = screen(&e.title, [&[], &matches, &[]], None, 0, "/p");
-    assert_eq!(draw(&mut b, SystemTime::now()), expected);
+    assert_eq!(draw(&mut b, now()), expected);
 
     // clearing the filter keeps a selection made while filtered
     press(&mut b, &[KeyCode::Down, KeyCode::Esc]);
     let empty = e.root.iter().position(|r| *r == matches[1]).unwrap();
     let expected = screen(&e.title, [&[], &e.root, &[]], None, empty, HELP);
-    assert_eq!(draw(&mut b, SystemTime::now()), expected);
+    assert_eq!(draw(&mut b, now()), expected);
 }
 
 #[test]
@@ -301,7 +309,8 @@ fn shows_a_saved_scan_with_its_age() {
         false,
     );
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + 5 * 60);
-    let title = format!("{}  saved 5 min ago", e.title);
+    let title = e.title.strip_suffix(SCANNED).unwrap();
+    let title = format!("{title}  saved 5 min ago");
     assert_eq!(draw(&mut b, now), first_view(&e, &title, HELP));
 }
 
@@ -361,10 +370,7 @@ fn shows_the_path_instead_over_ssh_or_without_a_display() {
     let mut b = scanned(f.dir.path(), detect(true, &[ssh]));
     assert_eq!(press(&mut b, &[KeyCode::Char('r')]), []);
     let footer = format!("path: {}", f.dir.path().join("big").display());
-    assert_eq!(
-        draw(&mut b, SystemTime::now()),
-        first_view(&e, &e.title, &footer)
-    );
+    assert_eq!(draw(&mut b, now()), first_view(&e, &e.title, &footer));
 }
 
 #[test]
@@ -388,13 +394,10 @@ fn lists_the_denied_dirs_with_why() {
     let mut lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     lines.resize(HEIGHT - 1, "");
     lines.push("arrows/jk scroll  d close  q quit");
-    assert_eq!(draw(&mut b, SystemTime::now()), plain(&lines, None));
+    assert_eq!(draw(&mut b, now()), plain(&lines, None));
 
     press(&mut b, &[KeyCode::Char('d')]);
-    assert_eq!(
-        draw(&mut b, SystemTime::now()),
-        first_view(&e, &e.title, HELP)
-    );
+    assert_eq!(draw(&mut b, now()), first_view(&e, &e.title, HELP));
 }
 
 fn mount(point: &Path, fs: &str, hidden: bool, total: u64, used: u64, free: u64) -> Mount {
@@ -463,7 +466,7 @@ fn enter_volume(f: &Fixture, used: u64, access: FullDiskAccess) -> App {
 }
 
 fn finish(app: &mut App) {
-    while app.poll() {
+    while app.poll(now()) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -545,7 +548,7 @@ fn shows_reclaimable_sizes() {
     ];
     let clone = [row_r("1.0 MiB", "0 B", "f")];
     let expected = screen("/clones  3.0 MiB", [&[], &root, &clone], None, 0, HELP);
-    assert_eq!(draw(&mut b, SystemTime::now()), expected);
+    assert_eq!(draw(&mut b, now()), expected);
 }
 
 /// ```text
@@ -597,7 +600,7 @@ fn labels_dirs_tools_rebuild() {
         row(&kib(16384 + d), "target/  [cache: cargo]"),
         row("4.0 KiB", "Cargo.toml"),
     ];
-    let title = format!("/labels  {}", kib(45056 + 8 * d));
+    let title = format!("/labels  {}{SCANNED}", kib(45056 + 8 * d));
     let expected = screen_in(
         WIDE,
         WIDE_COLUMNS,
@@ -607,7 +610,7 @@ fn labels_dirs_tools_rebuild() {
         0,
         HELP,
     );
-    assert_eq!(render_in(WIDE, |f| b.draw(f, SystemTime::now())), expected);
+    assert_eq!(render_in(WIDE, |f| b.draw(f, now())), expected);
 }
 
 /// The fixture with one of the hard links `a/h1` and `a/h2` removed, as
@@ -654,14 +657,11 @@ fn lists_the_largest_files() {
     let f = one_link();
     let mut b = scanned(f.dir.path(), Desktop::None);
     press(&mut b, &[KeyCode::Char('t')]);
-    assert_eq!(draw(&mut b, SystemTime::now()), top_files(&f, 0));
+    assert_eq!(draw(&mut b, now()), top_files(&f, 0));
 
     press(&mut b, &[KeyCode::Char('t')]);
     let e = expected(&f);
-    assert_eq!(
-        draw(&mut b, SystemTime::now()),
-        first_view(&e, &e.title, HELP)
-    );
+    assert_eq!(draw(&mut b, now()), first_view(&e, &e.title, HELP));
 }
 
 #[test]
@@ -670,7 +670,7 @@ fn drops_a_largest_file_deleted_since_the_scan() {
     let mut b = scanned(f.dir.path(), Desktop::None);
     fs::remove_file(f.dir.path().join("big/f")).unwrap();
     press(&mut b, &[KeyCode::Char('t')]);
-    assert_eq!(draw(&mut b, SystemTime::now()), top_files(&f, 1));
+    assert_eq!(draw(&mut b, now()), top_files(&f, 1));
 }
 
 #[test]
@@ -686,28 +686,26 @@ fn reveals_and_opens_a_largest_file() {
     assert_eq!(runs, [(open, vec![f3.into()])]);
 }
 
-/// Polls `b` until it draws `expected`, for at most 3 s.
-#[cfg(target_os = "macos")]
-fn shows_within_3s(b: &mut Browser, expected: &Buffer) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+/// Polls `b` until it draws `expected`, for at most `within`.
+fn shows_within(b: &mut Browser, expected: &Buffer, within: Duration) {
+    let deadline = Instant::now() + within;
     loop {
-        b.poll();
-        let drawn = draw(b, SystemTime::now());
+        b.poll(now());
+        let drawn = draw(b, now());
         if drawn == *expected {
             return;
         }
         if Instant::now() > deadline {
-            assert_eq!(drawn, *expected, "not shown within 3 s");
+            assert_eq!(drawn, *expected, "not shown within {within:?}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 /// `root/a/` with `keep` (4096) and `gone` (8192), browsed from a saved
-/// scan brought up to date, then changed while shown.
-#[cfg(target_os = "macos")]
-#[test]
-fn follows_changes_on_disk() {
+/// scan brought up to date, or on Linux scanned again, then changed while
+/// shown. Each change shows `within`. `inotify` is for [`Env::inotify`].
+fn follows_changes(inotify: bool, within: Duration) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir(root.join("a")).unwrap();
@@ -715,36 +713,111 @@ fn follows_changes_on_disk() {
     file(&root.join("a/gone"), 8192);
     let d = common::own_bytes(root);
     // the root lists only `a/`, previewed
-    let shown = |files: &[(u64, &str)]| {
+    let shown_at = |scanned: &str, files: &[(u64, &str)]| {
         let a = d + files.iter().map(|&(size, _)| size).sum::<u64>();
-        let title = format!("/live  {}", kib(a + d));
+        let title = format!("/live  {}{scanned}", kib(a + d));
         let files: Vec<String> = files
             .iter()
             .map(|&(size, name)| row(&kib(size), name))
             .collect();
         screen(&title, [&[], &[row(&kib(a), "a/")], &files], None, 0, HELP)
     };
+    let shown = |files: &[(u64, &str)]| shown_at(SCANNED, files);
     let saved = Saved {
         tree: disksweep::scan(root, &ScanOptions::default()).unwrap(),
         reclaimable: false,
-        modified: SystemTime::now(),
+        modified: now(),
     };
-    let mut b = Browser::new(root, "/live", env(Desktop::None), Some(saved), None, false);
+    let env = Env {
+        inotify,
+        ..env(Desktop::None)
+    };
+    let mut b = Browser::new(root, "/live", env, Some(saved), None, false);
     b.scan();
-    while b.poll() {
+    while b.poll(now()) {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        draw(&mut b, SystemTime::now()),
+        draw(&mut b, now()),
         shown(&[(8192, "gone"), (4096, "keep")])
     );
 
     file(&root.join("a/new"), 4096);
     let expected = shown(&[(8192, "gone"), (4096, "keep"), (4096, "new")]);
-    shows_within_3s(&mut b, &expected);
+    shows_within(&mut b, &expected, within);
     fs::remove_file(root.join("a/gone")).unwrap();
-    shows_within_3s(&mut b, &shown(&[(4096, "keep"), (4096, "new")]));
+    shows_within(&mut b, &shown(&[(4096, "keep"), (4096, "new")]), within);
     // in place: no entry of `a/` changes
     common::append(&root.join("a/keep"), 4096);
-    shows_within_3s(&mut b, &shown(&[(8192, "keep"), (4096, "new")]));
+    let files = [(8192, "keep"), (4096, "new")];
+    shows_within(&mut b, &shown(&files), within);
+    // on Linux the title says how old the scan is
+    let later = now() + Duration::from_secs(4 * 60);
+    let scanned = SCANNED.replace("0 s", "4 min");
+    assert_eq!(draw(&mut b, later), shown_at(&scanned, &files));
+}
+
+/// FSEvents on macOS, inotify on Linux.
+#[test]
+fn follows_changes_on_disk() {
+    let within = match cfg!(target_os = "macos") {
+        true => 3,
+        false => 1,
+    };
+    follows_changes(true, Duration::from_secs(within));
+}
+
+/// Without inotify, as on NFS, the dirs shown are listed again every 2 s.
+#[cfg(target_os = "linux")]
+#[test]
+fn follows_changes_on_a_timer_without_inotify() {
+    follows_changes(false, Duration::from_secs(3));
+}
+
+/// The dirs below `root`, of `dirs`, that an inotify watch of this process
+/// is on, from `/proc`. The watches of other tests are on other dirs.
+#[cfg(target_os = "linux")]
+fn watched<'a>(root: &Path, dirs: &[&'a str]) -> Vec<&'a str> {
+    use std::os::unix::fs::MetadataExt;
+    let ino = |d: &str| fs::metadata(root.join(d)).unwrap().ino();
+    let mut watched = Vec::new();
+    for fd in fs::read_dir("/proc/self/fdinfo").unwrap() {
+        // closed since it was listed
+        let Ok(info) = fs::read_to_string(fd.unwrap().path()) else {
+            continue;
+        };
+        // `inotify wd:1 ino:2a sdev:... mask:...`, hex
+        for line in info.lines().filter_map(|l| l.strip_prefix("inotify wd:")) {
+            let hex = line.split(' ').find_map(|f| f.strip_prefix("ino:"));
+            let n = u64::from_str_radix(hex.unwrap(), 16).unwrap();
+            watched.extend(dirs.iter().filter(|d| ino(d) == n));
+        }
+    }
+    watched.sort_unstable();
+    watched
+}
+
+/// ```text
+/// root/
+///   a/x/f    8192
+///   b/
+/// ```
+#[cfg(target_os = "linux")]
+#[test]
+fn watches_only_the_dirs_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("a/x")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    file(&root.join("a/x/f"), 8192);
+    let dirs = ["", "a", "a/x", "b"];
+    let mut b = scanned(root, Desktop::None);
+    // the root, and `a/` previewed
+    assert_eq!(watched(root, &dirs), ["", "a"]);
+    press(&mut b, &[KeyCode::Right]);
+    assert_eq!(watched(root, &dirs), ["", "a", "a/x"]);
+    press(&mut b, &[KeyCode::Left, KeyCode::Down]);
+    assert_eq!(watched(root, &dirs), ["", "b"]);
+    drop(b);
+    assert_eq!(watched(root, &dirs), [""; 0]);
 }

@@ -2,7 +2,8 @@
 //! and the selected child, each largest first, like OmniDiskSweeper. A scan
 //! runs on its own thread meanwhile; a saved scan, if any, shows until the
 //! fresh one is done, or on macOS, until it is brought up to date from the
-//! changes since. Then the tree follows changes on disk ([`crate::watch`]).
+//! changes since. Then the tree follows changes on disk ([`crate::watch`]):
+//! all of them on macOS, those in the dirs shown on Linux.
 //! `d` lists the dirs the scan could not read instead, and `t` the largest
 //! files. With reclaimable sizes (`-r`), each size has a second column, the
 //! bytes deleting the item alone frees.
@@ -19,7 +20,7 @@ use crate::scan::{ScanError, ScanOptions, scan_live};
 use crate::store::{CacheDir, Saved};
 use crate::sys::{self, Kind};
 use crate::tree::{ChildIndex, LARGEST, Progress, Record, Since, Totals, Tree, join};
-use crate::watch::{Poll, Watch};
+use crate::watch::{DirWatch, Poll, Watch};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -34,7 +35,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const HELP: &str =
     "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  q quit";
@@ -49,6 +50,9 @@ pub struct Env {
     pub terminal: String,
     /// Where a finished scan is saved, if anywhere.
     pub cache: Option<CacheDir>,
+    /// On Linux, watch the dirs shown with inotify. Off, they are listed
+    /// again on a timer, as where inotify cannot watch them.
+    pub inotify: bool,
 }
 
 impl Env {
@@ -58,6 +62,7 @@ impl Env {
             desktop: Desktop::from_env(),
             terminal: terminal_app(std::env::var("TERM_PROGRAM").ok().as_deref()),
             cache: CacheDir::from_env().ok(),
+            inotify: true,
         }
     }
 }
@@ -78,6 +83,8 @@ pub struct Browser {
     scan: Option<Scan>,
     /// Changes on disk below the root, since the tree shown.
     watch: Option<Watch>,
+    /// Without `watch`, changes in the dirs shown.
+    dir_watch: Option<DirWatch>,
     /// Listings by record id, kept until another scan's tree is shown.
     files: HashMap<u32, Files>,
     /// Sorted rows by record id, for the view shown.
@@ -224,6 +231,7 @@ impl Browser {
             view: None,
             scan: None,
             watch: None,
+            dir_watch: None,
             files: HashMap::new(),
             rows: HashMap::new(),
             trail: Vec::new(),
@@ -265,6 +273,7 @@ impl Browser {
     /// Scans all of the root on another thread.
     fn full_scan(&mut self) {
         self.watch = None;
+        self.dir_watch = None;
         let (tx, started) = mpsc::channel();
         let root = self.root.clone();
         let opts = self.options();
@@ -285,7 +294,7 @@ impl Browser {
     /// saved scan is shown, or once it is done, its tree, and saves that.
     /// Without a scan, applies the changes on disk since the last poll.
     /// Returns whether a scan, or the update of a saved scan, still runs.
-    pub fn poll(&mut self) -> bool {
+    pub fn poll(&mut self, now: SystemTime) -> bool {
         let Some(scan) = &mut self.scan else {
             return self.follow();
         };
@@ -301,7 +310,9 @@ impl Browser {
                     // from where the scan started, so it sees the changes
                     // made while it ran
                     self.watch = Watch::start(&self.root, &tree, self.env.cache.as_ref());
-                    self.show(tree, Status::Done);
+                    self.dir_watch =
+                        (self.watch.is_none()).then(|| DirWatch::new(self.env.inotify, now));
+                    self.show_done(tree, Instant::now());
                 }
                 Err(e) => self.message = Some(format!("cannot scan: {e}")),
             }
@@ -477,11 +488,13 @@ impl Browser {
     /// once the watch has replayed those from before it started. Returns
     /// whether a saved scan is still being brought up to date.
     fn follow(&mut self) -> bool {
-        let Some(watch) = &mut self.watch else {
-            return false;
+        let poll = match (&mut self.watch, &mut self.dir_watch, &self.view) {
+            (Some(watch), _, _) => watch.poll(),
+            (None, Some(dirs), Some(view)) => dirs.poll(&view.tree),
+            _ => return false,
         };
         let replaying = matches!(&self.view, Some(v) if matches!(v.status, Status::Saved(_)));
-        let changes = match watch.poll() {
+        let changes = match poll {
             Poll::Wait => return replaying,
             Poll::Lost => {
                 self.full_scan();
@@ -492,6 +505,7 @@ impl Browser {
         if changes.is_empty() && !replaying {
             return false;
         }
+        let started = Instant::now();
         let View {
             mut tree, status, ..
         } = self.view.take().expect("a watch follows a view");
@@ -504,8 +518,17 @@ impl Browser {
         if replaying {
             self.save(&tree);
         }
-        self.show(tree, Status::Done);
+        self.show_done(tree, started);
         false
+    }
+
+    /// Shows `tree`, done since `started`, and tells the dir watch how long
+    /// that took, with the listings of the dirs shown, which `show` redoes.
+    fn show_done(&mut self, tree: Tree, started: Instant) {
+        self.show(tree, Status::Done);
+        if let Some(dirs) = &mut self.dir_watch {
+            dirs.listed(started.elapsed());
+        }
     }
 
     fn options(&self) -> ScanOptions {
@@ -586,11 +609,16 @@ impl Browser {
             .as_deref()
             .and_then(|s| self.current.iter().position(|r| name(r) == s))
             .unwrap_or(0);
+        let mut shown = self.dirs[self.dirs.len().saturating_sub(2)..].to_vec();
         if let Some(&Row {
             item: Item::Dir(k), ..
         }) = self.current.get(self.cursor)
         {
             self.ensure(k);
+            shown.push(k);
+        }
+        if let (Some(dirs), Some(view)) = (&mut self.dir_watch, &self.view) {
+            dirs.show(&view.tree, &shown);
         }
     }
 
@@ -723,7 +751,14 @@ impl Browser {
         };
         match view.status {
             Status::Scanning => format!("{root}  scanning... at least {total}"),
-            Status::Done => format!("{root}  {total}{partial}"),
+            Status::Done => match &self.dir_watch {
+                // changes in the dirs not shown are not seen since
+                Some(dirs) => {
+                    let age = age(now.duration_since(dirs.scanned).unwrap_or_default());
+                    format!("{root}  {total}{partial}  scanned {age} ago")
+                }
+                None => format!("{root}  {total}{partial}"),
+            },
             Status::Saved(at) => {
                 let age = age(now.duration_since(at).unwrap_or_default());
                 format!("{root}  {total}{partial}  saved {age} ago")
@@ -976,6 +1011,7 @@ mod tests {
             desktop: Desktop::None,
             terminal: "Terminal".into(),
             cache: None,
+            inotify: true,
         };
         let mut b = Browser::new(dir.path(), "/scan", env, None, None, false);
         assert!(tree.progress().snapshot().is_none());

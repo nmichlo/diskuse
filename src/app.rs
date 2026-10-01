@@ -67,7 +67,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
             return Ok(());
         }
         if tick.elapsed() >= TICK {
-            app.poll();
+            app.poll(SystemTime::now());
             tick = Instant::now();
         }
     }
@@ -144,13 +144,13 @@ impl App {
 
     /// Catches up with a running scan, or with changes on disk. Returns
     /// whether a scan still runs.
-    pub fn poll(&mut self) -> bool {
+    pub fn poll(&mut self, now: SystemTime) -> bool {
         // a parked browser keeps up too, so changes do not pile up
         if let Some(b) = &mut self.parked {
-            b.poll();
+            b.poll(now);
         }
         match &mut self.screen {
-            Screen::Browse(b) => b.poll(),
+            Screen::Browse(b) => b.poll(now),
             _ => false,
         }
     }

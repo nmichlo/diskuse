@@ -350,8 +350,9 @@ impl Tree {
         Some(listed)
     }
 
-    /// The dirs `changes` touched, and those of them to list afresh, with
-    /// everything below them. `None` if that is the root: a full scan.
+    /// The dirs `changes` touched or named, and those of them to list
+    /// afresh, with everything below them. `None` if that is the root: a
+    /// full scan.
     fn touched(&self, index: &ChildIndex, changes: &Changes) -> Option<(BTreeSet<u32>, Vec<u32>)> {
         // a lookup by name of the children of each dir walked through
         let mut lookups: HashMap<u32, HashMap<&[u8], u32>> = HashMap::new();
@@ -374,7 +375,7 @@ impl Tree {
             }
             (d, true)
         };
-        let mut dirty = BTreeSet::new();
+        let mut dirty: BTreeSet<u32> = changes.dirs.iter().copied().collect();
         for path in &changes.changed {
             let (d, exact) = find(path);
             let r = self.record(d);

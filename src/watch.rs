@@ -5,18 +5,20 @@
 //! live ones, and [`Tree::apply`] lists the dirs they touched again.
 //!
 //! macOS only. Elsewhere [`Watch::start`] is always `None`, so every scan
-//! is a full one.
+//! is a full one, and an open browser follows only the dirs it shows
+//! ([`DirWatch`]).
 
 use crate::scan::ScanOptions;
 use crate::store::CacheDir;
 use crate::sys::{self, Event, What};
-use crate::tree::Tree;
+use crate::tree::{Record, Tree};
 use rustix::fd::AsFd;
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long the stream must stay quiet after the replay ends before the
 /// replay is trusted. FSEvents sends the changes of the moments before the
@@ -27,6 +29,12 @@ const QUIET: Duration = Duration::from_millis(200);
 const QUIET_MAX: Duration = Duration::from_secs(2);
 /// The longest wait for the replay to end before a full scan instead.
 const REPLAY_MAX: Duration = Duration::from_secs(30);
+/// How often a dir shown without an inotify watch is listed again, at
+/// most.
+const POLL: Duration = Duration::from_secs(2);
+/// Listing the dirs shown again waits this many times as long as the last
+/// listing took, so it takes at most a tenth of a core.
+const BACKOFF: u32 = 10;
 
 /// Brings `tree`, an earlier scan of `root`, up to date from the changes
 /// the OS recorded since, listing again only the dirs they touched.
@@ -44,25 +52,28 @@ pub fn update(
 }
 
 /// Changes below a root, as paths relative to it: names joined by `/`,
-/// `""` for the root itself.
+/// `""` for the root itself. Or as dirs of a tree of it.
 #[derive(Debug, Default)]
 pub(crate) struct Changes {
     /// Where something changed.
     pub changed: Vec<Box<[u8]>>,
     /// Where everything below is to be listed again.
     pub rescan: Vec<Box<[u8]>>,
+    /// Dirs to list again, by record id in the tree they are for.
+    pub dirs: Vec<u32>,
     /// The latest event id seen.
     pub id: u64,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.rescan.is_empty()
+        self.changed.is_empty() && self.rescan.is_empty() && self.dirs.is_empty()
     }
 }
 
 pub(crate) enum Poll {
     /// The replay has not ended, or the stream has not gone quiet after it.
+    /// Or no dir shown is due to be listed again.
     Wait,
     /// Changes were lost: only a full scan is right.
     Lost,
@@ -204,5 +215,112 @@ impl Watch {
             return Some(b"");
         }
         path.strip_prefix(&self.root[..])?.strip_prefix(b"/")
+    }
+}
+
+/// The dirs a browser shows, followed where the OS keeps no record of
+/// changes: each is watched with inotify, or listed again on a timer where
+/// that cannot work, on a network or FUSE filesystem, or once the watch
+/// limit is reached. Changes in other dirs are not seen until the next
+/// scan. The pattern of GIO, KDirWatch and the `notify` crate.
+pub(crate) struct DirWatch {
+    /// When the tree was scanned, as the dirs not shown stand.
+    pub scanned: SystemTime,
+    inotify: Option<sys::Inotify>,
+    /// The record id of each dir shown, and its watch if it has one. At
+    /// most three, so searched in order.
+    dirs: Vec<(u32, Option<i32>)>,
+    /// Dirs found changed, to list again.
+    dirty: BTreeSet<u32>,
+    /// When the dirs were last listed again, and how long that took.
+    listed: Instant,
+    took: Duration,
+}
+
+impl DirWatch {
+    /// Follows no dirs yet, of a tree scanned at `scanned`, with inotify if
+    /// `inotify`.
+    pub fn new(inotify: bool, scanned: SystemTime) -> Self {
+        Self {
+            scanned,
+            inotify: inotify.then(sys::Inotify::new).flatten(),
+            dirs: Vec::new(),
+            dirty: BTreeSet::new(),
+            listed: Instant::now(),
+            took: Duration::ZERO,
+        }
+    }
+
+    /// Follows dirs `shown` of `tree` from now on, and no others. Mount
+    /// points and dirs that could not be read are left out, as the tree
+    /// has nothing below them.
+    pub fn show(&mut self, tree: &Tree, shown: &[u32]) {
+        let skip = Record::OTHER_DEVICE | Record::DENIED;
+        let shown: Vec<u32> = (shown.iter().copied())
+            .filter(|&d| tree.record(d).flags & skip == 0)
+            .collect();
+        let (kept, hidden): (Vec<_>, Vec<_>) =
+            self.dirs.drain(..).partition(|(d, _)| shown.contains(d));
+        self.dirs = kept;
+        for (_, wd) in hidden {
+            // one dir seen at two paths, through a bind mount, has one watch
+            if let (Some(inotify), Some(wd)) = (&self.inotify, wd)
+                && !self.dirs.iter().any(|&(_, w)| w == Some(wd))
+            {
+                inotify.remove(wd);
+            }
+        }
+        for d in shown {
+            if self.dirs.iter().any(|&(k, _)| k == d) {
+                continue;
+            }
+            let path = CString::new(tree.dir_path(d)).expect("names hold no NUL");
+            // a symlinked root is followed, as the scan does
+            let wd = (self.inotify.as_ref()).and_then(|i| i.add(&path, d == 0));
+            self.dirs.push((d, wd));
+        }
+    }
+
+    /// The dirs of `tree` to list again now: those inotify saw change,
+    /// and every [`POLL`] those without a watch, but never sooner than
+    /// [`BACKOFF`] times the last listing took. Call [`DirWatch::listed`]
+    /// once listed.
+    pub fn poll(&mut self, tree: &Tree) -> Poll {
+        if let Some(inotify) = &self.inotify {
+            let (dirs, dirty) = (&self.dirs, &mut self.dirty);
+            let of = |wd: i32| dirs.iter().filter(move |&&(_, w)| w == Some(wd));
+            inotify.read(|note| match note {
+                sys::Note::Changed(wd) => dirty.extend(of(wd).map(|&(d, _)| d)),
+                // the dir is in its parent's listing, unless it is the root
+                sys::Note::Gone(wd) => {
+                    let parent = |d| match d {
+                        0 => 0,
+                        _ => tree.record(d).parent,
+                    };
+                    dirty.extend(of(wd).map(|&(d, _)| parent(d)));
+                }
+                sys::Note::Lost => dirty.extend(dirs.iter().map(|&(d, _)| d)),
+            });
+        }
+        let since = self.listed.elapsed();
+        let rest = self.took * BACKOFF;
+        if since >= rest.max(POLL) {
+            let polled = self.dirs.iter().filter(|(_, wd)| wd.is_none());
+            self.dirty.extend(polled.map(|&(d, _)| d));
+        }
+        if self.dirty.is_empty() || since < rest {
+            return Poll::Wait;
+        }
+        Poll::Changes(Changes {
+            dirs: std::mem::take(&mut self.dirty).into_iter().collect(),
+            ..Changes::default()
+        })
+    }
+
+    /// The dirs [`DirWatch::poll`] gave were listed again, which took
+    /// `took`.
+    pub fn listed(&mut self, took: Duration) {
+        self.listed = Instant::now();
+        self.took = took;
     }
 }

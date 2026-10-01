@@ -137,6 +137,25 @@ brought up to date like an [incremental scan](#incremental-scans), usually in
 under a second, instead of scanning again. Then, while disksweep is open,
 sizes follow changes on disk, about once a second.
 
+Linux keeps no record of changes, so there the saved scan shows until a full
+scan is done, and then only the directories on screen follow changes: those
+of the three columns. inotify reports their changes, so they show within
+about a second. Changes anywhere else show after a rescan (`R`), so the title
+says how old the scan is:
+
+```text
+/home/me  41.2 GiB  scanned 4 min ago
+```
+
+On network filesystems inotify misses the changes other machines make, and
+on FUSE those made behind the kernel's back. On these, a directory on screen
+is listed again every 2 s instead, or if longer, after 10 times as long as
+the last listing took, so listing takes at most a tenth of a core: NFS,
+SMB/CIFS, FUSE (sshfs, rclone, virtiofs VM shares), 9p, Ceph, AFS, Coda,
+Lustre, GPFS, GFS2, OCFS2 and OrangeFS. The same goes for a directory inotify
+cannot watch, as once `fs.inotify.max_user_watches` is reached. On macOS, a volume
+macOS records no changes for, like a network share, is followed the same way.
+
 | Key                  | Action                                                 |
 | -------------------- | ------------------------------------------------------ |
 | Up, Down, `k`, `j`   | Move                                                   |
