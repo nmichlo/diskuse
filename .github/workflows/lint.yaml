@@ -1,0 +1,37 @@
+# runs `.pre-commit-config.yaml` verbatim, so `pre-commit run --all-files`
+# locally and CI can never disagree. the cargo fmt/clippy hooks live in that
+# file, so there is no separate rust-lint job.
+
+name: lint
+
+on:
+  pull_request:
+  push:
+    # stacked branches are pushed without PRs, so they are checked on push
+    branches: [main, "nathan/disksweep/**"]
+
+# least privilege: jobs that need more declare it themselves, and a job-level
+# `permissions:` replaces this one rather than adding to it.
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    uses: nmichlo/.github/.github/workflows/pre-commit.yaml@main
+    with:
+      rust: true
+      # the hooks are cargo fmt/clippy and ruff -- none of them import the
+      # package, so there is no need to spend a Rust build installing it
+      install: false
+
+  # The branch-protection gate; see nmichlo/.github/actions/gate for why it
+  # exists. `always()` is required, or the gate is skipped when what it guards
+  # fails -- and a skipped required check counts as success.
+  lint:
+    needs: [pre-commit]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: nmichlo/.github/actions/gate@main
+        with:
+          needs: ${{ toJSON(needs) }}

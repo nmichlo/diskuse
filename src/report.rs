@@ -1,0 +1,80 @@
+//! The `disksweep scan` text output.
+
+use crate::sys;
+use crate::tree::{Record, Tree};
+use std::fmt::Write;
+
+/// The root's total, then its direct children and its own files, largest
+/// first, ties by name bytes.
+pub fn report(tree: &Tree) -> String {
+    let totals = tree.totals();
+    let index = tree.child_index();
+    let denied = (0..tree.len() as u32)
+        .filter(|&i| tree.record(i).flags & Record::DENIED != 0)
+        .count();
+
+    let mut out = format!(
+        "{:>10}  {}",
+        format_size(totals.size[0]),
+        String::from_utf8_lossy(tree.name(tree.record(0).name))
+    );
+    if denied > 0 {
+        write!(out, "  (partial: {denied} denied)").unwrap();
+    }
+    out.push('\n');
+
+    // (size, name bytes for the tie-break, label)
+    let mut rows: Vec<(u64, &[u8], String)> = index
+        .children(0)
+        .iter()
+        .map(|&i| {
+            let r = tree.record(i);
+            let name = tree.name(r.name);
+            let label = format!(
+                "{}/{}",
+                String::from_utf8_lossy(name),
+                suffix(r, totals.flags[i as usize])
+            );
+            (totals.size[i as usize], name, label)
+        })
+        .collect();
+    let files = tree.record(0).own;
+    if files > 0 {
+        rows.push((files, b"[files]", "[files]".into()));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    for (size, _, label) in rows {
+        writeln!(out, "{:>10}  {label}", format_size(size)).unwrap();
+    }
+    out
+}
+
+fn suffix(r: &Record, flags: u32) -> String {
+    if flags & Record::DENIED != 0 {
+        match sys::errno_name(r.errno) {
+            Some(name) => format!(" (denied: {name})"),
+            None => format!(" (denied: errno {})", r.errno),
+        }
+    } else if flags & Record::OTHER_DEVICE != 0 {
+        " (other device)".into()
+    } else if flags & Record::PARTIAL != 0 {
+        " (partial)".into()
+    } else {
+        String::new()
+    }
+}
+
+/// `n B` below 1 KiB, else one decimal in binary units.
+fn format_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut v = n as f64 / 1024.0;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    format!("{v:.1} {}", UNITS[unit])
+}
