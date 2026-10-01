@@ -3,3 +3,31 @@ check:
     uvx --from pre-commit pre-commit run --all-files
     cargo test
     cargo deny check
+
+# benchmarks, see bench/README.md
+
+# make dataset ID (S1 to S6) in DIR
+bench-gen ID DIR:
+    cargo run --release --example bench-gen -- {{ID}} {{DIR}}
+
+# warm runs, e.g. `just bench S1 /tmp/disksweep-bench/S1 --runs 2`
+bench DATASET PATH *ARGS:
+    cargo build --release
+    python3 bench/run.py warm {{DATASET}} {{PATH}} {{ARGS}}
+
+# needs sudo, to drop the file cache before each run
+bench-cold DATASET PATH *ARGS:
+    cargo build --release
+    python3 bench/run.py cold {{DATASET}} {{PATH}} {{ARGS}}
+
+# README table and gate results from bench/results/<machine>
+bench-report:
+    python3 bench/run.py report
+
+# fails if disksweep got > 10% slower than the last committed result
+bench-check:
+    python3 bench/run.py check
+
+# warm runs on Linux in an OrbStack machine
+bench-orb *ARGS:
+    bench/orb.sh {{ARGS}}
