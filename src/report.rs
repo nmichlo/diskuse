@@ -2,12 +2,14 @@
 
 use crate::sys;
 use crate::tree::{Record, Tree};
+use std::cmp::Ordering;
 use std::fmt::Write;
 
 /// The root's total, then its direct children and its own files, largest
 /// first, ties by name bytes. `reclaimable` adds a second size column, the
-/// bytes not shared with a clone.
-pub fn report(tree: &Tree, reclaimable: bool) -> String {
+/// bytes not shared with a clone. `top` appends that many of the largest
+/// files.
+pub fn report(tree: &Tree, reclaimable: bool, top: Option<usize>) -> String {
     let totals = tree.totals();
     let index = tree.child_index();
     let denied = (0..tree.len() as u32)
@@ -48,25 +50,56 @@ pub fn report(tree: &Tree, reclaimable: bool) -> String {
     if root.own > 0 {
         rows.push((root.own, root.own_private, b"[files]", "[files]".into()));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(b.2)));
+    rows.sort_by(|a, b| largest_first((a.0, a.2), (b.0, b.2)));
     for (size, private, _, label) in rows {
         writeln!(out, "{}  {label}", sizes(size, private)).unwrap();
+    }
+    if let Some(n) = top {
+        out.push_str("\nlargest files:\n");
+        for (size, path) in largest_files(tree, n) {
+            let path = String::from_utf8_lossy(&path);
+            writeln!(out, "{:>10}  {path}", format_size(size)).unwrap();
+        }
     }
     out
 }
 
+/// The output order of `(size, name)` pairs: largest first, ties by name
+/// bytes, so output never depends on scan order.
+pub(crate) fn largest_first(a: (u64, &[u8]), b: (u64, &[u8])) -> Ordering {
+    b.0.cmp(&a.0).then(a.1.cmp(b.1))
+}
+
+/// The `n` largest files as `(bytes, path)`, ties by path bytes.
+pub(crate) fn largest_files(tree: &Tree, n: usize) -> Vec<(u64, Vec<u8>)> {
+    let mut files: Vec<_> = tree
+        .largest()
+        .iter()
+        .map(|f| (f.bytes, tree.path(f)))
+        .collect();
+    files.sort_by(|a, b| largest_first((a.0, &a.1), (b.0, &b.1)));
+    files.truncate(n);
+    files
+}
+
 fn suffix(r: &Record, flags: u32) -> String {
     if flags & Record::DENIED != 0 {
-        match sys::errno_name(r.errno) {
-            Some(name) => format!(" (denied: {name})"),
-            None => format!(" (denied: errno {})", r.errno),
-        }
+        format!(" (denied: {})", denied(r))
     } else if flags & Record::OTHER_DEVICE != 0 {
         " (other device)".into()
     } else if flags & Record::PARTIAL != 0 {
         " (partial)".into()
     } else {
         String::new()
+    }
+}
+
+/// Why a [`Record::DENIED`] dir could not be read: `EACCES`, `EPERM` or
+/// `errno N`.
+pub(crate) fn denied(r: &Record) -> String {
+    match sys::errno_name(r.errno) {
+        Some(name) => name.into(),
+        None => format!("errno {}", r.errno),
     }
 }
 

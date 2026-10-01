@@ -1,9 +1,15 @@
 //! The scanned tree: one [`Record`] per directory, in a flat array where a
 //! child's index is always greater than its parent's. Files are not stored;
-//! their bytes are folded into their directory's `own`.
+//! their bytes are folded into their directory's `own`. Only the
+//! [`LARGEST`] largest files are kept, by name.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// How many of the largest files a scan keeps.
+pub const LARGEST: usize = 1000;
 
 /// One directory.
 #[derive(Clone, Copy, Debug)]
@@ -59,10 +65,23 @@ impl ChildIndex {
     }
 }
 
+/// One of the [`LARGEST`] largest files. Ordered by `bytes` first.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LargeFile {
+    /// Allocated bytes, as counted in its directory's `own`.
+    pub bytes: u64,
+    /// Record id of the directory it is in.
+    pub dir: u32,
+    pub name: Box<[u8]>,
+}
+
 #[derive(Debug)]
 pub struct Tree {
-    records: Vec<Record>,
-    names: Vec<Box<[u8]>>,
+    pub(crate) records: Vec<Record>,
+    /// Name id 0 is the root's, never shared with a directory.
+    pub(crate) names: Vec<Box<[u8]>>,
+    /// In no particular order.
+    pub(crate) largest: Vec<LargeFile>,
 }
 
 impl Tree {
@@ -81,6 +100,33 @@ impl Tree {
     /// Raw name bytes. The root's name is the scanned path as given.
     pub fn name(&self, name: u32) -> &[u8] {
         &self.names[name as usize]
+    }
+
+    /// The [`LARGEST`] largest files, or all if fewer, in no particular
+    /// order.
+    pub fn largest(&self) -> &[LargeFile] {
+        &self.largest
+    }
+
+    /// The path of `file`: the root's name, then `/` and each name below
+    /// it.
+    pub fn path(&self, file: &LargeFile) -> Vec<u8> {
+        let mut names = vec![&file.name[..]];
+        let mut i = file.dir;
+        while i != 0 {
+            let r = &self.records[i as usize];
+            names.push(self.name(r.name));
+            i = r.parent;
+        }
+        let mut path = self.name(0).to_vec();
+        for name in names.iter().rev() {
+            // `scan /` must not print `//usr`
+            if path.last() != Some(&b'/') {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+        }
+        path
     }
 
     pub fn totals(&self) -> Totals {
@@ -128,9 +174,9 @@ impl Tree {
 pub(crate) struct Builder {
     records: boxcar::Vec<Record>,
     pub names: Mutex<Names>,
+    pub largest: Largest,
 }
 
-#[derive(Default)]
 pub(crate) struct Names {
     map: HashMap<Box<[u8]>, u32>,
     names: Vec<Box<[u8]>>,
@@ -148,11 +194,57 @@ impl Names {
     }
 }
 
+/// The largest files seen so far, as a min-heap of at most [`LARGEST`].
+#[derive(Default)]
+pub(crate) struct Largest {
+    heap: Mutex<BinaryHeap<Reverse<LargeFile>>>,
+    /// The smallest kept size once the heap is full, else 0. Only larger
+    /// files take the lock, so most never do.
+    floor: AtomicU64,
+}
+
+impl Largest {
+    /// A file of at most this many bytes would not be kept. May lag behind
+    /// the heap, which only costs an extra [`Largest::offer`].
+    pub fn floor(&self) -> u64 {
+        self.floor.load(Ordering::Relaxed)
+    }
+
+    /// Offers `(bytes, name)` files of directory `dir`, whose record id is
+    /// only known after its listing.
+    pub fn offer(&self, dir: u32, files: Vec<(u64, Box<[u8]>)>) {
+        if files.is_empty() {
+            return;
+        }
+        let mut heap = self.heap.lock().unwrap();
+        for (bytes, name) in files {
+            if heap.len() == LARGEST {
+                if bytes <= heap.peek().unwrap().0.bytes {
+                    continue;
+                }
+                heap.pop();
+            }
+            heap.push(Reverse(LargeFile { bytes, dir, name }));
+        }
+        if heap.len() == LARGEST {
+            self.floor
+                .store(heap.peek().unwrap().0.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Builder {
-    pub fn new() -> Self {
+    /// `root` becomes name id 0, the root's, outside the dedup map so no
+    /// directory shares it and a saved scan can drop it.
+    pub fn new(root: &[u8]) -> Self {
+        let names = Names {
+            map: HashMap::new(),
+            names: vec![root.into()],
+        };
         Self {
             records: boxcar::Vec::new(),
-            names: Mutex::default(),
+            names: Mutex::new(names),
+            largest: Largest::default(),
         }
     }
 
@@ -164,6 +256,14 @@ impl Builder {
         Tree {
             records: self.records.into_iter().collect(),
             names: self.names.into_inner().unwrap().names,
+            largest: self
+                .largest
+                .heap
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .map(|Reverse(f)| f)
+                .collect(),
         }
     }
 }

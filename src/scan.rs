@@ -68,24 +68,18 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Result<Tree, ScanError> {
         .build()
         .map_err(ScanError::ThreadPool)?;
     let walk = Walk {
-        tree: Builder::new(),
+        tree: Builder::new(root.as_os_str().as_bytes()),
         links: Mutex::default(),
         root_dev: st.dev,
         reclaimable: opts.reclaimable,
         reader: opts.reader,
     };
-    let name = walk
-        .tree
-        .names
-        .lock()
-        .unwrap()
-        .intern(root.as_os_str().as_bytes());
     let own = Own {
         bytes: st.bytes,
         // a dir's own blocks are never shared with a clone
         private: if opts.reclaimable { st.bytes } else { 0 },
     };
-    pool.scope(|s| walk.list(s, fd, Record::NO_PARENT, name, own));
+    pool.scope(|s| walk.list(s, fd, Record::NO_PARENT, 0, own));
     Ok(walk.tree.finish())
 }
 
@@ -129,11 +123,13 @@ impl Walk {
         match opened {
             Ok(fd) => self.list(s, fd, parent, name, child.own),
             // like du: a denied directory still counts its own blocks
-            Err(e) => self.deny(parent, name, child.own, e),
+            Err(e) => {
+                self.deny(parent, name, child.own, e);
+            }
         }
     }
 
-    fn deny(&self, parent: u32, name: u32, own: Own, e: rustix::io::Errno) {
+    fn deny(&self, parent: u32, name: u32, own: Own, e: rustix::io::Errno) -> u32 {
         self.tree.push(Record {
             parent,
             name,
@@ -141,7 +137,7 @@ impl Walk {
             errno: e.raw_os_error() as u16,
             own: own.bytes,
             own_private: own.private,
-        });
+        })
     }
 
     /// Lists the open directory `fd`, pushes its record, then spawns a task
@@ -149,6 +145,8 @@ impl Walk {
     fn list<'s>(&'s self, s: &rayon::Scope<'s>, fd: OwnedFd, parent: u32, name: u32, own: Own) {
         let mut own = own;
         let mut kids = Vec::new();
+        // candidates for the largest files, held until this dir has an id
+        let mut files = Vec::new();
         let on_entry = |e: sys::Entry<'_>| match e.kind {
             Kind::Dir => kids.push(Child {
                 name: e.name.to_owned(),
@@ -163,23 +161,32 @@ impl Walk {
             _ => {
                 own.bytes += e.bytes;
                 own.private += e.private;
+                if e.bytes > self.tree.largest.floor() {
+                    files.push((e.bytes, e.name.to_bytes().into()));
+                }
             }
         };
         let listed = match self.reader {
             Reader::Auto => sys::read_dir(&fd, self.reclaimable, on_entry),
             Reader::Portable => sys::read_dir_portable(&fd, on_entry),
         };
-        if let Err(e) = listed {
-            return self.deny(parent, name, own, e);
+        let denied = listed.err();
+        let id = match denied {
+            // files listed before the error are counted, so they compete too
+            Some(e) => self.deny(parent, name, own, e),
+            None => self.tree.push(Record {
+                parent,
+                name,
+                flags: 0,
+                errno: 0,
+                own: own.bytes,
+                own_private: own.private,
+            }),
+        };
+        self.tree.largest.offer(id, files);
+        if denied.is_some() {
+            return;
         }
-        let id = self.tree.push(Record {
-            parent,
-            name,
-            flags: 0,
-            errno: 0,
-            own: own.bytes,
-            own_private: own.private,
-        });
         let ids: Vec<u32> = {
             let mut names = self.tree.names.lock().unwrap();
             kids.iter()

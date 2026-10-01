@@ -93,6 +93,15 @@ pub fn read_dir_portable(fd: impl AsFd, f: impl FnMut(Entry<'_>)) -> Result<()> 
     portable::read_dir(fd.as_fd(), f)
 }
 
+/// An id of the volume holding `path`, stable across mounts and reboots:
+/// the volume UUID on macOS, `f_fsid` elsewhere.
+pub fn volume_id(path: &Path) -> Result<u128> {
+    #[cfg(target_os = "macos")]
+    return macos::volume_uuid(path);
+    #[cfg(not(target_os = "macos"))]
+    Ok(u128::from(rustix::fs::statvfs(path)?.f_fsid))
+}
+
 /// Stops this process from downloading iCloud placeholder files while it
 /// reads, so a scan never fills the disk it measures. macOS only. Failure
 /// only means such files may download, so it is ignored.

@@ -11,8 +11,10 @@ use super::{Entry, Kind, dir_stat, portable};
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::io::{Errno, Result};
 use std::cell::RefCell;
-use std::ffi::{CStr, c_int};
+use std::ffi::{CStr, CString, c_int};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 // Not in the libc crate.
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
@@ -236,6 +238,42 @@ fn u32_at(e: &[u8], at: usize) -> u32 {
 
 fn u64_at(e: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(e[at..at + 8].try_into().unwrap())
+}
+
+/// ATTR_VOL_UUID of the volume holding `path`, or 0 if the filesystem has
+/// none. Any path on the volume works, not only its root as the man page
+/// says.
+pub fn volume_uuid(path: &Path) -> Result<u128> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::INVAL)?;
+    let mut attrs = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // u32 length of what was returned, then the 16 UUID bytes
+    let mut buf = [0u8; 20];
+    // SAFETY: `path` is NUL-terminated, and `attrs` and `buf` are live,
+    // writable and sized as passed for the whole call.
+    let n = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&raw mut attrs).cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+        )
+    };
+    if n < 0 {
+        return Err(Errno::from_io_error(&io::Error::last_os_error()).unwrap());
+    }
+    Ok(match u32_at(&buf, 0) as usize {
+        20 => u128::from_be_bytes(buf[4..].try_into().unwrap()),
+        _ => 0,
+    })
 }
 
 pub fn keep_placeholders_remote() {

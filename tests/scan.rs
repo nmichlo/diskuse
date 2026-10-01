@@ -6,21 +6,40 @@ use std::fs::{self, File, Permissions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use tempfile::TempDir;
 
-/// Runs `disksweep scan <path> <args>` and returns stdout, requiring success
-/// and an empty stderr.
-fn scan(path: &Path, args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_disksweep"))
-        .arg("scan")
+/// Runs `disksweep <cmd> <path> <args>` with its saved scans in `cache`, so
+/// tests never touch the user's cache dir.
+fn disksweep(cache: &Path, cmd: &str, path: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_disksweep"))
+        .env("DISKSWEEP_CACHE_DIR", cache)
+        .arg(cmd)
         .arg(path)
         .args(args)
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+/// Requires success and an empty stderr, and returns stdout.
+fn ok(out: Output) -> String {
     assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
     assert!(out.status.success(), "exit status {}", out.status);
     String::from_utf8(out.stdout).unwrap()
+}
+
+/// `disksweep scan <path> <args>`, saving into a throwaway cache.
+fn scan(path: &Path, args: &[&str]) -> String {
+    let cache = tempfile::tempdir().unwrap();
+    ok(disksweep(cache.path(), "scan", path, args))
+}
+
+/// The saved scan files in `cache`.
+fn saved(cache: &Path) -> Vec<PathBuf> {
+    fs::read_dir(cache)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect()
 }
 
 /// Extra args for each directory reader. On macOS this checks the bulk
@@ -71,7 +90,12 @@ impl Drop for Unlock {
 struct Fixture {
     _unlock: Unlock,
     dir: TempDir,
+    /// The `scan` text output.
     expected: String,
+    /// Allocated bytes of each directory itself.
+    dir_bytes: u64,
+    /// Allocated bytes of `sym`.
+    sym_bytes: u64,
 }
 
 /// ```text
@@ -171,6 +195,8 @@ fn fixture() -> Fixture {
         _unlock: unlock,
         dir,
         expected,
+        dir_bytes: d,
+        sym_bytes: sym,
     }
 }
 
@@ -201,6 +227,147 @@ fn scan_follows_a_symlinked_root() {
         1,
     );
     assert_eq!(scan(&root, &[]), expected);
+}
+
+#[test]
+fn top_lists_the_largest_files() {
+    let f = fixture();
+    let root = f.dir.path().display();
+    // h1 and h2 are one file, of 8192 like f2 and top: ties go by path
+    let expected = format!(
+        "{}\nlargest files:\n   \
+         1.5 MiB  {root}/big/f\n  \
+         12.0 KiB  {root}/a/b/c/f3\n   \
+         8.0 KiB  {root}/a/b/f2\n",
+        f.expected
+    );
+    for reader in READERS {
+        let args = [reader, &["--top", "3"]].concat();
+        assert_eq!(scan(f.dir.path(), &args), expected, "{reader:?}");
+    }
+}
+
+/// A `--json` node with no `children` key. `extra` holds any flag keys.
+fn leaf(name: &str, size: u64, own: u64, extra: &str) -> String {
+    format!(r#"{{"name":"{name}","size":{size},"own":{own}{extra}}}"#)
+}
+
+/// The `--json` output of a root and its leaf children.
+fn root(path: &Path, size: u64, own: u64, extra: &str, kids: &[String]) -> String {
+    let path = path.display();
+    let kids = kids.join(",");
+    format!("{{\"name\":\"{path}\",\"size\":{size},\"own\":{own}{extra},\"children\":[{kids}]}}\n")
+}
+
+#[test]
+fn json_nests_dirs_to_the_given_depth() {
+    let f = fixture();
+    let d = f.dir_bytes;
+    let big = 1572864 + d;
+    let a = 4096 + 8192 + 8192 + 12288 + 3 * d;
+    let own = 8192 + f.sym_bytes + d;
+    let mut kids = vec![leaf("big", big, big, ""), leaf("empty", d, d, "")];
+    let expected = match rustix::process::geteuid().is_root() {
+        true => {
+            kids.insert(1, leaf("a", a, 4096 + 8192 + d, ""));
+            root(f.dir.path(), own + big + a + d, own, "", &kids)
+        }
+        false => {
+            let partial = r#","partial":true"#;
+            kids.insert(1, leaf("a", a + d, 4096 + 8192 + d, partial));
+            kids.push(leaf("locked", d, d, r#","denied":"EACCES""#));
+            root(f.dir.path(), own + big + a + 3 * d, own, partial, &kids)
+        }
+    };
+    assert_eq!(scan(f.dir.path(), &["--json"]), expected);
+}
+
+#[test]
+fn json_escapes_names() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a\"b\\c", "d\te\nf\u{1}"] {
+        fs::create_dir(dir.path().join(name)).unwrap();
+    }
+    let d = own_bytes(dir.path());
+    let kids = [
+        leaf(r#"a\"b\\c"#, d, d, ""),
+        leaf(r#"d\te\nf\u0001"#, d, d, ""),
+    ];
+    assert_eq!(
+        scan(dir.path(), &["--json"]),
+        root(dir.path(), 3 * d, d, "", &kids)
+    );
+}
+
+#[test]
+fn show_prints_what_scan_printed() {
+    let f = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    let mut flags: Vec<&[&str]> = vec![&[], &["--json", "--depth", "2"], &["--top", "3"]];
+    if cfg!(target_os = "macos") {
+        flags.push(&["-r"]);
+    }
+    for args in flags {
+        let scanned = ok(disksweep(cache.path(), "scan", f.dir.path(), args));
+        let shown = ok(disksweep(cache.path(), "show", f.dir.path(), args));
+        assert_eq!(shown, scanned, "{args:?}");
+    }
+
+    // saves are keyed by the real path, but print the path asked for
+    let link = tempfile::tempdir().unwrap();
+    let root = link.path().join("root");
+    symlink(f.dir.path(), &root).unwrap();
+    let expected = f.expected.replacen(
+        &f.dir.path().display().to_string(),
+        &root.display().to_string(),
+        1,
+    );
+    ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
+    assert_eq!(ok(disksweep(cache.path(), "show", &root, &[])), expected);
+}
+
+#[test]
+fn saved_scans_are_owner_only() {
+    let f = fixture();
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    ok(disksweep(&cache, "scan", f.dir.path(), &[]));
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&cache), 0o700);
+    let modes: Vec<u32> = saved(&cache).iter().map(|p| mode(p)).collect();
+    assert_eq!(modes, [0o600]);
+}
+
+#[test]
+fn show_fails_without_a_usable_saved_scan() {
+    let f = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    let path = f.dir.path().display();
+    let fails = |args: &[&str], message: String| {
+        let out = disksweep(cache.path(), "show", f.dir.path(), args);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(
+            (stderr, out.stdout, out.status.code()),
+            (message, vec![], Some(1))
+        );
+    };
+    let none = format!("disksweep: no saved scan for {path}\n");
+    fails(&[], none.clone());
+
+    ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
+    if cfg!(target_os = "macos") {
+        let message = format!("disksweep: saved scan for {path} has no reclaimable sizes\n");
+        fails(&["-r"], message);
+    }
+
+    // a file of another format version is ignored, not misread
+    let [file] = &saved(cache.path())[..] else {
+        panic!("not one saved file");
+    };
+    let mut bytes = fs::read(file).unwrap();
+    bytes[4] += 1;
+    fs::write(file, bytes).unwrap();
+    fails(&[], none);
 }
 
 /// Creates `root/d/d/.../d/f` with `depth` dirs and a 4096 byte `f`.
