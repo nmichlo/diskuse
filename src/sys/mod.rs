@@ -58,9 +58,6 @@ pub struct Entry<'a> {
     /// unless some are shared with a clone. Only the macOS reader fills it,
     /// and only when asked; otherwise 0.
     pub private: u64,
-    /// A dir known to hold no entries, so listing it would find none. Only
-    /// the macOS reader can tell; otherwise false.
-    pub empty: bool,
 }
 
 /// Calls `f` until it fails with something other than `EINTR`. A macOS

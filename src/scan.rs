@@ -156,8 +156,6 @@ struct Child {
     own: Own,
     dev: u64,
     mount: bool,
-    /// Known to hold no entries.
-    empty: bool,
 }
 
 /// What listing one dir found.
@@ -203,17 +201,6 @@ impl Walk {
         // release the parent's fd as soon as possible to bound open fds
         drop(parent_fd);
         match opened {
-            // opened only to learn it is not denied: listing finds nothing
-            Ok(_) if child.empty => {
-                self.tree.push(Record {
-                    parent,
-                    name,
-                    flags: 0,
-                    errno: 0,
-                    own: child.own.bytes,
-                    own_private: child.own.private,
-                });
-            }
             Ok(fd) => self.list(s, fd, parent, name, child.own),
             // like du: a denied directory still counts its own blocks
             Err(e) => {
@@ -248,7 +235,6 @@ impl Walk {
                 },
                 dev: e.dev,
                 mount: e.mount,
-                empty: e.empty,
             }),
             _ if e.nlink > 1 && !self.claim((e.dev, e.ino), &mut claimed) => {}
             _ => {

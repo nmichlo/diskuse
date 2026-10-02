@@ -32,7 +32,7 @@ unsafe extern "C" {
 
 // Byte offsets in one buffer entry. FSOPT_PACK_INVAL_ATTRS gives every
 // requested attribute a slot, valid or not, so they are fixed. Dirs get the
-// dir attributes and everything else the file ones, from COUNT on.
+// dir attributes and everything else the file ones, in the same slots.
 /// `u32`: the entry's length, including this field.
 const LENGTH: usize = 0;
 /// `attribute_set_t`: which slots hold valid values.
@@ -45,14 +45,12 @@ const DEV: usize = 36;
 const OBJTYPE: usize = 40;
 /// `u64`.
 const FILEID: usize = 44;
-/// `u32`: ATTR_DIR_ENTRYCOUNT for a dir, ATTR_FILE_LINKCOUNT otherwise.
-const COUNT: usize = 52;
-/// `u32`: ATTR_DIR_MOUNTSTATUS, of a dir.
-const MOUNT: usize = 56;
-/// `off_t`: ATTR_DIR_ALLOCSIZE of a dir.
-const DIR_ALLOC: usize = 60;
-/// `off_t`: ATTR_FILE_ALLOCSIZE of anything else.
-const FILE_ALLOC: usize = 56;
+/// `u32`: ATTR_DIR_MOUNTSTATUS for a dir, ATTR_FILE_LINKCOUNT otherwise.
+/// Not ATTR_DIR_ENTRYCOUNT: for a firmlink such as `/Users` it counts the
+/// empty dir on the system volume, not what the firmlink leads to.
+const MOUNT_OR_LINKS: usize = 52;
+/// `off_t`: ATTR_DIR_ALLOCSIZE or ATTR_FILE_ALLOCSIZE.
+const ALLOC: usize = 56;
 /// ATTR_CMNEXT_PRIVATESIZE, an `off_t` right after the allocated size, is
 /// only there when requested.
 const PRIVATE: usize = 8;
@@ -132,7 +130,7 @@ pub fn read_dir(fd: BorrowedFd<'_>, lister: Lister, mut f: impl FnMut(Entry<'_>)
             | libc::ATTR_CMN_OBJTYPE
             | libc::ATTR_CMN_FILEID,
         volattr: 0,
-        dirattr: libc::ATTR_DIR_ENTRYCOUNT | libc::ATTR_DIR_MOUNTSTATUS | libc::ATTR_DIR_ALLOCSIZE,
+        dirattr: libc::ATTR_DIR_MOUNTSTATUS | libc::ATTR_DIR_ALLOCSIZE,
         fileattr: libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE,
         forkattr,
     };
@@ -188,7 +186,6 @@ pub fn read_dir(fd: BorrowedFd<'_>, lister: Lister, mut f: impl FnMut(Entry<'_>)
                         bytes: 0,
                         mount: false,
                         private: 0,
-                        empty: false,
                     }),
                 }
             }
@@ -239,19 +236,17 @@ fn parse(e: &[u8], private: Private) -> Parsed<'_> {
             _ => Parsed::Skip,
         };
     }
-    let count = u32_at(e, COUNT);
-    let (alloc, mount, nlink, empty) = match kind {
+    let slot = u32_at(e, MOUNT_OR_LINKS);
+    let (mount, nlink) = match kind {
         Kind::Dir => {
-            let known = u32_at(e, RETURNED_DIR);
-            let mount = known & libc::ATTR_DIR_MOUNTSTATUS != 0
-                && u32_at(e, MOUNT) & (DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0;
-            let empty = known & libc::ATTR_DIR_ENTRYCOUNT != 0 && count == 0;
+            let known = u32_at(e, RETURNED_DIR) & libc::ATTR_DIR_MOUNTSTATUS != 0;
             // dirs cannot be hard-linked, and the scan never asks
-            (DIR_ALLOC, mount, 1, empty)
+            let mask = DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER;
+            (known && slot & mask != 0, 1)
         }
-        _ => (FILE_ALLOC, false, u64::from(count), false),
+        _ => (false, u64::from(slot)),
     };
-    let bytes = u64_at(e, alloc);
+    let bytes = u64_at(e, ALLOC);
     Parsed::Entry(Entry {
         name,
         kind,
@@ -262,10 +257,9 @@ fn parse(e: &[u8], private: Private) -> Parsed<'_> {
         mount,
         private: match private {
             Private::Zero => 0,
-            Private::Measured => u64_at(e, alloc + PRIVATE),
+            Private::Measured => u64_at(e, ALLOC + PRIVATE),
             Private::Allocated => bytes,
         },
-        empty,
     })
 }
 

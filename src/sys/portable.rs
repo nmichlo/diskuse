@@ -44,7 +44,6 @@ pub fn read_dir(fd: BorrowedFd<'_>, mut f: impl FnMut(Entry<'_>)) -> Result<()> 
             bytes: st.st_blocks as u64 * 512,
             mount: false,
             private: 0,
-            empty: false,
         });
     }
     Ok(())
