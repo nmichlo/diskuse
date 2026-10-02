@@ -291,6 +291,12 @@ pub fn keep_placeholders_remote() {
     macos::keep_placeholders_remote();
 }
 
+/// The CPU time this process has used, on all its threads.
+pub fn cpu_time() -> std::time::Duration {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+    std::time::Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+}
+
 /// Raises the soft open-file limit to `min(hard, 65536)`. The walk keeps a
 /// parent's fd open until all its children are opened, and the macOS default
 /// soft limit is 256. Failure only means more `EMFILE` denials, so it is

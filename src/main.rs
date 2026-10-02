@@ -30,7 +30,7 @@ enum Command {
         /// Scan all of PATH, even if a saved scan could be brought up to date
         #[arg(long)]
         full: bool,
-        /// Worker threads [default: the number of cores, at most 8]
+        /// Worker threads [default: 4, up to the number of cores while waiting on the disk]
         #[arg(long)]
         threads: Option<NonZeroUsize>,
         /// Directory reader, for the differential test and benchmarks

@@ -18,13 +18,15 @@ use std::ffi::{CString, OsStr};
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use std::{fmt, io};
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanOptions {
-    /// Worker threads. `None` means the number of cores, at most 8 (see
-    /// `DEFAULT_THREADS` for why).
+    /// Worker threads. `None` starts with 4 and adds threads, up to the
+    /// number of cores, while they wait on the disk.
     pub threads: Option<NonZeroUsize>,
     /// Also measure [`Record::own_private`]. Only the macOS reader can see
     /// clones; the portable reader leaves it 0.
@@ -115,12 +117,12 @@ pub fn scan_live(
         id: sys::event_id(),
         store: sys::event_store(st.dev),
     };
-    let pool = pool(opts).map_err(ScanError::ThreadPool)?;
+    let (pool, gate) = pool(opts).map_err(ScanError::ThreadPool)?;
     let tree = Builder::new(root.as_os_str().as_bytes());
-    let walk = Walk::new(tree, Links::new(), st.dev, lister, opts.stop.clone());
+    let walk = Walk::new(tree, Links::new(), st.dev, lister, opts.stop.clone(), gate);
     let own = Own::of(&st, opts.reclaimable);
     progress(walk.tree.progress());
-    pool.scope(|s| walk.list(s, fd, Record::NO_PARENT, 0, own));
+    walk.run(&pool, |s| walk.list(s, fd, Record::NO_PARENT, 0, own));
     Ok(walk.finish(since))
 }
 
@@ -132,20 +134,133 @@ fn lister(fd: &OwnedFd, opts: &ScanOptions) -> rustix::io::Result<sys::Lister> {
     }
 }
 
-/// The default cap on worker threads. Past it, threads mostly wait on
-/// kernel locks: on a 10-core M4, 8 threads were as fast as or faster than
-/// 10 on every tree measured, with 10% less CPU; fewer threads lose on
-/// large trees, which also wait on the disk.
-const DEFAULT_THREADS: usize = 8;
-
-fn pool(opts: &ScanOptions) -> Result<ThreadPool, rayon::ThreadPoolBuildError> {
+/// A pool of `--threads` threads, or of every core with a [`Gate`] that
+/// lets only some of them list dirs at once.
+fn pool(opts: &ScanOptions) -> Result<(ThreadPool, Gate), rayon::ThreadPoolBuildError> {
     let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(
-            opts.threads
-                .map_or(cores.min(DEFAULT_THREADS), NonZeroUsize::get),
-        )
-        .build()
+    let (threads, gate) = match opts.threads {
+        Some(n) => (n.get(), Gate::fixed(n.get())),
+        None => (cores, Gate::adaptive(cores)),
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()?;
+    Ok((pool, gate))
+}
+
+/// How many of the pool's threads list dirs at once: those with an index
+/// below `limit`. The others hand back any dir they take and wait.
+///
+/// The best number depends on the tree. Listing a dir is ~98% kernel time,
+/// and past ~4 threads they mostly contend for kernel locks: on a 10-core
+/// M4, a cached tree of 4k dirs took 0.41 s with 4 threads and 0.66 s with
+/// 8, and one of 1M dirs 11 s and 17 s. But a tree that waits on the disk
+/// needs more threads to hide the waits: a home dir of 1.3M dirs took 40 s
+/// with 4 and 26 s with 8. So an adaptive gate starts at 4 and moves by how
+/// busy its threads keep the CPU, see [`Gate::tune`].
+struct Gate {
+    limit: AtomicUsize,
+    /// `Some((min, max))` of the limit when it adapts.
+    range: Option<(usize, usize)>,
+    /// Dirs spawned and not yet visited. Waiting threads stop waiting at 0,
+    /// when the walk is done.
+    pending: AtomicUsize,
+    /// Whether the walk is done, for the thread that tunes the limit.
+    done: Mutex<bool>,
+    wake: Condvar,
+}
+
+/// How often an adaptive [`Gate`] measures the CPU time and moves its
+/// limit. Long enough to list hundreds of dirs, so a measure is not noise,
+/// and short enough to reach every core within a second of a large scan.
+const TICK: Duration = Duration::from_millis(100);
+
+/// The share of a tick the admitted threads spend on the CPU, under which
+/// they wait on the disk, so more threads hide the waits. With 4 threads,
+/// a cached tree keeps them 60-95% busy (contended kernel locks spin on the
+/// CPU), and a home dir partly on the disk 30-40%.
+const IDLE: f64 = 0.5;
+
+/// The share over which the admitted threads are not waiting on the disk,
+/// so fewer do the same work with less lock contention.
+const BUSY: f64 = 0.75;
+
+impl Gate {
+    fn fixed(n: usize) -> Self {
+        Self::new(n, None)
+    }
+
+    /// Starts at 4 rather than the performance cores: every Apple silicon
+    /// Mac has at least 4, and the kernel locks, not the core kind, limit a
+    /// cached walk. More than `cores` was slower: 39 s against 31 s on the
+    /// home dir with 20.
+    fn adaptive(cores: usize) -> Self {
+        let first = cores.min(4);
+        Self::new(first, Some((first, cores)))
+    }
+
+    fn new(limit: usize, range: Option<(usize, usize)>) -> Self {
+        Self {
+            limit: AtomicUsize::new(limit),
+            range,
+            pending: AtomicUsize::new(0),
+            done: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Whether this thread may list a dir now.
+    fn admits(&self) -> bool {
+        rayon::current_thread_index().is_none_or(|i| i < self.limit.load(Relaxed))
+    }
+
+    /// Waits until this thread is admitted, or the walk is done.
+    fn wait(&self) {
+        let i = rayon::current_thread_index().unwrap_or(0);
+        let mut done = self.done.lock().unwrap();
+        while i >= self.limit.load(Relaxed) && self.pending.load(Relaxed) > 0 {
+            done = self.wake.wait(done).unwrap();
+        }
+    }
+
+    /// One spawned dir visited.
+    fn visited(&self) {
+        if self.pending.fetch_sub(1, Relaxed) == 1 {
+            // under the lock, so no waiter checks and then misses it
+            let _done = self.done.lock().unwrap();
+            self.wake.notify_all();
+        }
+    }
+
+    /// Moves the limit every [`TICK`] until the walk is done, by how busy
+    /// the admitted threads kept the CPU: one more while under [`IDLE`] of
+    /// them were, with dirs waiting for them, one fewer while over [`BUSY`].
+    fn tune(&self, (min, max): (usize, usize)) {
+        let mut done = self.done.lock().unwrap();
+        let (mut at, mut used) = (Instant::now(), sys::cpu_time());
+        loop {
+            done = self.wake.wait_timeout(done, TICK).unwrap().0;
+            if *done {
+                return;
+            }
+            let (now, cpu) = (Instant::now(), sys::cpu_time());
+            let limit = self.limit.load(Relaxed);
+            let busy = (cpu - used).as_secs_f64() / (now - at).as_secs_f64() / limit as f64;
+            (at, used) = (now, cpu);
+            let next = if busy < IDLE && self.pending.load(Relaxed) > limit {
+                limit + 1
+            } else if busy > BUSY {
+                limit - 1
+            } else {
+                limit
+            }
+            .clamp(min, max);
+            if next != limit {
+                self.limit.store(next, Relaxed);
+                self.wake.notify_all();
+            }
+        }
+    }
 }
 
 struct Walk {
@@ -156,6 +271,7 @@ struct Walk {
     /// Of the root's filesystem, so of every dir the walk lists.
     lister: sys::Lister,
     stop: Stop,
+    gate: Gate,
 }
 
 /// [`Record::own`] and [`Record::own_private`], summed together.
@@ -199,13 +315,50 @@ struct Listing {
 
 impl Walk {
     /// A walk that builds `tree`, adding to `links`.
-    fn new(tree: Builder, links: Links, root_dev: u64, lister: sys::Lister, stop: Stop) -> Self {
+    fn new(
+        tree: Builder,
+        links: Links,
+        root_dev: u64,
+        lister: sys::Lister,
+        stop: Stop,
+        gate: Gate,
+    ) -> Self {
         Self {
             tree,
             links: Mutex::new(links),
             root_dev,
             lister,
             stop,
+            gate,
+        }
+    }
+
+    /// Runs `op` and every task it spawns on `pool`, tuning the gate
+    /// meanwhile if it adapts.
+    fn run<'s>(&'s self, pool: &ThreadPool, op: impl FnOnce(&rayon::Scope<'s>) + Send) {
+        std::thread::scope(|t| {
+            if let Some(range) = self.gate.range {
+                t.spawn(move || self.gate.tune(range));
+            }
+            pool.scope(op);
+            *self.gate.done.lock().unwrap() = true;
+            self.gate.wake.notify_all();
+        });
+    }
+
+    /// Spawns a visit of each of `kids`, with its name id, subdirectories
+    /// of dir `parent` open as `fd`.
+    fn spawn<'s>(
+        &'s self,
+        s: &rayon::Scope<'s>,
+        fd: Arc<OwnedFd>,
+        parent: u32,
+        kids: Vec<(Child, u32)>,
+    ) {
+        self.gate.pending.fetch_add(kids.len(), Relaxed);
+        for (kid, name) in kids {
+            let fd = Arc::clone(&fd);
+            s.spawn(move |s| self.visit(s, fd, parent, name, kid));
         }
     }
 
@@ -222,20 +375,26 @@ impl Walk {
         name: u32,
         child: Child,
     ) {
-        // left out, and missing from its parent's `subdirs`
-        if self.stop.now() {
+        // handed back for an admitted thread, which steals it
+        if !self.gate.admits() {
+            s.spawn(move |s| self.visit(s, parent_fd, parent, name, child));
+            self.gate.wait();
             return;
         }
-        let opened = sys::open_child(parent_fd.as_fd(), &child.name);
-        // release the parent's fd as soon as possible to bound open fds
-        drop(parent_fd);
-        match opened {
-            Ok(fd) => self.list(s, fd, parent, name, child.own),
-            // like du: a denied directory still counts its own blocks
-            Err(e) => {
-                self.deny(parent, name, child.own, e);
+        // left out, and missing from its parent's `subdirs`
+        if !self.stop.now() {
+            let opened = sys::open_child(parent_fd.as_fd(), &child.name);
+            // release the parent's fd as soon as possible to bound open fds
+            drop(parent_fd);
+            match opened {
+                Ok(fd) => self.list(s, fd, parent, name, child.own),
+                // like du: a denied directory still counts its own blocks
+                Err(e) => {
+                    self.deny(parent, name, child.own, e);
+                }
             }
         }
+        self.gate.visited();
     }
 
     fn deny(&self, parent: u32, name: u32, own: Own, e: Errno) -> u32 {
@@ -334,7 +493,7 @@ impl Walk {
         }
         let kids = listing.kids;
         let ids = self.tree.intern(kids.iter().map(|k| k.name.to_bytes()));
-        let fd = Arc::new(fd);
+        let mut visit = Vec::with_capacity(kids.len());
         for (kid, name) in kids.into_iter().zip(ids) {
             // like `du -x`: decided from the parent's listing, so a mount
             // point is never opened. The mount flag catches the macOS Data
@@ -349,11 +508,11 @@ impl Walk {
                     own: 0,
                     own_private: 0,
                 });
-                continue;
+            } else {
+                visit.push((kid, name));
             }
-            let fd = Arc::clone(&fd);
-            s.spawn(move |s| self.visit(s, fd, id, name, kid));
         }
+        self.spawn(s, Arc::new(fd), id, visit);
     }
 
     /// Scans `kids`, subdirectories of dir `d` of the tree appended to,
@@ -371,12 +530,8 @@ impl Walk {
         let Ok(fd) = open_path(root, names) else {
             return;
         };
-        let fd = Arc::new(fd);
         let ids = self.tree.intern(kids.iter().map(|k| k.name.to_bytes()));
-        for (kid, name) in kids.into_iter().zip(ids) {
-            let fd = Arc::clone(&fd);
-            s.spawn(move |s| self.visit(s, fd, d, name, kid));
-        }
+        self.spawn(s, Arc::new(fd), d, kids.into_iter().zip(ids).collect());
     }
 }
 
@@ -404,7 +559,7 @@ impl Tree {
         let root = sys::open_root(Path::new(OsStr::from_bytes(self.name(0)))).ok()?;
         let dev = sys::dir_stat(root.as_fd()).ok()?.dev;
         let lister = lister(&root, opts).ok()?;
-        let pool = pool(opts).ok()?;
+        let (pool, gate) = pool(opts).ok()?;
         sys::raise_fd_limit();
         sys::keep_placeholders_remote();
         self.since.id = self.since.id.max(changes.id);
@@ -435,11 +590,18 @@ impl Tree {
             return Some(());
         }
         let links = std::mem::take(&mut self.links);
-        let walk = Walk::new(Builder::append(self), links, dev, lister, opts.stop.clone());
+        let walk = Walk::new(
+            Builder::append(self),
+            links,
+            dev,
+            lister,
+            opts.stop.clone(),
+            gate,
+        );
         progress(walk.tree.progress());
         // each parent is opened again from the root, rather than kept open
         // since its listing, so no more dirs are open at once than in a scan
-        pool.scope(|s| {
+        walk.run(&pool, |s| {
             for (names, d, kids) in new {
                 let (walk, root) = (&walk, &root);
                 s.spawn(move |s| walk.adopt(s, root, &names, d, kids));
@@ -526,7 +688,15 @@ impl Tree {
             }
         };
         let links = std::mem::take(&mut self.links);
-        let walk = Walk::new(Builder::new(b""), links, st.dev, lister, Stop::default());
+        let gate = Gate::fixed(1);
+        let walk = Walk::new(
+            Builder::new(b""),
+            links,
+            st.dev,
+            lister,
+            Stop::default(),
+            gate,
+        );
         let listing = walk.read(&fd, Own::of(&st, opts.reclaimable));
         walk.own(d, &listing.claimed);
         self.links = walk.links.into_inner().unwrap();
