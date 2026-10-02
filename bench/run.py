@@ -34,8 +34,12 @@ TOLERANCE = 0.001  # a total is valid within 0.1% of the reference
 # --- tools -------------------------------------------------------------------
 
 
+# colour codes: some tool versions (dua 2.34) colour output even into a pipe
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def first_int(out: str) -> int:
-    return int(re.search(r"\d+", out).group())
+    return int(re.search(r"\d+", ANSI.sub("", out)).group())
 
 
 def last_line_int(out: str) -> int:
@@ -228,25 +232,38 @@ def run(argv: list[str], **kw) -> subprocess.CompletedProcess:
 def walk_bytes(path: str) -> int:
     """Allocated bytes below `path`, one device, hard links once, like du.
 
-    Only used when du fails: BSD du cannot read past PATH_MAX (S4). fwalk
-    opens each dir relative to its parent, so depth is no problem.
+    Only used when du fails: BSD du cannot read past PATH_MAX (S4). Each dir
+    is opened relative to its parent and listed from an explicit stack, so
+    neither depth nor Python's recursion limit is a problem.
     """
     root = os.lstat(path)
     total, seen = root.st_blocks * 512, set()
-    for _, dirs, files, fd in os.fwalk(path, onerror=lambda e: None):
-        for name in [*dirs, *files]:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    stack = [os.open(path, os.O_RDONLY | os.O_DIRECTORY)]
+    while stack:
+        fd = stack.pop()
+        try:
+            names = os.listdir(fd)
+        except OSError:
+            names = []
+        for name in names:
             try:
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
             except OSError:
                 continue
             if st.st_dev != root.st_dev:
-                dirs.remove(name)  # a mount point: skip it, like du -x
-                continue
-            if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
+                continue  # a mount point: skip it, like du -x
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    stack.append(os.open(name, flags, dir_fd=fd))
+                except OSError:
+                    pass  # unreadable: its own blocks still count
+            elif st.st_nlink > 1:
                 if st.st_ino in seen:
                     continue
                 seen.add(st.st_ino)
             total += st.st_blocks * 512
+        os.close(fd)
     return total
 
 
