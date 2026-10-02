@@ -80,6 +80,7 @@ pub fn scan_live(
     sys::keep_placeholders_remote();
     let fd = sys::open_root(root).map_err(|e| ScanError::Root(e.into()))?;
     let st = sys::dir_stat(fd.as_fd()).map_err(|e| ScanError::Root(e.into()))?;
+    let lister = lister(&fd, opts).map_err(|e| ScanError::Root(e.into()))?;
     // taken first, so an update from here also sees the changes made while
     // the walk runs
     let since = Since {
@@ -87,11 +88,19 @@ pub fn scan_live(
         store: sys::event_store(st.dev),
     };
     let pool = pool(opts).map_err(ScanError::ThreadPool)?;
-    let walk = Walk::new(root.as_os_str().as_bytes(), Links::new(), 0, st.dev, opts);
+    let walk = Walk::new(root.as_os_str().as_bytes(), Links::new(), 0, st.dev, lister);
     let own = Own::of(&st, opts.reclaimable);
     progress(walk.tree.progress());
     pool.scope(|s| walk.list(s, fd, Record::NO_PARENT, 0, own));
     Ok(walk.finish(since))
+}
+
+/// The [`sys::Lister`] `opts` ask for, of the filesystem of `fd`.
+fn lister(fd: &OwnedFd, opts: &ScanOptions) -> rustix::io::Result<sys::Lister> {
+    match opts.reader {
+        Reader::Auto => sys::Lister::of(fd.as_fd(), opts.reclaimable),
+        Reader::Portable => Ok(sys::Lister::PORTABLE),
+    }
 }
 
 fn pool(opts: &ScanOptions) -> Result<ThreadPool, rayon::ThreadPoolBuildError> {
@@ -108,8 +117,8 @@ struct Walk {
     /// its records are appended to.
     base: u32,
     root_dev: u64,
-    reclaimable: bool,
-    reader: Reader,
+    /// Of the root's filesystem, so of every dir the walk lists.
+    lister: sys::Lister,
 }
 
 /// [`Record::own`] and [`Record::own_private`], summed together.
@@ -136,6 +145,8 @@ struct Child {
     own: Own,
     dev: u64,
     mount: bool,
+    /// Known to hold no entries.
+    empty: bool,
 }
 
 /// What listing one dir found.
@@ -154,14 +165,13 @@ struct Listing {
 impl Walk {
     /// A walk whose root is named `root`, adding to `links` of a tree of
     /// `base` records.
-    fn new(root: &[u8], links: Links, base: u32, root_dev: u64, opts: &ScanOptions) -> Self {
+    fn new(root: &[u8], links: Links, base: u32, root_dev: u64, lister: sys::Lister) -> Self {
         Self {
             tree: Builder::new(root),
             links: Mutex::new(links),
             base,
             root_dev,
-            reclaimable: opts.reclaimable,
-            reader: opts.reader,
+            lister,
         }
     }
 
@@ -182,6 +192,17 @@ impl Walk {
         // release the parent's fd as soon as possible to bound open fds
         drop(parent_fd);
         match opened {
+            // opened only to learn it is not denied: listing finds nothing
+            Ok(_) if child.empty => {
+                self.tree.push(Record {
+                    parent,
+                    name,
+                    flags: 0,
+                    errno: 0,
+                    own: child.own.bytes,
+                    own_private: child.own.private,
+                });
+            }
             Ok(fd) => self.list(s, fd, parent, name, child.own),
             // like du: a denied directory still counts its own blocks
             Err(e) => {
@@ -216,6 +237,7 @@ impl Walk {
                 },
                 dev: e.dev,
                 mount: e.mount,
+                empty: e.empty,
             }),
             _ if e.nlink > 1 && !self.claim((e.dev, e.ino), &mut claimed) => {}
             _ => {
@@ -226,10 +248,7 @@ impl Walk {
                 }
             }
         };
-        let listed = match self.reader {
-            Reader::Auto => sys::read_dir(fd, self.reclaimable, on_entry),
-            Reader::Portable => sys::read_dir_portable(fd, on_entry),
-        };
+        let listed = sys::read_dir_with(fd, self.lister, on_entry);
         Listing {
             own,
             kids,
@@ -418,8 +437,8 @@ impl Tree {
             .collect();
         let opened = self
             .open(root, d)
-            .and_then(|fd| Ok((sys::dir_stat(fd.as_fd())?, fd)));
-        let (st, fd) = match opened {
+            .and_then(|fd| Ok((sys::dir_stat(fd.as_fd())?, lister(&fd, opts)?, fd)));
+        let (st, lister, fd) = match opened {
             Ok(opened) => opened,
             // listing the parent again finds that too
             Err(Errno::NOENT | Errno::NOTDIR) => return self.remove(d),
@@ -429,7 +448,7 @@ impl Tree {
                 return self.deny(d, &kids, own, e);
             }
         };
-        let walk = Walk::new(b"", std::mem::take(&mut self.links), 0, st.dev, opts);
+        let walk = Walk::new(b"", std::mem::take(&mut self.links), 0, st.dev, lister);
         let listing = walk.read(&fd, Own::of(&st, opts.reclaimable));
         walk.own(d, &listing.claimed);
         self.links = walk.links.into_inner().unwrap();
@@ -482,7 +501,7 @@ impl Tree {
             }
             let base = u32::try_from(self.len()).expect("over 2^32 directories");
             let links = std::mem::take(&mut self.links);
-            let walk = Walk::new(kid.name.to_bytes(), links, base, st.dev, opts);
+            let walk = Walk::new(kid.name.to_bytes(), links, base, st.dev, lister);
             let fd = Arc::clone(&fd);
             pool.scope(|s| walk.visit(s, fd, Record::NO_PARENT, 0, kid));
             let mut sub = walk.finish(Since::default());

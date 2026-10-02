@@ -57,6 +57,22 @@ pub struct Entry<'a> {
     /// unless some are shared with a clone. Only the macOS reader fills it,
     /// and only when asked; otherwise 0.
     pub private: u64,
+    /// A dir known to hold no entries, so listing it would find none. Only
+    /// the macOS reader can tell; otherwise false.
+    pub empty: bool,
+}
+
+/// Calls `f` until it fails with something other than `EINTR`. A macOS
+/// scan, which installs no signal handlers, still sees `EINTR` on a few
+/// dirs, and it only means "try again". `readdir` is not retried, as
+/// `rustix::fs::Dir` stops at its first error.
+fn retry<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    loop {
+        match f() {
+            Err(Errno::INTR) => {}
+            r => return r,
+        }
+    }
 }
 
 /// What `fstat` says about an open directory.
@@ -71,24 +87,24 @@ pub fn open_root(path: &Path) -> Result<OwnedFd> {
     let flags = DIR_FLAGS.difference(OFlags::NOFOLLOW);
     // sys owns the only openat, with fixed read-only flags.
     #[allow(clippy::disallowed_methods)]
-    rustix::fs::openat(rustix::fs::CWD, path, flags, rustix::fs::Mode::empty())
+    retry(|| rustix::fs::openat(rustix::fs::CWD, path, flags, rustix::fs::Mode::empty()))
 }
 
 /// Opens `name` relative to its parent, so no full path is ever built.
 pub fn open_child(parent: BorrowedFd<'_>, name: &CStr) -> Result<OwnedFd> {
     // sys owns the only openat, with fixed read-only flags.
     #[allow(clippy::disallowed_methods)]
-    rustix::fs::openat(parent, name, DIR_FLAGS, rustix::fs::Mode::empty())
+    retry(|| rustix::fs::openat(parent, name, DIR_FLAGS, rustix::fs::Mode::empty()))
 }
 
 pub fn dir_stat(fd: BorrowedFd<'_>) -> Result<DirStat> {
-    rustix::fs::fstat(fd).map(DirStat::of)
+    retry(|| rustix::fs::fstat(fd)).map(DirStat::of)
 }
 
 /// [`dir_stat`] of `name` in the open dir `parent`, by `lstat`, so of a
 /// dir that cannot be opened too.
 pub fn child_stat(parent: BorrowedFd<'_>, name: &CStr) -> Result<DirStat> {
-    rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map(DirStat::of)
+    retry(|| rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)).map(DirStat::of)
 }
 
 impl DirStat {
@@ -214,18 +230,28 @@ pub fn exists(path: &Path) -> bool {
     !matches!(rustix::fs::lstat(path), Err(Errno::NOENT | Errno::NOTDIR))
 }
 
+/// How to list the dirs of one filesystem, from [`Lister::of`] an open dir
+/// on it. Dirs with the same `st_dev` are on the same filesystem, so a walk,
+/// which never leaves its root's device, decides once. `Lister::PORTABLE`
+/// is `readdir` plus `lstat`, the reader every unix has.
+#[cfg(target_os = "macos")]
+pub use macos::Lister;
+#[cfg(not(target_os = "macos"))]
+pub use portable::Lister;
+
 /// Calls `f` for every entry of the open directory `fd`, with the fastest
 /// reader for the OS. `private` asks for [`Entry::private`].
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 pub fn read_dir(fd: impl AsFd, private: bool, f: impl FnMut(Entry<'_>)) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    return macos::read_dir(fd.as_fd(), private, f);
-    #[cfg(not(target_os = "macos"))]
-    portable::read_dir(fd.as_fd(), f)
+    let lister = Lister::of(fd.as_fd(), private)?;
+    read_dir_with(fd, lister, f)
 }
 
-/// [`read_dir`] with `readdir` plus `lstat`, the reader every unix has.
-pub fn read_dir_portable(fd: impl AsFd, f: impl FnMut(Entry<'_>)) -> Result<()> {
+/// [`read_dir`] with `lister`, which must be of the filesystem of `fd`.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn read_dir_with(fd: impl AsFd, lister: Lister, f: impl FnMut(Entry<'_>)) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return macos::read_dir(fd.as_fd(), lister, f);
+    #[cfg(not(target_os = "macos"))]
     portable::read_dir(fd.as_fd(), f)
 }
 

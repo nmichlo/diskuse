@@ -147,6 +147,58 @@ fn json_escapes_names() {
     );
 }
 
+/// ```text
+/// root/
+///   e/
+///   n/a/, n/b/
+///   locked/     mode 000, empty
+/// ```
+///
+/// The macOS reader knows from a parent's listing which dirs are empty, but
+/// an empty dir that cannot be opened is still denied. `locked/` is left out
+/// when running as root, which can open anything.
+#[test]
+fn scan_counts_empty_dirs_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    for d in ["e", "n/a", "n/b"] {
+        fs::create_dir_all(path.join(d)).unwrap();
+    }
+    let as_root = rustix::process::geteuid().is_root();
+    let locked = path.join("locked");
+    let _unlock = (!as_root).then(|| {
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        common::Unlock(vec![locked])
+    });
+    let d = own_bytes(path);
+    let empty = |name: &str, extra: &str| leaf(name, d, d, &format!("{extra},\"children\":[]"));
+    let n = format!(
+        r#"{{"name":"n","size":{},"own":{d},"children":[{},{}]}}"#,
+        3 * d,
+        leaf("a", d, d, ""),
+        leaf("b", d, d, ""),
+    );
+    let mut kids = vec![empty("e", "")];
+    if !as_root {
+        kids.push(empty("locked", r#","denied":"EACCES""#));
+    }
+    // largest first, then by name
+    match d {
+        0 => kids.push(n),
+        _ => kids.insert(0, n),
+    }
+    let (size, partial) = match as_root {
+        true => (5 * d, ""),
+        false => (6 * d, r#","partial":true"#),
+    };
+    let expected = root(path, size, d, partial, &kids);
+    for reader in READERS {
+        let args = [reader, &["--json", "--depth", "2"]].concat();
+        assert_eq!(scan(path, &args), expected, "{reader:?}");
+    }
+}
+
 #[test]
 fn show_prints_what_scan_printed() {
     let f = fixture();

@@ -74,7 +74,7 @@ pub fn clones() -> TempDir {
 }
 
 /// Makes the locked dirs readable again before the temp dir is removed.
-pub struct Unlock(Vec<PathBuf>);
+pub struct Unlock(pub Vec<PathBuf>);
 
 impl Drop for Unlock {
     fn drop(&mut self) {

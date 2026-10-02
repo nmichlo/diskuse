@@ -2,12 +2,12 @@
 //! entries, so there is no `lstat` per entry. Apple's `libdarwin/dirstat.c`
 //! parses the same buffer.
 //!
-//! Only APFS and HFS+ get it. Other filesystems can answer with wrong sizes:
-//! FAT reports every file as 0 B.
+//! Only APFS gets it. Other filesystems can answer with wrong sizes: FAT
+//! reports every file as 0 B, and HFS+ more than `st_blocks`.
 
 #![allow(unsafe_code)]
 
-use super::{Entry, Kind, dir_stat, portable};
+use super::{Entry, Kind, dir_stat, portable, retry};
 use crate::volumes::Mount;
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::io::{Errno, Result};
@@ -32,7 +32,7 @@ unsafe extern "C" {
 
 // Byte offsets in one buffer entry. FSOPT_PACK_INVAL_ATTRS gives every
 // requested attribute a slot, valid or not, so they are fixed. Dirs get the
-// dir attributes and everything else the file ones, in the same slots.
+// dir attributes and everything else the file ones, from COUNT on.
 /// `u32`: the entry's length, including this field.
 const LENGTH: usize = 0;
 /// `attribute_set_t`: which slots hold valid values.
@@ -45,12 +45,17 @@ const DEV: usize = 36;
 const OBJTYPE: usize = 40;
 /// `u64`.
 const FILEID: usize = 44;
-/// `u32`: ATTR_DIR_MOUNTSTATUS for a dir, ATTR_FILE_LINKCOUNT otherwise.
-const MOUNT_OR_LINKS: usize = 52;
-/// `off_t`: ATTR_DIR_ALLOCSIZE or ATTR_FILE_ALLOCSIZE.
-const ALLOC: usize = 56;
-/// `off_t`: ATTR_CMNEXT_PRIVATESIZE, only when requested.
-const PRIVATE: usize = 64;
+/// `u32`: ATTR_DIR_ENTRYCOUNT for a dir, ATTR_FILE_LINKCOUNT otherwise.
+const COUNT: usize = 52;
+/// `u32`: ATTR_DIR_MOUNTSTATUS, of a dir.
+const MOUNT: usize = 56;
+/// `off_t`: ATTR_DIR_ALLOCSIZE of a dir.
+const DIR_ALLOC: usize = 60;
+/// `off_t`: ATTR_FILE_ALLOCSIZE of anything else.
+const FILE_ALLOC: usize = 56;
+/// ATTR_CMNEXT_PRIVATESIZE, an `off_t` right after the allocated size, is
+/// only there when requested.
+const PRIVATE: usize = 8;
 
 // `attribute_set_t` fields, from RETURNED.
 const RETURNED_CMN: usize = RETURNED;
@@ -74,18 +79,42 @@ enum Private {
     Allocated,
 }
 
-pub fn read_dir(fd: BorrowedFd<'_>, private: bool, mut f: impl FnMut(Entry<'_>)) -> Result<()> {
-    let fs = rustix::fs::fstatfs(fd)?.f_fstypename.map(|c| c as u8);
-    let fs = CStr::from_bytes_until_nul(&fs)
-        .unwrap_or_default()
-        .to_bytes();
-    // only APFS has clones; HFS+ reports a private size of 0
-    let private = match (private, fs) {
-        (false, _) => Private::Zero,
-        (true, b"apfs") => Private::Measured,
-        (true, _) => Private::Allocated,
+/// How to list the dirs of one filesystem.
+#[derive(Clone, Copy)]
+pub struct Lister {
+    bulk: bool,
+    private: Private,
+}
+
+impl Lister {
+    pub const PORTABLE: Self = Self {
+        bulk: false,
+        private: Private::Zero,
     };
-    if fs != b"apfs" && fs != b"hfs" {
+
+    /// Decided by one `fstatfs` of `fd`.
+    pub fn of(fd: BorrowedFd<'_>, private: bool) -> Result<Self> {
+        let fs = retry(|| rustix::fs::fstatfs(fd))?
+            .f_fstypename
+            .map(|c| c as u8);
+        let fs = CStr::from_bytes_until_nul(&fs)
+            .unwrap_or_default()
+            .to_bytes();
+        Ok(Self {
+            bulk: fs == b"apfs",
+            // only APFS has clones
+            private: match (private, fs) {
+                (false, _) => Private::Zero,
+                (true, b"apfs") => Private::Measured,
+                (true, _) => Private::Allocated,
+            },
+        })
+    }
+}
+
+pub fn read_dir(fd: BorrowedFd<'_>, lister: Lister, mut f: impl FnMut(Entry<'_>)) -> Result<()> {
+    let private = lister.private;
+    if !lister.bulk {
         return read_portable(fd, private, f);
     }
     // the fork group means ATTR_CMNEXT_* only with FSOPT_ATTR_CMN_EXTENDED
@@ -103,7 +132,7 @@ pub fn read_dir(fd: BorrowedFd<'_>, private: bool, mut f: impl FnMut(Entry<'_>))
             | libc::ATTR_CMN_OBJTYPE
             | libc::ATTR_CMN_FILEID,
         volattr: 0,
-        dirattr: libc::ATTR_DIR_MOUNTSTATUS | libc::ATTR_DIR_ALLOCSIZE,
+        dirattr: libc::ATTR_DIR_ENTRYCOUNT | libc::ATTR_DIR_MOUNTSTATUS | libc::ATTR_DIR_ALLOCSIZE,
         fileattr: libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE,
         forkattr,
     };
@@ -111,25 +140,31 @@ pub fn read_dir(fd: BorrowedFd<'_>, private: bool, mut f: impl FnMut(Entry<'_>))
     BUF.with_borrow_mut(|buf| {
         let mut first = true;
         loop {
-            // SAFETY: `attrs` and `buf` are live, writable and sized as
-            // passed for the whole call, and `fd` is an open directory.
-            let n = unsafe {
-                libc::getattrlistbulk(
-                    fd.as_raw_fd(),
-                    (&raw mut attrs).cast(),
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    options,
-                )
-            };
-            if n < 0 {
-                let e = Errno::from_io_error(&io::Error::last_os_error()).unwrap();
+            let n = retry(|| {
+                // SAFETY: `attrs` and `buf` are live, writable and sized as
+                // passed for the whole call, and `fd` is an open directory.
+                let n = unsafe {
+                    libc::getattrlistbulk(
+                        fd.as_raw_fd(),
+                        (&raw mut attrs).cast(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        options,
+                    )
+                };
+                match n {
+                    0.. => Ok(n),
+                    _ => Err(Errno::from_io_error(&io::Error::last_os_error()).unwrap()),
+                }
+            });
+            let n = match n {
+                Ok(n) => n,
                 // a filesystem may refuse bulk listing or these attributes
-                if first && (e == Errno::NOTSUP || e == Errno::INVAL) {
+                Err(Errno::NOTSUP | Errno::INVAL) if first => {
                     return read_portable(fd, private, &mut f);
                 }
-                return Err(e);
-            }
+                Err(e) => return Err(e),
+            };
             if n == 0 {
                 return Ok(());
             }
@@ -153,6 +188,7 @@ pub fn read_dir(fd: BorrowedFd<'_>, private: bool, mut f: impl FnMut(Entry<'_>))
                         bytes: 0,
                         mount: false,
                         private: 0,
+                        empty: false,
                     }),
                 }
             }
@@ -203,19 +239,19 @@ fn parse(e: &[u8], private: Private) -> Parsed<'_> {
             _ => Parsed::Skip,
         };
     }
-    let bytes = u64_at(e, ALLOC);
-    let slot = u32_at(e, MOUNT_OR_LINKS);
-    let (mount, nlink) = match kind {
+    let count = u32_at(e, COUNT);
+    let (alloc, mount, nlink, empty) = match kind {
         Kind::Dir => {
-            let known = u32_at(e, RETURNED_DIR) & libc::ATTR_DIR_MOUNTSTATUS != 0;
+            let known = u32_at(e, RETURNED_DIR);
+            let mount = known & libc::ATTR_DIR_MOUNTSTATUS != 0
+                && u32_at(e, MOUNT) & (DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0;
+            let empty = known & libc::ATTR_DIR_ENTRYCOUNT != 0 && count == 0;
             // dirs cannot be hard-linked, and the scan never asks
-            (
-                known && slot & (DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0,
-                1,
-            )
+            (DIR_ALLOC, mount, 1, empty)
         }
-        _ => (false, u64::from(slot)),
+        _ => (FILE_ALLOC, false, u64::from(count), false),
     };
+    let bytes = u64_at(e, alloc);
     Parsed::Entry(Entry {
         name,
         kind,
@@ -226,9 +262,10 @@ fn parse(e: &[u8], private: Private) -> Parsed<'_> {
         mount,
         private: match private {
             Private::Zero => 0,
-            Private::Measured => u64_at(e, PRIVATE),
+            Private::Measured => u64_at(e, alloc + PRIVATE),
             Private::Allocated => bytes,
         },
+        empty,
     })
 }
 
