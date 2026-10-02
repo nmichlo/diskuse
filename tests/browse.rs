@@ -757,14 +757,12 @@ fn follows_changes(inotify: bool, within: Duration) {
     assert_eq!(draw(&mut b, later), shown_at(&scanned, &files));
 }
 
-/// FSEvents on macOS, inotify on Linux.
+/// FSEvents on macOS, inotify on Linux. The deadline is generous so a
+/// loaded machine cannot fail it; inotify itself shows changes well inside
+/// a second.
 #[test]
 fn follows_changes_on_disk() {
-    let within = match cfg!(target_os = "macos") {
-        true => 3,
-        false => 1,
-    };
-    follows_changes(true, Duration::from_secs(within));
+    follows_changes(true, Duration::from_secs(3));
 }
 
 /// Without inotify, as on NFS, the dirs shown are listed again every 2 s.

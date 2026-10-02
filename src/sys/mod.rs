@@ -130,6 +130,14 @@ pub use fsevents::Stream;
 #[cfg(not(target_os = "macos"))]
 pub enum Stream {}
 
+#[cfg(not(target_os = "macos"))]
+impl Stream {
+    // never built off macOS, as `watch` returns `None` there
+    pub fn flush(&self) {
+        match *self {}
+    }
+}
+
 /// Sends the changes below `path`, an absolute path with no symlinks, with
 /// event ids after `since`, first the recorded ones, then live ones, in
 /// batches to `tx`. `None` where the OS keeps no record of changes, so on
