@@ -81,3 +81,21 @@ both.
 
 `check` fails if a disksweep warm median is more than 10% above the last
 committed result for the same dataset and machine.
+
+## Reproducing the README numbers
+
+The tables in the top-level README come from these commands, run at commit
+`532fd05` on an Apple M4 (10 cores, 24 GB, macOS 27), load average about 2.
+
+```sh
+bench/install.sh                                   # the 9 other tools
+just bench-gen S1 /tmp/disksweep-bench/S1          # about 1 minute
+just bench S1 /tmp/disksweep-bench/S1 --runs 3
+just bench R3 /opt/homebrew --runs 3               # any real dir works; R3 is just a label
+just bench-report                                  # writes bench/results/<machine>/README.md
+```
+
+The raw results are in `bench/results/m4-10c-24g-macos27/`. Each tool runs
+3 warmup and 3 timed runs at its default threads and at 1x, 2x and 4x the
+cores. The README shows the mean. Use the default `--runs 10` for numbers
+tight enough to pass the gates.

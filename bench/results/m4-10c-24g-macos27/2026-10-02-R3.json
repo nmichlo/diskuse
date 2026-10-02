@@ -1,0 +1,626 @@
+{
+ "machine": "m4-10c-24g-macos27",
+ "dataset": "R3",
+ "date": "2026-10-02",
+ "cores": 10,
+ "reference": {
+  "command": "du -skx R3",
+  "bytes": 12892590080
+ },
+ "versions": {
+  "disksweep": "0.0.0@532fd05",
+  "dua": "2.45.1",
+  "gdu": "5.37.0",
+  "dust": "1.2.6",
+  "pdu": "0.24.0",
+  "ncdu": "2.9.2",
+  "diskscour": "0.5.0",
+  "diskus": "0.9.0",
+  "dumac": "0.1.0@1ffbe3c3",
+  "du": "system"
+ },
+ "skipped": [],
+ "warm": [
+  {
+   "tool": "disksweep",
+   "league": "tree",
+   "threads": null,
+   "command": "disksweep scan R3 --full",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.609999139,
+   "stddev": 0.03571376922286368,
+   "median": 0.596273625,
+   "min": 0.583184292,
+   "max": 0.6505395,
+   "times": [
+    0.596273625,
+    0.583184292,
+    0.6505395
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "disksweep",
+   "league": "tree",
+   "threads": 10,
+   "command": "disksweep scan R3 --full --threads 10",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.7563276806666668,
+   "stddev": 0.10955509081776528,
+   "median": 0.7056131670000001,
+   "min": 0.681318875,
+   "max": 0.882051,
+   "times": [
+    0.882051,
+    0.7056131670000001,
+    0.681318875
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "disksweep",
+   "league": "tree",
+   "threads": 20,
+   "command": "disksweep scan R3 --full --threads 20",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.6702581523333334,
+   "stddev": 0.013990565491771948,
+   "median": 0.670161,
+   "min": 0.656316416,
+   "max": 0.684297041,
+   "times": [
+    0.656316416,
+    0.670161,
+    0.684297041
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "disksweep",
+   "league": "tree",
+   "threads": 40,
+   "command": "disksweep scan R3 --full --threads 40",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.6922794446666667,
+   "stddev": 0.008010925180515905,
+   "median": 0.691056667,
+   "min": 0.6849502080000001,
+   "max": 0.700831459,
+   "times": [
+    0.700831459,
+    0.6849502080000001,
+    0.691056667
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dua",
+   "league": "tree",
+   "threads": null,
+   "command": "dua -x --format bytes aggregate --no-sort R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.7219692219999999,
+   "stddev": 0.06939280313903388,
+   "median": 0.714846333,
+   "min": 0.656412583,
+   "max": 0.79464875,
+   "times": [
+    0.79464875,
+    0.714846333,
+    0.656412583
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dua",
+   "league": "tree",
+   "threads": 10,
+   "command": "dua -x -t 10 --format bytes aggregate --no-sort R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.6957201666666667,
+   "stddev": 0.11232572160117185,
+   "median": 0.698853625,
+   "min": 0.5818605,
+   "max": 0.806446375,
+   "times": [
+    0.806446375,
+    0.698853625,
+    0.5818605
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dua",
+   "league": "tree",
+   "threads": 20,
+   "command": "dua -x -t 20 --format bytes aggregate --no-sort R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.6469631386666667,
+   "stddev": 0.010663884502981178,
+   "median": 0.648720458,
+   "min": 0.63552975,
+   "max": 0.6566392080000001,
+   "times": [
+    0.648720458,
+    0.63552975,
+    0.6566392080000001
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dua",
+   "league": "tree",
+   "threads": 40,
+   "command": "dua -x -t 40 --format bytes aggregate --no-sort R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.6635202636666667,
+   "stddev": 0.0474290425449687,
+   "median": 0.653600791,
+   "min": 0.621835417,
+   "max": 0.715124583,
+   "times": [
+    0.653600791,
+    0.715124583,
+    0.621835417
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "gdu",
+   "league": "tree",
+   "threads": null,
+   "command": "gdu -n -s -p --no-prefix -x R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.8444870693333335,
+   "stddev": 0.4482415378394736,
+   "median": 1.9781152080000002,
+   "min": 1.344627833,
+   "max": 2.210718167,
+   "times": [
+    1.9781152080000002,
+    2.210718167,
+    1.344627833
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "gdu",
+   "league": "tree",
+   "threads": 10,
+   "command": "gdu -n -s -p --no-prefix -x -m 10 R3",
+   "total": 12339032064,
+   "valid": false,
+   "mean": 1.1511087776666666,
+   "stddev": 0.05285639022629234,
+   "median": 1.142556791,
+   "min": 1.1030498340000001,
+   "max": 1.207719708,
+   "times": [
+    1.207719708,
+    1.1030498340000001,
+    1.142556791
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "gdu",
+   "league": "tree",
+   "threads": 20,
+   "command": "gdu -n -s -p --no-prefix -x -m 20 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.189082097,
+   "stddev": 0.05017924523461087,
+   "median": 1.215227958,
+   "min": 1.131229125,
+   "max": 1.220789208,
+   "times": [
+    1.131229125,
+    1.215227958,
+    1.220789208
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "gdu",
+   "league": "tree",
+   "threads": 40,
+   "command": "gdu -n -s -p --no-prefix -x -m 40 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.1771560413333333,
+   "stddev": 0.06769539423392279,
+   "median": 1.1788308330000001,
+   "min": 1.108638791,
+   "max": 1.2439985,
+   "times": [
+    1.108638791,
+    1.1788308330000001,
+    1.2439985
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dust",
+   "league": "tree",
+   "threads": null,
+   "command": "dust -d0 -P -c -b -o b -x R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.085929695,
+   "stddev": 0.059837852193356425,
+   "median": 1.097152042,
+   "min": 1.021275209,
+   "max": 1.139361834,
+   "times": [
+    1.139361834,
+    1.021275209,
+    1.097152042
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dust",
+   "league": "tree",
+   "threads": 10,
+   "command": "dust -d0 -P -c -b -o b -x -T 10 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.2046621386666667,
+   "stddev": 0.043696792441801864,
+   "median": 1.199800458,
+   "min": 1.1635995000000001,
+   "max": 1.250586458,
+   "times": [
+    1.199800458,
+    1.250586458,
+    1.1635995000000001
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dust",
+   "league": "tree",
+   "threads": 20,
+   "command": "dust -d0 -P -c -b -o b -x -T 20 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.218507639,
+   "stddev": 0.028786317847893976,
+   "median": 1.204987167,
+   "min": 1.198970542,
+   "max": 1.2515652080000002,
+   "times": [
+    1.2515652080000002,
+    1.198970542,
+    1.204987167
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dust",
+   "league": "tree",
+   "threads": 40,
+   "command": "dust -d0 -P -c -b -o b -x -T 40 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.1575450693333333,
+   "stddev": 0.01064578363215105,
+   "median": 1.155209792,
+   "min": 1.148260791,
+   "max": 1.169164625,
+   "times": [
+    1.155209792,
+    1.169164625,
+    1.148260791
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "pdu",
+   "league": "tree",
+   "threads": null,
+   "command": "pdu -x -H -b plain --json-output R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.087324667,
+   "stddev": 0.03308307779122717,
+   "median": 1.1034345,
+   "min": 1.049272334,
+   "max": 1.109267167,
+   "times": [
+    1.109267167,
+    1.049272334,
+    1.1034345
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "pdu",
+   "league": "tree",
+   "threads": 10,
+   "command": "pdu -x -H -b plain --json-output --threads 10 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.0427057916666667,
+   "stddev": 0.008782829771838698,
+   "median": 1.041211583,
+   "min": 1.034765917,
+   "max": 1.052139875,
+   "times": [
+    1.034765917,
+    1.041211583,
+    1.052139875
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "pdu",
+   "league": "tree",
+   "threads": 20,
+   "command": "pdu -x -H -b plain --json-output --threads 20 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.989467306,
+   "stddev": 0.047931571935017035,
+   "median": 1.014524167,
+   "min": 0.9342007090000001,
+   "max": 1.019677042,
+   "times": [
+    1.019677042,
+    1.014524167,
+    0.9342007090000001
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "pdu",
+   "league": "tree",
+   "threads": 40,
+   "command": "pdu -x -H -b plain --json-output --threads 40 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.0334984580000002,
+   "stddev": 0.05983961634796692,
+   "median": 1.056331833,
+   "min": 0.9656038330000001,
+   "max": 1.078559708,
+   "times": [
+    1.056331833,
+    1.078559708,
+    0.9656038330000001
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "ncdu",
+   "league": "totals",
+   "threads": null,
+   "command": "ncdu -0 -x -o - R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 2.708510110666667,
+   "stddev": 0.05478980997778524,
+   "median": 2.738138,
+   "min": 2.645285791,
+   "max": 2.742106541,
+   "times": [
+    2.645285791,
+    2.738138,
+    2.742106541
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "ncdu",
+   "league": "totals",
+   "threads": 10,
+   "command": "ncdu -0 -x -t 10 -o - R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.0300911666666668,
+   "stddev": 0.08214479943936256,
+   "median": 1.073581708,
+   "min": 0.9353445420000001,
+   "max": 1.08134725,
+   "times": [
+    0.9353445420000001,
+    1.073581708,
+    1.08134725
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "ncdu",
+   "league": "totals",
+   "threads": 20,
+   "command": "ncdu -0 -x -t 20 -o - R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.0371985833333335,
+   "stddev": 0.08395983754825993,
+   "median": 1.076536125,
+   "min": 0.9407921250000001,
+   "max": 1.0942675,
+   "times": [
+    1.076536125,
+    1.0942675,
+    0.9407921250000001
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "ncdu",
+   "league": "totals",
+   "threads": 40,
+   "command": "ncdu -0 -x -t 40 -o - R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.032100722,
+   "stddev": 0.058641712487202444,
+   "median": 1.0623455,
+   "min": 0.9645112910000001,
+   "max": 1.069445375,
+   "times": [
+    1.069445375,
+    1.0623455,
+    0.9645112910000001
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "diskscour",
+   "league": "tree",
+   "threads": null,
+   "command": "diskscour scan --full --json R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 3.5806787223333334,
+   "stddev": 0.06645528784916079,
+   "median": 3.612136584,
+   "min": 3.504335375,
+   "max": 3.625564208,
+   "times": [
+    3.612136584,
+    3.625564208,
+    3.504335375
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "diskus",
+   "league": "totals",
+   "threads": null,
+   "command": "diskus R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.9966654583333333,
+   "stddev": 0.03637135263159037,
+   "median": 0.9899638340000001,
+   "min": 0.964110958,
+   "max": 1.035921583,
+   "times": [
+    1.035921583,
+    0.964110958,
+    0.9899638340000001
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "diskus",
+   "league": "totals",
+   "threads": 10,
+   "command": "diskus -j 10 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.0304015,
+   "stddev": 0.024441628506252186,
+   "median": 1.044014333,
+   "min": 1.002184542,
+   "max": 1.045005625,
+   "times": [
+    1.044014333,
+    1.045005625,
+    1.002184542
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "diskus",
+   "league": "totals",
+   "threads": 20,
+   "command": "diskus -j 20 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 1.005872292,
+   "stddev": 0.015462118061241226,
+   "median": 1.012641084,
+   "min": 0.9881800420000001,
+   "max": 1.01679575,
+   "times": [
+    0.9881800420000001,
+    1.012641084,
+    1.01679575
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "diskus",
+   "league": "totals",
+   "threads": 40,
+   "command": "diskus -j 40 R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 0.949662403,
+   "stddev": 0.03559778738062894,
+   "median": 0.931591417,
+   "min": 0.9267247500000001,
+   "max": 0.9906710420000001,
+   "times": [
+    0.931591417,
+    0.9267247500000001,
+    0.9906710420000001
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "dumac",
+   "league": "totals",
+   "threads": null,
+   "command": "dumac R3",
+   "total": 12884901888,
+   "valid": true,
+   "mean": 0.6355938056666667,
+   "stddev": 0.004359494304626882,
+   "median": 0.634550375,
+   "min": 0.6318507080000001,
+   "max": 0.640380334,
+   "times": [
+    0.6318507080000001,
+    0.634550375,
+    0.640380334
+   ],
+   "failed_runs": 0
+  },
+  {
+   "tool": "du",
+   "league": "totals",
+   "threads": null,
+   "command": "du -skx R3",
+   "total": 12892590080,
+   "valid": true,
+   "mean": 2.7031282783333332,
+   "stddev": 0.011138812021258007,
+   "median": 2.700509459,
+   "min": 2.693532209,
+   "max": 2.715343167,
+   "times": [
+    2.715343167,
+    2.700509459,
+    2.693532209
+   ],
+   "failed_runs": 0
+  }
+ ],
+ "memory": {
+  "disksweep": 14516224,
+  "dua": 13352960,
+  "gdu": 43925504,
+  "dust": 164282368,
+  "pdu": 38273024,
+  "ncdu": 2408448,
+  "diskscour": 260833280,
+  "diskus": 21168128,
+  "dumac": 33357824,
+  "du": 5783552
+ }
+}

@@ -351,8 +351,34 @@ replaces it.
 
 ## Benchmarks
 
-Results land before 0.1.0. The method is in
-[bench/README.md](https://github.com/nmichlo/disksweep/blob/main/bench/README.md).
+**disksweep had the fastest mean in both runs below, and builds a browsable tree while doing it.** These are quick runs (3 timed runs each), so its lead over dua and dumac (2-6%) is within the noise; the gap to every other tool is clear. Every tool's total matched `du`.
+
+Apple M4, 10 cores, 24 GB, macOS 27, warm cache, 2026-10-02. How to reproduce: [bench/README.md](bench/README.md#reproducing-the-readme-numbers).
+
+**S1: the dumac README tree, 4,095 dirs and 409,500 files.**
+
+| tool | kind | warm time | peak memory |
+| --- | --- | --- | --- |
+| **disksweep** | tree | **0.342 s** | **7.7 MiB** |
+| dua | tree | 0.350 s | 9.2 MiB |
+| dumac | totals only | 0.446 s | - |
+
+**A Homebrew prefix: 42,700 dirs, 12 GiB.** "Best" is each tool at its fastest thread count.
+
+| tool | kind | warm, default threads | warm, best | peak memory |
+| --- | --- | --- | --- | --- |
+| **disksweep** | tree | **0.610 s** | **0.610 s** | 13.8 MiB |
+| dumac | totals only | 0.636 s | 0.636 s | 31.8 MiB |
+| dua | tree | 0.722 s | 0.647 s | **12.7 MiB** |
+| diskus | totals only | 0.997 s | 0.950 s | 20.2 MiB |
+| dust | tree | 1.086 s | 1.086 s | 156.7 MiB |
+| pdu | tree | 1.087 s | 0.989 s | 36.5 MiB |
+| gdu | tree | 1.844 s | 1.177 s | 41.9 MiB |
+| ncdu | totals only (`-o -`) | 2.709 s | 1.030 s | 2.3 MiB |
+| du | totals only | 2.703 s | 2.703 s | 5.5 MiB |
+| DiskScour | tree | 3.581 s | 3.581 s | 248.8 MiB |
+
+Versions: dua 2.45.1, gdu 5.37.0, dust 1.2.6, pdu 0.24.0, ncdu 2.9.2, DiskScour 0.5.0, diskus 0.9.0, dumac 1ffbe3c3, du (macOS).
 
 ## License
 
