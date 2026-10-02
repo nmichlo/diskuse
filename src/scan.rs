@@ -22,7 +22,8 @@ use std::{fmt, io};
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanOptions {
-    /// Worker threads. `None` means the available parallelism.
+    /// Worker threads. `None` means the number of cores, at most 8 (see
+    /// `DEFAULT_THREADS` for why).
     pub threads: Option<NonZeroUsize>,
     /// Also measure [`Record::own_private`]. Only the macOS reader can see
     /// clones; the portable reader leaves it 0.
@@ -103,9 +104,19 @@ fn lister(fd: &OwnedFd, opts: &ScanOptions) -> rustix::io::Result<sys::Lister> {
     }
 }
 
+/// The default cap on worker threads. Past it, threads mostly wait on
+/// kernel locks: on a 10-core M4, 8 threads were as fast as or faster than
+/// 10 on every tree measured, with 10% less CPU; fewer threads lose on
+/// large trees, which also wait on the disk.
+const DEFAULT_THREADS: usize = 8;
+
 fn pool(opts: &ScanOptions) -> Result<ThreadPool, rayon::ThreadPoolBuildError> {
+    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     rayon::ThreadPoolBuilder::new()
-        .num_threads(opts.threads.map_or(0, NonZeroUsize::get))
+        .num_threads(
+            opts.threads
+                .map_or(cores.min(DEFAULT_THREADS), NonZeroUsize::get),
+        )
         .build()
 }
 
