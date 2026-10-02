@@ -12,10 +12,10 @@ use tempfile::TempDir;
 /// Writes a file of `len` bytes and requires the filesystem to allocate
 /// exactly `len` bytes for it, which the expected sizes below rely on.
 pub fn file(path: &Path, len: usize) {
-    File::create(path)
-        .unwrap()
-        .write_all(&vec![0xab; len])
-        .unwrap();
+    let mut f = File::create(path).unwrap();
+    f.write_all(&vec![0xab; len]).unwrap();
+    // APFS allocates lazily: flush so the blocks exist before checking
+    f.sync_all().unwrap();
     let allocated = fs::metadata(path).unwrap().blocks() * 512;
     assert_eq!(
         allocated, len as u64,
@@ -26,12 +26,19 @@ pub fn file(path: &Path, len: usize) {
 
 /// Appends `len` bytes to the file at `path` in place: no entry of its
 /// directory changes.
-pub fn append(path: &Path, len: usize) {
+pub fn append(path: &Path, len: usize) -> u64 {
     let before = fs::metadata(path).unwrap().blocks() * 512;
     let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
     f.write_all(&vec![0xcd; len]).unwrap();
+    f.sync_all().unwrap();
+    // APFS may allocate ahead of a growing file (seen: +1 MiB for a 4 KiB
+    // append), so the caller uses what was allocated, not what was written
     let allocated = fs::metadata(path).unwrap().blocks() * 512;
-    assert_eq!(allocated, before + len as u64);
+    assert!(
+        allocated >= before + len as u64,
+        "{allocated} < {before} + {len}"
+    );
+    allocated
 }
 
 /// Allocated bytes of a directory or symlink itself (APFS: 0, ext4: 4096).

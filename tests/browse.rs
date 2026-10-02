@@ -1260,8 +1260,8 @@ fn follows_changes(inotify: bool, within: Duration) {
     fs::remove_file(root.join("a/gone")).unwrap();
     shows_within(&mut b, &shown(&[(4096, "keep"), (4096, "new")]), within);
     // in place: no entry of `a/` changes
-    common::append(&root.join("a/keep"), 4096);
-    let files = [(8192, "keep"), (4096, "new")];
+    let keep = common::append(&root.join("a/keep"), 4096);
+    let files = [(keep, "keep"), (4096, "new")];
     shows_within(&mut b, &shown(&files), within);
     // on Linux the title says how old the scan is
     let later = now() + Duration::from_secs(4 * 60);
@@ -1330,4 +1330,57 @@ fn watches_only_the_dirs_shown() {
     assert_eq!(watched(root, &dirs), ["", "b"]);
     drop(b);
     assert_eq!(watched(root, &dirs), [""; 0]);
+}
+
+/// ```text
+/// root/
+///   x0/f .. x4/f    4096 each
+/// ```
+///
+/// scanned with a stop at once, so the saved scan has the root alone. The
+/// browser finishes it, saying how many dirs are left meanwhile.
+#[test]
+fn finishes_a_stopped_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let names = ["x0", "x1", "x2", "x3", "x4"];
+    for name in names {
+        fs::create_dir(root.join(name)).unwrap();
+        file(&root.join(name).join("f"), 4096);
+    }
+    let opts = ScanOptions {
+        stop: disksweep::Stop::new(|| true),
+        ..ScanOptions::default()
+    };
+    let saved = Saved {
+        tree: disksweep::scan(root, &opts).unwrap(),
+        reclaimable: false,
+        modified: now(),
+    };
+    let mut b = Browser::new(
+        root,
+        "/stopped",
+        env(Desktop::None),
+        Some(saved),
+        None,
+        false,
+    );
+    b.scan();
+    let d = common::own_bytes(root);
+    let title = format!("/stopped  resuming: 5 dirs left, at least {}", kib(d));
+    assert_eq!(
+        draw(&mut b, now()),
+        screen(&title, [&[], &[], &[]], None, 0, HELP)
+    );
+
+    while b.poll(now()) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let x = 4096 + d;
+    let total = 5 * x + d;
+    let rows: Vec<Row> = names.iter().map(|name| Row::dir(x, total, name)).collect();
+    let title = format!("/stopped  {}{SCANNED}", kib(total));
+    let f = [Row::file(4096, x, "f")];
+    let expected = screen(&title, [&[], &rows, &f], None, 0, HELP);
+    assert_eq!(draw(&mut b, now()), expected);
 }

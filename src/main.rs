@@ -1,7 +1,10 @@
 use clap::{Args, Parser, Subcommand};
+use signal_hook::consts::{SIGINT, SIGTERM};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Parser)]
 #[command(version, about, args_conflicts_with_subcommands = true)]
@@ -19,7 +22,9 @@ struct Cli {
 enum Command {
     /// Print the size of PATH and of each of its direct children, and save
     /// the result for `show`. On macOS, a saved scan of PATH is brought up
-    /// to date from the changes since, when macOS recorded them.
+    /// to date from the changes since, when macOS recorded them. Ctrl-C
+    /// stops the scan and saves what it found, which the next scan of PATH
+    /// finishes.
     Scan {
         path: PathBuf,
         /// Scan all of PATH, even if a saved scan could be brought up to date
@@ -31,6 +36,10 @@ enum Command {
         /// Directory reader, for the differential test and benchmarks
         #[arg(long, value_enum, default_value_t, hide = true)]
         reader: disksweep::Reader,
+        /// Stop after listing N directories below PATH, as Ctrl-C would, for
+        /// the tests
+        #[arg(long, value_name = "N", hide = true)]
+        stop_after: Option<usize>,
         #[command(flatten)]
         output: Output,
     },
@@ -105,10 +114,11 @@ fn main() -> ExitCode {
                 full,
                 threads,
                 reader,
+                stop_after,
                 output,
             }),
             _,
-        ) => scan(&path, full, threads, reader, &output),
+        ) => scan(&path, full, threads, reader, stop_after, &output),
         (Some(Command::Show { path, output }), _) => show(&path, &output),
         (None, path) => browse(path.as_deref(), cli.reclaimable.on()),
     }
@@ -133,12 +143,26 @@ fn scan(
     full: bool,
     threads: Option<NonZeroUsize>,
     reader: disksweep::Reader,
+    stop_after: Option<usize>,
     output: &Output,
 ) -> ExitCode {
+    // the number of the signal that stopped the scan, if one did
+    let signal = Arc::new(AtomicUsize::new(0));
+    for sig in [SIGINT, SIGTERM] {
+        // only fails for signals that cannot be caught
+        signal_hook::flag::register_usize(sig, Arc::clone(&signal), sig as usize).unwrap();
+    }
+    let listed = AtomicUsize::new(0);
+    let stopped = Arc::clone(&signal);
+    let stop = disksweep::Stop::new(move || {
+        let enough = stop_after.is_some_and(|n| listed.fetch_add(1, Ordering::Relaxed) >= n);
+        enough || stopped.load(Ordering::Relaxed) != 0
+    });
     let opts = disksweep::ScanOptions {
         threads,
         reclaimable: output.reclaimable(),
         reader,
+        stop,
     };
     let cache = disksweep::CacheDir::from_env();
     // a saved scan that cannot be read is replaced, like a missing one
@@ -161,7 +185,11 @@ fn scan(
     if let Err(e) = saved {
         eprintln!("disksweep: warning: scan not saved: {e}");
     }
-    ExitCode::SUCCESS
+    // like a shell reports a process the signal ended
+    match signal.load(Ordering::Relaxed) {
+        0 => ExitCode::SUCCESS,
+        sig => ExitCode::from(128 + sig as u8),
+    }
 }
 
 fn show(path: &Path, output: &Output) -> ExitCode {

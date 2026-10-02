@@ -97,7 +97,42 @@ The largest files list (`--top`, `t`) keeps the 1000 largest files from the
 full scan, plus those of the directories listed again. A full scan finds the
 others again.
 
-On Linux every `scan` is a full scan.
+On Linux every `scan` is a full scan, unless it finishes a stopped one.
+
+## Stop and resume
+
+Ctrl-C stops a `scan`, and so does SIGTERM. In the browser, `q`, Esc and
+Ctrl-C stop the scan when quitting. Either way disksweep lists no more
+directories, saves what it found, and marks the result incomplete:
+
+```text
+ 182.4 GiB  /  (incomplete: run scan to finish)
+```
+
+`scan` prints that and exits with 130 after Ctrl-C, 143 after SIGTERM.
+`show` prints it the same way. With `--json`, the root has
+`"incomplete": true`.
+
+The next `scan` or browse of `<path>` finishes the stopped scan rather than
+starting over. Each saved directory records how many subdirectories it has,
+so disksweep lists again only the directories the scan did not finish, and
+scans only the subdirectories missing from them:
+
+```text
+disksweep scan /              # Ctrl-C after a minute: saved, incomplete
+disksweep scan /              # scans only what the first one missed
+disksweep scan / --full       # starts over
+```
+
+On macOS it first applies the changes made since the stopped scan started,
+like an [incremental scan](#incremental-scans), so the result is the same as
+a full scan's. On Linux the directories already scanned stay as they were,
+so changes in them since then only show after a full scan. In the browser
+the title says `resuming: 120 dirs left, at least 182.4 GiB` until it is
+done; the number is of the subdirectories known to be missing so far.
+
+A scan that is killed outright, by SIGKILL, a crash or a power cut, saves
+nothing. The next scan starts from the last saved scan, if any.
 
 ## Browse
 
@@ -141,7 +176,8 @@ the sizes grow, about once a second, until the scan is done and saved. If
 `<path>` was scanned before, the saved scan shows at once, marked
 `saved 5 min ago`, until the fresh scan is done. On macOS that saved scan is
 brought up to date like an [incremental scan](#incremental-scans), usually in
-under a second, instead of scanning again. Then, while disksweep is open,
+under a second, instead of scanning again. A saved scan that was stopped is
+finished instead, as in [Stop and resume](#stop-and-resume). Then, while disksweep is open,
 sizes follow changes on disk, about once a second.
 
 Linux keeps no record of changes, so there the saved scan shows until a full
@@ -179,7 +215,7 @@ macOS records no changes for, like a network share, is followed the same way.
 | `d`                  | List the directories that could not be read, and why       |
 | `t`                  | Show or hide the largest files under `<path>`              |
 | `?`                  | Show or hide every key                                     |
-| `q`, Esc             | Quit                                                       |
+| `q`, Esc             | Quit; a running scan stops and saves what it found         |
 | Click                | Select; in the parent or preview column, go there too      |
 | Double click         | Go into the directory, or scan the volume                  |
 | Wheel                | Move the cursor, or scroll the parent or preview column    |
@@ -282,6 +318,8 @@ Files are not listed; their bytes are in `own`.
   "partial": true,               only if something below it was denied
   "name_lossy": true,            only if the name is not UTF-8 and was
                                  converted with U+FFFD
+  "incomplete": true,            root only, only if the scan was stopped
+                                 before it was done
   "children": [ <node>, ... ],   largest first, ties by name; absent at the
                                  depth limit
   "largest_files": [ {"path": "...", "size": <bytes>}, ... ]

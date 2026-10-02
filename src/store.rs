@@ -2,6 +2,10 @@
 //! without scanning, and the next `scan` can start from it. The only module
 //! that writes files, and only inside [`CacheDir`].
 //!
+//! A stopped scan is saved like any other. What it lacks needs no flag:
+//! each record counts its subdirectories ([`Record::subdirs`]), so the
+//! dirs it did not finish are those with fewer children in the file.
+//!
 //! A file is a fixed header, then an [rkyv] archive of [`Body`], which
 //! `show` reads in place ([`SavedTree`]), then a CRC-32 of all the bytes
 //! before it. The format is versioned, with no migrations: a file of another
@@ -12,7 +16,7 @@
 //!
 //! ```text
 //! magic     b"DSWP"
-//! version   u8 = 3
+//! version   u8 = 4
 //! flags     u8: bit 0 = scanned with reclaimable sizes
 //! event_id  u64: the tree has every change up to this event, 0 if the OS
 //!           keeps no record of changes
@@ -40,7 +44,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"DSWP";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const RECLAIMABLE: u8 = 1 << 0;
 const HEADER_LEN: usize = 32;
 
@@ -235,6 +239,7 @@ impl ReadTree for SavedTree<'_> {
             name: r.name.to_native(),
             flags: r.flags.to_native(),
             errno: r.errno.to_native(),
+            subdirs: r.subdirs.to_native(),
             own: r.own.to_native(),
             own_private: r.own_private.to_native(),
         }

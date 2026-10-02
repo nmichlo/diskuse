@@ -25,7 +25,7 @@ pub use app::{App, Preflight, browse};
 pub use browse::{Browser, Env};
 pub use json::json;
 pub use report::report;
-pub use scan::{Reader, ScanError, ScanOptions, scan, scan_live};
+pub use scan::{Reader, ScanError, ScanOptions, Stop, scan, scan_live};
 pub use store::{CacheDir, Saved, SavedFile, SavedTree};
 pub use tree::{ChildIndex, LARGEST, LargeFile, Progress, ReadTree, Record, Totals, Tree};
 pub use volumes::{Mount, mounts};

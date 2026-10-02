@@ -5,13 +5,13 @@
 //! live ones, and [`Tree::apply`] lists the dirs they touched again.
 //!
 //! macOS only. Elsewhere [`Watch::start`] is always `None`, so every scan
-//! is a full one, and an open browser follows only the dirs it shows
-//! ([`DirWatch`]).
+//! is a full one, unless it finishes a stopped one, and an open browser
+//! follows only the dirs it shows ([`DirWatch`]).
 
 use crate::scan::ScanOptions;
 use crate::store::CacheDir;
 use crate::sys::{self, Event, What};
-use crate::tree::{ReadTree, Record, Tree};
+use crate::tree::{Progress, ReadTree, Record, Tree};
 use rustix::fd::AsFd;
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -37,17 +37,36 @@ const POLL: Duration = Duration::from_secs(2);
 const BACKOFF: u32 = 10;
 
 /// Brings `tree`, an earlier scan of `root`, up to date from the changes
-/// the OS recorded since, listing again only the dirs they touched.
-/// Changes in `cache` are ignored. `None` where the OS cannot say what
-/// changed, so only a full scan is right: always on Linux.
+/// the OS recorded since, listing again only the dirs they touched, and
+/// finishes it if it was stopped, scanning only what it lacks. Changes in
+/// `cache` are ignored. `None` if only a full scan is right: when the OS
+/// recorded the changes, but no longer has them all, or keeps no record of
+/// changes and the tree is finished. So on Linux, a stopped scan is
+/// finished, and the dirs it listed are left as they were.
 pub fn update(
+    root: &Path,
+    tree: Tree,
+    opts: &ScanOptions,
+    cache: Option<&CacheDir>,
+) -> Option<Tree> {
+    update_live(root, tree, opts, cache, |_| {})
+}
+
+/// [`update`], handing `progress` a [`Progress`] of the scan of what is
+/// new or missing, if any.
+pub(crate) fn update_live(
     root: &Path,
     mut tree: Tree,
     opts: &ScanOptions,
     cache: Option<&CacheDir>,
+    progress: impl FnOnce(Progress),
 ) -> Option<Tree> {
-    let changes = Watch::start(root, &tree, cache)?.replay()?;
-    tree.apply(&changes, opts)?;
+    let changes = match tree.since.store {
+        0 if tree.unfinished(&tree.child_index()).next().is_some() => Changes::default(),
+        0 => return None,
+        _ => Watch::start(root, &tree, cache)?.replay()?,
+    };
+    tree.apply(&changes, opts, progress)?;
     Some(tree)
 }
 

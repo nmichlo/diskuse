@@ -372,19 +372,20 @@ fn reclaimable_excludes_blocks_shared_with_a_clone() {
 }
 
 /// Creates `a/b/new` (12288) in the fixture, deletes `a/f1`, and grows
-/// `big/f` by 4096 in place.
-fn change(f: &common::Fixture) {
+/// `big/f` by 4096 in place. Returns what `big/f` then allocates.
+fn change(f: &common::Fixture) -> u64 {
     let root = f.dir.path();
     file(&root.join("a/b/new"), 12288);
     fs::remove_file(root.join("a/f1")).unwrap();
     // no dir entry changes, which a replay of dir changes misses
-    append(&root.join("big/f"), 4096);
+    append(&root.join("big/f"), 4096)
 }
 
-/// The `--json` output of the fixture after [`change`].
-fn changed_json(f: &common::Fixture) -> String {
+/// The `--json` output of the fixture after [`change`], which left `big/f`
+/// allocating `big_file` bytes.
+fn changed_json(f: &common::Fixture, big_file: u64) -> String {
     let d = f.dir_bytes;
-    let big = 1572864 + 4096 + d;
+    let big = big_file + d;
     let a = 8192 + 8192 + 12288 + 12288 + 3 * d;
     let a_own = 8192 + d;
     let own = 8192 + f.sym_bytes + d;
@@ -410,7 +411,7 @@ fn scan_brings_a_saved_scan_up_to_date() {
     let f = fixture();
     let cache = tempfile::tempdir().unwrap();
     ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
-    change(&f);
+    let big_file = change(&f);
     let updated = ok(disksweep(cache.path(), "scan", f.dir.path(), &["--json"]));
     let full = ok(disksweep(
         cache.path(),
@@ -418,7 +419,7 @@ fn scan_brings_a_saved_scan_up_to_date() {
         f.dir.path(),
         &["--json", "--full"],
     ));
-    let expected = changed_json(&f);
+    let expected = changed_json(&f, big_file);
     assert_eq!([updated, full], [expected.clone(), expected]);
 }
 
@@ -444,9 +445,9 @@ fn scan_is_full_without_a_usable_saved_scan() {
         let mut bytes = fs::read(saved).unwrap();
         corrupt(&mut bytes);
         fs::write(saved, bytes).unwrap();
-        change(&f);
+        let big_file = change(&f);
         let out = ok(disksweep(cache.path(), "scan", f.dir.path(), &["--json"]));
-        assert_eq!(out, changed_json(&f), "corruption {i}");
+        assert_eq!(out, changed_json(&f, big_file), "corruption {i}");
     }
 }
 
@@ -485,4 +486,192 @@ fn update_adds_new_subdirs_and_drops_removed_ones() {
     let a = leaf("a", 4096 + d, 4096 + d, r#","children":[]"#);
     let expected = root(path, 16384 + 4 * d, d, "", &[new, a]);
     assert_eq!(disksweep::json(&tree, false, 3, None), expected);
+}
+
+/// After the first line of a scan that was stopped before it was done.
+const INCOMPLETE: &str = "  (incomplete: run scan to finish)";
+
+/// A scan stopped after any number of dirs is saved, and the next scan
+/// finishes it, with the output of a full scan.
+#[test]
+fn scan_finishes_a_stopped_scan() {
+    let f = fixture();
+    let root = f.dir.path();
+    let full = ["--json", "--depth", "9", "--top", "9"];
+    let expected = scan(root, &[&["--full"], &full[..]].concat());
+    // `a/`, `a/b/`, `a/b/c/`, `big/`, `empty/`, and both `locked/`
+    let dirs = match rustix::process::geteuid().is_root() {
+        true => 5,
+        false => 7,
+    };
+    for k in 0..=dirs {
+        let cache = tempfile::tempdir().unwrap();
+        let stopped = ok(disksweep(
+            cache.path(),
+            "scan",
+            root,
+            &["--stop-after", &k.to_string()],
+        ));
+        let first = stopped.lines().next().unwrap();
+        assert_eq!(first.ends_with(INCOMPLETE), k < dirs, "{k}: {stopped}");
+        if k == 0 {
+            // the root alone was listed
+            let files = common::kib(8192 + f.sym_bytes + f.dir_bytes);
+            let shown = format!(
+                "{files:>10}  {}{INCOMPLETE}\n{files:>10}  [files]\n",
+                root.display()
+            );
+            assert_eq!(ok(disksweep(cache.path(), "show", root, &[])), shown);
+        }
+        let finished = ok(disksweep(cache.path(), "scan", root, &full));
+        assert_eq!(finished, expected, "{k}");
+        assert_eq!(
+            ok(disksweep(cache.path(), "show", root, &[])),
+            f.expected,
+            "{k}"
+        );
+    }
+}
+
+/// [`disksweep::update`] scans only the dirs a stopped scan left out, once
+/// each.
+#[test]
+fn update_scans_only_what_a_stopped_scan_left_out() {
+    use disksweep::{ReadTree, ScanOptions, Stop};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let f = fixture();
+    let root = f.dir.path();
+    let full = disksweep::scan(root, &ScanOptions::default()).unwrap();
+    let expected = disksweep::json(&full, false, 9, Some(9));
+    let dirs = full.len() - 1;
+    // stops after `k` dirs, and counts the dirs asked about
+    let after = |k: usize| {
+        let listed = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&listed);
+        let stop = Stop::new(move || count.fetch_add(1, Ordering::Relaxed) >= k);
+        let opts = ScanOptions {
+            stop,
+            ..ScanOptions::default()
+        };
+        (opts, listed)
+    };
+    for k in 0..dirs {
+        let (opts, _) = after(k);
+        let stopped = disksweep::scan(root, &opts).unwrap();
+        assert_eq!(stopped.len(), 1 + k);
+        let (opts, listed) = after(usize::MAX);
+        let tree = disksweep::update(root, stopped, &opts, None).unwrap();
+        let out = disksweep::json(&tree, false, 9, Some(9));
+        let listed = listed.load(Ordering::Relaxed);
+        assert_eq!((out, listed), (expected.clone(), dirs - k), "{k}");
+    }
+}
+
+/// ```text
+/// root/
+///   a/f, b/f    4096 each
+/// ```
+///
+/// then `a/new` and `b/new` (8192 each) created after a scan stopped after
+/// one of `a/` and `b/`. That one is not listed again for being unfinished,
+/// so only the changes macOS recorded bring it up to date.
+#[cfg(target_os = "macos")]
+#[test]
+fn scan_finishes_a_stopped_scan_with_the_changes_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    for d in ["a", "b"] {
+        fs::create_dir(path.join(d)).unwrap();
+        file(&path.join(d).join("f"), 4096);
+    }
+    let cache = tempfile::tempdir().unwrap();
+    ok(disksweep(
+        cache.path(),
+        "scan",
+        path,
+        &["--stop-after", "1"],
+    ));
+    for d in ["a", "b"] {
+        file(&path.join(d).join("new"), 8192);
+    }
+    let finished = ok(disksweep(cache.path(), "scan", path, &["--json"]));
+    let full = ok(disksweep(cache.path(), "scan", path, &["--json", "--full"]));
+    let d = own_bytes(path);
+    let kid = |name| leaf(name, 12288 + d, 12288 + d, "");
+    let expected = root(path, 24576 + 3 * d, d, "", &[kid("a"), kid("b")]);
+    assert_eq!([finished, full], [expected.clone(), expected]);
+}
+
+/// The access time of `path`, which listing it moves when older than its
+/// modification time, as after creating entries in it.
+fn accessed(path: &Path) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).unwrap();
+    (m.atime(), m.atime_nsec())
+}
+
+/// SIGTERM stops a running scan, which saves what it found, and the next
+/// scan finishes it. The signal is sent once the scan has listed the root,
+/// so it can stop, and the tree is made larger until the scan is still
+/// running then.
+#[test]
+fn sigterm_stops_a_scan_and_the_next_scan_finishes_it() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let args = ["--json", "--depth", "2"];
+    // top dirs, each with 64 subdirs
+    for top in [64, 256, 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        for i in 0..top {
+            for j in 0..64 {
+                fs::create_dir_all(path.join(format!("{i}/{j}"))).unwrap();
+            }
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let before = accessed(path);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_disksweep"))
+            .env("DISKSWEEP_CACHE_DIR", cache.path())
+            .arg("scan")
+            .arg(path)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        while child.try_wait().unwrap().is_none() {
+            if accessed(path) != before {
+                let pid = Pid::from_raw(child.id() as i32).unwrap();
+                kill_process(pid, Signal::TERM).unwrap();
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            out.status.signal(),
+            None,
+            "ended by the signal, not stopped"
+        );
+        let stopped = String::from_utf8(out.stdout).unwrap();
+        // done before the signal landed
+        if !stopped.contains(r#""incomplete":true"#) {
+            continue;
+        }
+        assert_eq!(out.status.code(), Some(128 + 15));
+        let finished = ok(disksweep(cache.path(), "scan", path, &args));
+        let full = ok(disksweep(
+            cache.path(),
+            "scan",
+            path,
+            &[&args[..], &["--full"]].concat(),
+        ));
+        assert_eq!(finished, full);
+        return;
+    }
+    panic!("every scan was done before SIGTERM landed");
 }

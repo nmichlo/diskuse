@@ -93,6 +93,9 @@ pub fn browse(path: Option<&Path>, reclaimable: bool) -> io::Result<()> {
         execute!(io::stdout(), EnableMouseCapture).and_then(|()| run(&mut terminal, &mut app));
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    if let Err(e) = app.quit() {
+        eprintln!("disksweep: warning: scan not saved: {e}");
+    }
     result
 }
 
@@ -213,6 +216,17 @@ impl App {
             Screen::Browse(b) => b.poll(now),
             _ => false,
         }
+    }
+
+    /// Stops the scans still running, and saves what they found, so the
+    /// next run finishes them.
+    pub fn quit(&mut self) -> io::Result<()> {
+        let shown = match &mut self.screen {
+            Screen::Browse(b) => b.quit(),
+            _ => Ok(()),
+        };
+        let parked = self.parked.as_mut().map_or(Ok(()), |b| b.quit());
+        shown.and(parked)
     }
 
     /// Handles a key. Reveal, open and the settings pane go through `run`,

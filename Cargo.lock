@@ -346,6 +346,7 @@ dependencies = [
  "rayon",
  "rkyv",
  "rustix",
+ "signal-hook",
  "tempfile",
 ]
 

@@ -8,7 +8,7 @@ use std::fmt::Write;
 /// The root's total, then its direct children and its own files, largest
 /// first, ties by name bytes. `reclaimable` adds a second size column, the
 /// bytes not shared with a clone. `top` appends that many of the largest
-/// files.
+/// files. The first line says so if the tree is partial or unfinished.
 pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> String {
     let totals = tree.totals();
     let index = tree.child_index();
@@ -25,6 +25,9 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> St
     );
     if denied > 0 {
         write!(out, "  (partial: {denied} denied)").unwrap();
+    }
+    if tree.unfinished(&index).next().is_some() {
+        out.push_str(INCOMPLETE);
     }
     out.push('\n');
 
@@ -62,6 +65,9 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> St
     out
 }
 
+/// After the root's line of a tree a stopped scan left unfinished.
+const INCOMPLETE: &str = "  (incomplete: run scan to finish)";
+
 /// The output order of `(size, name)` pairs: largest first, ties by name
 /// bytes, so output never depends on scan order.
 pub(crate) fn largest_first(a: (u64, &[u8]), b: (u64, &[u8])) -> Ordering {
@@ -88,7 +94,7 @@ fn count_denied(tree: &impl ReadTree) -> usize {
 /// The marker after a directory's name: ` (denied: EACCES)`,
 /// ` (other device)`, ` (partial)` or nothing. `flags` is from
 /// [`crate::Totals::flags`].
-pub(crate) fn suffix(r: &Record, flags: u32) -> String {
+pub(crate) fn suffix(r: &Record, flags: u16) -> String {
     if flags & Record::DENIED != 0 {
         format!(" (denied: {})", denied(r))
     } else if flags & Record::OTHER_DEVICE != 0 {
