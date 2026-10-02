@@ -105,8 +105,8 @@ On Linux every `scan` is a full scan.
 
 ```text
 volumes
- 800.6 GiB used of  926.4 GiB   125.7 GiB free  /
-  10.0 GiB used of   64.0 GiB    54.0 GiB free  /Volumes/USB
+ 800.6 GiB used of  926.4 GiB   125.7 GiB free  #########.  /
+  10.0 GiB used of   64.0 GiB    54.0 GiB free  ##........  /Volumes/USB
 ```
 
 Enter browses the selected volume. Esc, or Backspace at its top, goes back to
@@ -118,16 +118,23 @@ disk: a scan of `/` also covers the hidden Data volume, where your files are,
 and the used bytes of an APFS volume are those of its whole container.
 
 `disksweep <path>` browses `<path>` full screen, in three columns: the parent
-directory, the current one, and a preview of the selected item. Each lists
-directories and files together, largest first.
+directory, the current one, and a preview of the selected item. At the top of
+`<path>` there is no parent, so the current directory takes the first column.
+Each lists directories and files together, largest first. In a column at
+least 40 cells wide, a bar shows each item's share of its directory, in
+tenths, rounded, and at least one `#` from 1%:
 
 ```text
 /opt/homebrew  12.0 GiB
-  10.5 GiB  Cellar/                  1.4 GiB  llvm@20/                1.4 GiB  20.1.8/
- 667.1 MiB  share/                 795.4 MiB  proj/
- 439.5 MiB  Library/               490.3 MiB  go/
- 132.1 MiB  .git/                  444.2 MiB  gcc/
+  10.5 GiB  #########. Cellar/                 1.4 GiB  #......... llvm@20/
+ 667.1 MiB  #......... share/                795.4 MiB  #......... proj/
+ 439.5 MiB  #......... Library/              490.3 MiB  #......... go/
 ```
+
+Sizes are coloured by magnitude, like OmniDiskSweeper: red from 1 GiB, yellow
+from 1 MiB, green from 1 KiB, grey below. Directories are bold. With
+[`NO_COLOR`](https://no-color.org) set, nothing is coloured; the selection is
+reversed instead.
 
 It scans while you browse. The title says `scanning... at least <size>` and
 the sizes grow, about once a second, until the scan is done and saved. If
@@ -156,18 +163,30 @@ Lustre, GPFS, GFS2, OCFS2 and OrangeFS. The same goes for a directory inotify
 cannot watch, as once `fs.inotify.max_user_watches` is reached. On macOS, a volume
 macOS records no changes for, like a network share, is followed the same way.
 
-| Key                  | Action                                                 |
-| -------------------- | ------------------------------------------------------ |
-| Up, Down, `k`, `j`   | Move                                                   |
-| Right, Enter, `l`    | Go into the selected directory                         |
-| Left, Backspace, `h` | Go to the parent directory, not above `<path>`         |
-| `r`                  | Reveal the selected item in Finder or the file manager |
-| `o`                  | Open the selected item                                 |
-| `R`                  | Rescan all of `<path>`                                 |
-| `/`                  | Filter the current column by text; Esc clears          |
-| `d`                  | List the directories that could not be read, and why   |
-| `t`                  | Show or hide the largest files under `<path>`          |
-| `q`, Esc             | Quit                                                   |
+### Keys
+
+| Key                  | Action                                                     |
+| -------------------- | ---------------------------------------------------------- |
+| Up, Down, `k`, `j`   | Move                                                       |
+| PageUp, PageDown     | Move by a screen                                           |
+| Home, End, `g`, `G`  | Go to the first or the last row                            |
+| Right, Enter, `l`    | Go into the selected directory                             |
+| Left, Backspace, `h` | Go to the parent directory, not above `<path>`             |
+| `r`                  | Reveal the selected item in Finder or the file manager     |
+| `o`                  | Open the selected item                                     |
+| `R`                  | Rescan all of `<path>`                                     |
+| `/`                  | Filter the current column by text; Enter keeps, Esc clears |
+| `d`                  | List the directories that could not be read, and why       |
+| `t`                  | Show or hide the largest files under `<path>`              |
+| `?`                  | Show or hide every key                                     |
+| `q`, Esc             | Quit                                                       |
+| Click                | Select; in the parent or preview column, go there too      |
+| Double click         | Go into the directory, or scan the volume                  |
+| Wheel                | Move the cursor, or scroll the parent or preview column    |
+
+The move keys, the mouse and `?` work the same on the volume list, the `d`
+list and the `t` list. disksweep takes the mouse, so to select text on screen,
+hold Shift (Option in Terminal and iTerm) while dragging.
 
 Reveal and open run `open -R` and `open` on macOS, and `xdg-open` on Linux,
 which opens the folder of the item for reveal. Over SSH, or on Linux without

@@ -9,9 +9,12 @@ use disksweep::reveal::Desktop;
 use disksweep::{App, Browser, Env, FullDiskAccess, Mount, Saved, ScanOptions};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::{Frame, Terminal};
 use std::cmp::Reverse;
 use std::ffi::OsString;
@@ -23,15 +26,18 @@ use std::time::{Duration, Instant, SystemTime};
 
 const WIDTH: usize = 100;
 const HEIGHT: usize = 20;
-/// `(x, width)` of the parent, current and preview columns.
+/// `(x, width)` of the parent, current and preview columns. At the root,
+/// the current and preview columns take the first two.
 const COLUMNS: [(usize, usize); 3] = [(0, 33), (34, 32), (67, 33)];
 /// A wider terminal, for rows too long for 100 columns.
 const WIDE: usize = 130;
 const WIDE_COLUMNS: [(usize, usize); 3] = [(0, 43), (44, 42), (87, 43)];
 const HELP: &str =
-    "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  q quit";
-const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  q quit";
+    "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  ? help  q quit";
+const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
+const VOLUMES_HELP: &str = "arrows/jk move  enter scan  ? help  q quit";
 const GIB: u64 = 1 << 30;
+const MIB: u64 = 1 << 20;
 /// After the total of a finished scan: its age, on Linux, where only the
 /// dirs shown follow changes.
 const SCANNED: &str = match cfg!(target_os = "macos") {
@@ -45,84 +51,244 @@ fn now() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
 }
 
-/// An expected screen: `title`, the rows of each column, and `footer`.
-/// `parent` is the bold row of the parent column, `current` the reversed
-/// row of the current one.
+/// The styles the screens are drawn with, with colours or without.
+#[derive(Clone, Copy)]
+struct Look {
+    color: bool,
+}
+
+const COLOR: Look = Look { color: true };
+const NO_COLOR: Look = Look { color: false };
+
+impl Look {
+    fn fg(self, color: Color) -> Style {
+        match self.color {
+            true => Style::new().fg(color),
+            false => Style::new(),
+        }
+    }
+
+    /// A size, by its unit: like OmniDiskSweeper, red from 1 GiB, yellow
+    /// from 1 MiB, green from 1 KiB, dim below.
+    fn size(self, text: &str) -> Style {
+        match text.rsplit(' ').next().unwrap() {
+            "GiB" => self.fg(Color::Red),
+            "MiB" => self.fg(Color::Yellow),
+            "KiB" => self.fg(Color::Green),
+            _ => self.fg(Color::DarkGray),
+        }
+    }
+
+    fn dim(self) -> Style {
+        self.fg(Color::DarkGray)
+    }
+
+    /// The row at the cursor.
+    fn selected(self) -> Style {
+        match self.color {
+            true => Style::new()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            false => Style::new().add_modifier(Modifier::REVERSED),
+        }
+    }
+
+    /// The current dir's row in the parent column.
+    fn parent(self) -> Style {
+        match self.color {
+            true => Style::new().fg(Color::White).bg(Color::DarkGray),
+            false => Style::new().add_modifier(Modifier::UNDERLINED),
+        }
+    }
+}
+
+fn bold() -> Style {
+    Style::new().add_modifier(Modifier::BOLD)
+}
+
+/// `bytes` as the browser prints them, for the sizes the tests use.
+fn size(bytes: u64) -> String {
+    match bytes {
+        ..MIB => kib(bytes),
+        _ => format!("{:.1} MiB", bytes as f64 / MIB as f64),
+    }
+}
+
+/// The `#`s and `.`s of a bar of `size`'s share of `of`: tenths, to the
+/// nearest, at least one from 1%.
+fn bar(size: u64, of: u64) -> (String, String) {
+    let n = match of {
+        0 => 0,
+        _ if size * 100 < of => 0,
+        _ => ((size as f64 * 10.0 / of as f64).round() as usize).max(1),
+    };
+    ("#".repeat(n), ".".repeat(10 - n))
+}
+
+/// What a row shows after its sizes and bar.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    File,
+    /// `+` after the size if `partial`: something below was denied.
+    Dir {
+        partial: bool,
+    },
+    Denied,
+    /// A dir with a cache label.
+    Label(&'static str),
+}
+
+/// An expected row of a column: `size` bytes of a dir of `of` bytes.
+#[derive(Clone, PartialEq)]
+struct Row {
+    size: u64,
+    /// Reclaimable bytes, shown with `-r`.
+    private: Option<u64>,
+    of: u64,
+    name: String,
+    kind: Kind,
+}
+
+impl Row {
+    fn new(size: u64, of: u64, name: &str, kind: Kind) -> Self {
+        Row {
+            size,
+            private: None,
+            of,
+            name: name.into(),
+            kind,
+        }
+    }
+
+    fn file(size: u64, of: u64, name: &str) -> Self {
+        Self::new(size, of, name, Kind::File)
+    }
+
+    fn dir(size: u64, of: u64, name: &str) -> Self {
+        Self::new(size, of, name, Kind::Dir { partial: false })
+    }
+
+    /// `size  ##........ name`, the size coloured, and the `#`s the same,
+    /// the bar only if `bar`.
+    fn line(&self, look: Look, bar: bool) -> Line<'static> {
+        let plus = match self.kind {
+            Kind::Dir { partial: true } => "+",
+            _ => " ",
+        };
+        let size = |n: u64| {
+            let text = size(n);
+            Span::styled(format!("{text:>10}"), look.size(&text))
+        };
+        let mut spans = vec![size(self.size), Span::styled(plus, look.dim())];
+        if let Some(private) = self.private {
+            spans.extend([size(private), Span::styled(plus, look.dim())]);
+        }
+        spans.push(Span::raw(" "));
+        if bar {
+            let (filled, empty) = self::bar(self.size, self.of);
+            spans.extend([
+                Span::styled(filled, look.size(&size(self.size).content)),
+                Span::styled(empty, look.dim()),
+                Span::raw(" "),
+            ]);
+        }
+        let name = self.name.clone();
+        match self.kind {
+            Kind::File => spans.push(Span::raw(name)),
+            Kind::Dir { .. } => spans.push(Span::styled(name + "/", bold())),
+            Kind::Denied => spans.extend([
+                Span::styled(name + "/", bold()),
+                Span::styled(" (denied: EACCES)", look.fg(Color::Red)),
+            ]),
+            Kind::Label(label) => spans.extend([
+                Span::styled(name + "/", bold()),
+                Span::styled(format!("  [{label}]"), look.dim()),
+            ]),
+        }
+        Line::from(spans)
+    }
+}
+
+/// An expected screen: `title`, the rows of the parent, current and
+/// preview columns, and `footer`. `parent` is the marked row of the
+/// parent column, `None` at the root, and `current` the selected row of
+/// the current column.
 fn screen(
     title: &str,
-    columns: [&[String]; 3],
+    columns: [&[Row]; 3],
     parent: Option<usize>,
     current: usize,
     footer: &str,
 ) -> Buffer {
-    screen_in(WIDTH, COLUMNS, title, columns, parent, current, footer)
+    screen_in(
+        COLOR, WIDTH, COLUMNS, title, columns, parent, current, footer,
+    )
 }
 
-/// [`screen`] in a terminal `width` wide, with columns at `layout`.
+/// [`screen`] drawn with `look`, in a terminal `width` wide, with columns
+/// at `layout`.
+#[allow(clippy::too_many_arguments)]
 fn screen_in(
+    look: Look,
     width: usize,
     layout: [(usize, usize); 3],
     title: &str,
-    columns: [&[String]; 3],
+    columns: [&[Row]; 3],
     parent: Option<usize>,
     current: usize,
     footer: &str,
 ) -> Buffer {
-    let mut lines = vec![vec![' '; width]; HEIGHT];
-    let mut put = |y: usize, x: usize, width: usize, text: &str| {
-        for (i, c) in text.chars().take(width).enumerate() {
-            lines[y][x + i] = c;
-        }
+    let mut buf = Buffer::empty(Rect::new(0, 0, width as u16, HEIGHT as u16));
+    buf.set_stringn(0, 0, title, width, Style::new());
+    buf.set_stringn(0, HEIGHT as u16 - 1, footer, width, Style::new());
+    // at the root, the columns move left
+    let places = match parent {
+        None => [None, Some(layout[0]), Some(layout[1])],
+        Some(_) => layout.map(Some),
     };
-    put(0, 0, width, title);
-    for (rows, (x, width)) in columns.iter().zip(layout) {
-        for (y, row) in rows.iter().take(HEIGHT - 2).enumerate() {
-            put(y + 1, x, width, row);
+    let marks = [
+        parent.map(|i| (i, look.parent())),
+        Some((current, look.selected())),
+        None,
+    ];
+    for ((rows, place), mark) in columns.iter().zip(places).zip(marks) {
+        let Some((x, width)) = place else {
+            assert!(rows.is_empty(), "no parent column at the root");
+            continue;
+        };
+        let (x, width) = (x as u16, width as u16);
+        for (y, row) in (1..HEIGHT as u16 - 1).zip(rows.iter()) {
+            // narrower columns have no bars
+            buf.set_line(x, y, &row.line(look, width >= 40), width);
+        }
+        if let Some((i, style)) = mark.filter(|&(i, _)| i < rows.len()) {
+            buf.set_style(Rect::new(x, 1 + i as u16, width, 1), style);
         }
     }
-    put(HEIGHT - 1, 0, width, footer);
-    let lines: Vec<String> = lines.into_iter().map(String::from_iter).collect();
-    let mut buf = Buffer::with_lines(lines);
-    let row =
-        |i: usize, (x, width): (usize, usize)| Rect::new(x as u16, 1 + i as u16, width as u16, 1);
-    if let Some(i) = parent {
-        buf.set_style(row(i, layout[0]), Style::new().add_modifier(Modifier::BOLD));
+    buf
+}
+
+/// An expected screen of whole-width `lines`, `selected` the index of the
+/// selected one.
+fn plain(lines: &[Line<'static>], selected: Option<usize>) -> Buffer {
+    let mut buf = Buffer::empty(Rect::new(0, 0, WIDTH as u16, HEIGHT as u16));
+    for (y, line) in (0..HEIGHT as u16).zip(lines) {
+        buf.set_line(0, y, line, WIDTH as u16);
     }
-    if current < columns[1].len() {
-        buf.set_style(
-            row(current, layout[1]),
-            Style::new().add_modifier(Modifier::REVERSED),
-        );
+    if let Some(y) = selected {
+        buf.set_style(Rect::new(0, y as u16, WIDTH as u16, 1), COLOR.selected());
     }
     buf
 }
 
-fn row(size: &str, name: &str) -> String {
-    format!("{size:>10}  {name}")
-}
-
-/// A row with a reclaimable size too, as `-r` shows it.
-#[cfg(target_os = "macos")]
-fn row_r(size: &str, reclaimable: &str, name: &str) -> String {
-    format!("{size:>10} {reclaimable:>10}  {name}")
-}
-
-/// A dir with something denied below it.
-fn partial(size: &str, name: &str) -> String {
-    format!("{size:>10}+ {name}")
-}
-
-/// An expected screen of whole-width `lines`, `reversed` the index of a
-/// reversed one.
-fn plain(lines: &[&str], reversed: Option<usize>) -> Buffer {
-    let line = |y: usize| lines.get(y).unwrap_or(&"").chars().take(WIDTH);
-    let rows = (0..HEIGHT).map(|y| format!("{:<WIDTH$}", String::from_iter(line(y))));
-    let mut buf = Buffer::with_lines(rows);
-    if let Some(y) = reversed {
-        let style = Style::new().add_modifier(Modifier::REVERSED);
-        buf.set_style(Rect::new(0, y as u16, WIDTH as u16, 1), style);
-    }
-    buf
+/// `lines` as unstyled lines, the last at the bottom, the others from the
+/// top.
+fn text(lines: &[&str], bottom: &str) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = lines.iter().map(|l| Line::raw(l.to_string())).collect();
+    lines.resize(HEIGHT - 1, Line::default());
+    lines.push(Line::raw(bottom.to_string()));
+    lines
 }
 
 /// An environment with no cache, so tests never touch the user's.
@@ -132,15 +298,19 @@ fn env(desktop: Desktop) -> Env {
         terminal: "iTerm".into(),
         cache: None,
         inotify: true,
+        color: true,
     }
 }
 
 /// What the browser shows of the fixture, scanned as root or not.
 struct Expected {
     title: String,
-    root: Vec<String>,
-    a: Vec<String>,
-    b: Vec<String>,
+    root: Vec<Row>,
+    a: Vec<Row>,
+    b: Vec<Row>,
+    /// The rows of `big/` and `a/b/c/`.
+    big: Vec<Row>,
+    c: Vec<Row>,
 }
 
 fn expected(f: &Fixture) -> Expected {
@@ -148,42 +318,64 @@ fn expected(f: &Fixture) -> Expected {
     let as_root = rustix::process::geteuid().is_root();
     // the same total `scan` prints
     let total = f.expected[..10].trim();
-    let (dir, locked): (fn(&str, &str) -> String, u64) = match as_root {
-        true => (row, 0),
-        false => (partial, d),
+    let locked = match as_root {
+        true => 0,
+        false => d,
     };
-    let denied = "locked/ (denied: EACCES)";
+    // a dir above a denied one
+    let dir = |size, of, name| Row::new(size, of, name, Kind::Dir { partial: !as_root });
+    // each dir's bytes: its own, its files' and its subdirs'
+    let c_bytes = 12288 + d;
+    let b_bytes = c_bytes + 8192 + d + locked;
+    let a_bytes = b_bytes + 4096 + 8192 + d;
+    let big_bytes = 1572864 + d;
+    let root_bytes = big_bytes + a_bytes + 8192 + f.sym_bytes + 2 * d + locked;
+    let of = root_bytes;
+    let denied = Row::new(d, of, "locked", Kind::Denied);
     // whether these tie depends on the filesystem
-    let mut small = vec![(d, "empty/"), (d, denied), (f.sym_bytes, "sym")];
-    small.sort_by_key(|&(size, name)| (Reverse(size), name));
-    small.retain(|&(_, name)| !(as_root && name == denied));
+    let mut small = vec![
+        Row::dir(d, of, "empty"),
+        denied.clone(),
+        Row::file(f.sym_bytes, of, "sym"),
+    ];
+    small.sort_by_key(|r| (Reverse(r.size), r.name.clone()));
+    small.retain(|r| !(as_root && r.kind == Kind::Denied));
     let mut root = vec![
-        row("1.5 MiB", "big/"),
-        dir(&kib(32768 + 3 * d + locked), "a/"),
-        row("8.0 KiB", "top"),
+        Row::dir(big_bytes, of, "big"),
+        dir(a_bytes, of, "a"),
+        Row::file(8192, of, "top"),
     ];
-    root.extend(small.iter().map(|&(size, name)| row(&kib(size), name)));
+    root.extend(small);
     let a = vec![
-        dir(&kib(20480 + 2 * d + locked), "b/"),
-        row("8.0 KiB", "h1"),
-        row("8.0 KiB", "h2"),
-        row("4.0 KiB", "f1"),
+        dir(b_bytes, a_bytes, "b"),
+        Row::file(8192, a_bytes, "h1"),
+        Row::file(8192, a_bytes, "h2"),
+        Row::file(4096, a_bytes, "f1"),
     ];
-    let mut b = vec![row(&kib(12288 + d), "c/"), row("8.0 KiB", "f2")];
+    let mut b = vec![
+        Row::dir(c_bytes, b_bytes, "c"),
+        Row::file(8192, b_bytes, "f2"),
+    ];
     if !as_root {
-        b.push(row(&kib(d), denied));
+        b.push(Row::new(d, b_bytes, "locked", Kind::Denied));
     }
     let title = match as_root {
         true => format!("/fixture  {total}{SCANNED}"),
         false => format!("/fixture  {total}  (partial: 2 denied){SCANNED}"),
     };
-    Expected { title, root, a, b }
+    Expected {
+        title,
+        root,
+        a,
+        b,
+        big: vec![Row::file(1572864, big_bytes, "f")],
+        c: vec![Row::file(12288, c_bytes, "f3")],
+    }
 }
 
 /// The first view: the root, its largest child selected and previewed.
 fn first_view(e: &Expected, title: &str, footer: &str) -> Buffer {
-    let big = [row("1.5 MiB", "f")];
-    screen(title, [&[], &e.root, &big], None, 0, footer)
+    screen(title, [&[], &e.root, &e.big], None, 0, footer)
 }
 
 fn render(draw: impl FnOnce(&mut Frame)) -> Buffer {
@@ -231,6 +423,24 @@ fn press_app(app: &mut App, k: &[KeyCode]) -> Runs {
     keys(k, |key, run| app.key(key, run))
 }
 
+fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn click(x: u16, y: u16) -> MouseEvent {
+    mouse(MouseEventKind::Down(MouseButton::Left), x, y)
+}
+
+/// `ms` milliseconds after [`now`].
+fn after(ms: u64) -> SystemTime {
+    now() + Duration::from_millis(ms)
+}
+
 /// A browser of the fixture after a real scan of it has finished.
 fn scanned(root: &Path, desktop: Desktop) -> Browser {
     scanned_as(root, "/fixture", desktop, false)
@@ -247,12 +457,28 @@ fn scanned_as(root: &Path, display: &str, desktop: Desktop, reclaimable: bool) -
     b
 }
 
+/// Columns of 40 cells or more have a bar of each row's share of its dir.
 #[test]
 fn shows_the_finished_scan() {
     let f = fixture();
     let e = expected(&f);
     let mut b = scanned(f.dir.path(), Desktop::None);
-    assert_eq!(draw(&mut b, now()), first_view(&e, &e.title, HELP));
+    let columns = [&[][..], &e.root, &e.big];
+    let expected = screen_in(COLOR, WIDE, WIDE_COLUMNS, &e.title, columns, None, 0, HELP);
+    assert_eq!(render_in(WIDE, |f| b.draw(f, now())), expected);
+}
+
+/// Columns under 40 cells, as in 100 wide, have no bars: names need the
+/// room.
+#[test]
+fn hides_the_bars_in_narrow_columns() {
+    let f = fixture();
+    let e = expected(&f);
+    let mut b = scanned(f.dir.path(), Desktop::None);
+    let drawn = draw(&mut b, now());
+    let first: String = (0..33).map(|x| drawn[(x, 1)].symbol()).collect();
+    assert_eq!(first, format!("{:<33}", "   1.5 MiB  big/"));
+    assert_eq!(drawn, first_view(&e, &e.title, HELP));
 }
 
 #[test]
@@ -261,8 +487,7 @@ fn enters_two_levels() {
     let e = expected(&f);
     let mut b = scanned(f.dir.path(), Desktop::None);
     press(&mut b, &[KeyCode::Down, KeyCode::Right, KeyCode::Char('l')]);
-    let c = [row("12.0 KiB", "f3")];
-    let expected = screen(&e.title, [&e.a, &e.b, &c], Some(0), 0, HELP);
+    let expected = screen(&e.title, [&e.a, &e.b, &e.c], Some(0), 0, HELP);
     assert_eq!(draw(&mut b, now()), expected);
 
     // back up to the root, with `a/` selected
@@ -280,8 +505,10 @@ fn filters_the_current_column() {
     let e = expected(&f);
     let mut b = scanned(f.dir.path(), Desktop::None);
     press(&mut b, &[KeyCode::Char('/'), KeyCode::Char('p')]);
-    let matches = [row("8.0 KiB", "top"), row(&kib(f.dir_bytes), "empty/")];
-    let expected = screen(&e.title, [&[], &matches, &[]], None, 0, "/p");
+    let named = |name: &str| e.root.iter().find(|r| r.name == name).unwrap().clone();
+    let matches = [named("top"), named("empty")];
+    let typing = "/p  enter keep  esc clear";
+    let expected = screen(&e.title, [&[], &matches, &[]], None, 0, typing);
     assert_eq!(draw(&mut b, now()), expected);
 
     // clearing the filter keeps a selection made while filtered
@@ -381,23 +608,79 @@ fn lists_the_denied_dirs_with_why() {
     press(&mut b, &[KeyCode::Char('d')]);
     let root = f.dir.path().display();
     let (a, top) = (format!("{root}/a/b/locked"), format!("{root}/locked"));
-    let why = "permission denied (try sudo)";
-    let lines = match rustix::process::geteuid().is_root() {
-        true => vec![e.title.clone(), "every directory could be read".into()],
-        false => vec![
-            e.title.clone(),
-            "2 directories could not be read, so their contents are not counted:".into(),
-            format!("{a}  {why}"),
-            format!("{top}  {why}"),
-        ],
+    let why = |path: String| {
+        let red = Style::new().fg(Color::Red);
+        Line::from_iter([
+            Span::raw(path + "  "),
+            Span::styled("permission denied (try sudo)", red),
+        ])
     };
-    let mut lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    lines.resize(HEIGHT - 1, "");
-    lines.push("arrows/jk scroll  d close  q quit");
+    let help = "arrows/jk scroll  d close  ? help  q quit";
+    let lines = match rustix::process::geteuid().is_root() {
+        true => text(&[&e.title, "every directory could be read"], help),
+        false => {
+            let head = "2 directories could not be read, so their contents are not counted:";
+            let mut lines = text(&[&e.title, head], help);
+            lines[2] = why(a);
+            lines[3] = why(top);
+            lines
+        }
+    };
     assert_eq!(draw(&mut b, now()), plain(&lines, None));
 
     press(&mut b, &[KeyCode::Char('d')]);
     assert_eq!(draw(&mut b, now()), first_view(&e, &e.title, HELP));
+}
+
+/// ```text
+/// root/
+///   locked/    mode 000, hides a 4096 file
+/// ```
+#[test]
+fn says_one_directory_could_not_be_read() {
+    // root can read anything
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    file(&locked.join("hidden"), 4096);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let d = common::own_bytes(dir.path());
+    let mut b = scanned_as(dir.path(), "/one", Desktop::None, false);
+    press(&mut b, &[KeyCode::Char('d')]);
+    let drawn = draw(&mut b, now());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let title = format!("/one  {}  (partial: 1 denied){SCANNED}", kib(2 * d));
+    let head = "1 directory could not be read, so its contents are not counted:";
+    let mut lines = text(&[&title, head], "arrows/jk scroll  d close  ? help  q quit");
+    lines[2] = Line::from_iter([
+        Span::raw(format!("{}  ", locked.display())),
+        Span::styled("permission denied (try sudo)", Style::new().fg(Color::Red)),
+    ]);
+    assert_eq!(drawn, plain(&lines, None));
+}
+
+/// A row of the volume list: `used`, coloured `color`, of `total`, `free`,
+/// then a bar of `tenths` `#`s, coloured the same, and `point`.
+fn volume(
+    used: &str,
+    [total, free]: [&str; 2],
+    tenths: usize,
+    color: Color,
+    point: &str,
+) -> Line<'static> {
+    let color = Style::new().fg(color);
+    Line::from_iter([
+        Span::styled(format!("{used:>10}"), color),
+        Span::raw(format!(" used of {total:>10}  {free:>10} free  ")),
+        Span::styled("#".repeat(tenths), color),
+        Span::styled(".".repeat(10 - tenths), COLOR.dim()),
+        Span::raw(format!("  {point}")),
+    ])
 }
 
 fn mount(point: &Path, fs: &str, hidden: bool, total: u64, used: u64, free: u64) -> Mount {
@@ -436,17 +719,117 @@ fn lists_the_volumes() {
         mount("/run".as_ref(), "tmpfs", false, 2 * GIB, 1 << 20, 2 * GIB),
     ];
     let mut app = App::new(None, mounts, env(Desktop::Mac), None, false);
-    let lines = [
-        "volumes",
-        " 800.0 GiB used of  926.0 GiB   126.0 GiB free  /",
-        "  10.0 GiB used of   64.0 GiB    54.0 GiB free  /Volumes/USB",
-    ];
-    let mut screen = lines.to_vec();
-    screen.resize(HEIGHT - 1, "");
-    screen.push("arrows/jk move  enter scan  q quit");
+    let mut screen = text(&["volumes"], VOLUMES_HELP);
+    // the bars are used of total, to the nearest tenth: 8.6 and 1.6
+    screen[1] = volume("800.0 GiB", ["926.0 GiB", "126.0 GiB"], 9, Color::Red, "/");
+    screen[2] = volume(
+        "10.0 GiB",
+        ["64.0 GiB", "54.0 GiB"],
+        2,
+        Color::Red,
+        "/Volumes/USB",
+    );
     assert_eq!(draw_app(&mut app), plain(&screen, Some(1)));
     press_app(&mut app, &[KeyCode::Down, KeyCode::Down]);
     assert_eq!(draw_app(&mut app), plain(&screen, Some(2)));
+}
+
+#[test]
+fn shows_every_key_on_question_mark() {
+    let usb = mount(
+        "/Volumes/USB".as_ref(),
+        "exfat",
+        false,
+        64 * GIB,
+        10 * GIB,
+        54 * GIB,
+    );
+    let mut app = App::new(None, vec![usb], env(Desktop::Mac), None, false);
+    let mut list = text(&["volumes"], VOLUMES_HELP);
+    list[1] = volume(
+        "10.0 GiB",
+        ["64.0 GiB", "54.0 GiB"],
+        2,
+        Color::Red,
+        "/Volumes/USB",
+    );
+    let list = plain(&list, Some(1));
+    let keys = [
+        "keys",
+        "Up Down k j       move",
+        "PageUp PageDown   move by a screen",
+        "Home End g G      go to the first or the last row",
+        "Right Enter l     go into the directory; on the volume list, scan the volume",
+        "Left Backspace h  go to the parent directory",
+        "r                 reveal in Finder or the file manager",
+        "o                 open",
+        "R                 rescan",
+        "/                 filter the column by text; Enter keeps the filter, Esc clears it",
+        "d                 list the directories that could not be read, and why",
+        "t                 list the largest files",
+        "?                 show or hide this help",
+        "q Esc             quit; Esc closes a filter or list first, or goes back to the volume list",
+        "click             select; in the parent or preview column, go there",
+        "double click      go into the directory, or scan the volume",
+        "wheel             scroll the column under the pointer",
+    ];
+    let help = plain(&text(&keys, "? or esc close"), None);
+    // other keys do nothing while it is shown
+    press_app(&mut app, &[KeyCode::Char('?'), KeyCode::Char('q')]);
+    assert_eq!(draw_app(&mut app), help);
+    press_app(&mut app, &[KeyCode::Char('?')]);
+    assert_eq!(draw_app(&mut app), list);
+    press_app(&mut app, &[KeyCode::Char('?'), KeyCode::Esc]);
+    assert_eq!(draw_app(&mut app), list);
+
+    // typed into a filter instead
+    let f = fixture();
+    let e = expected(&f);
+    let mut app = App::new(Some(f.dir.path()), vec![], env(Desktop::Mac), None, false);
+    finish(&mut app);
+    press_app(&mut app, &[KeyCode::Char('/'), KeyCode::Char('?')]);
+    let title = e
+        .title
+        .replacen("/fixture", &f.dir.path().display().to_string(), 1);
+    let footer = "/?  enter keep  esc clear";
+    let mut expected = screen(&title, [&[], &[], &[]], None, 0, footer);
+    expected.set_stringn(0, 1, "no matches for '?'", 33, COLOR.dim());
+    assert_eq!(draw_app(&mut app), expected);
+}
+
+/// A click selects a volume, a double click scans it.
+#[test]
+fn clicks_select_and_scan_a_volume() {
+    let f = fixture();
+    let e = expected(&f);
+    let usb = mount(
+        "/Volumes/USB".as_ref(),
+        "exfat",
+        false,
+        64 * GIB,
+        10 * GIB,
+        54 * GIB,
+    );
+    let volume_ = mount(f.dir.path(), "apfs", false, 100 * GIB, 0, 50 * GIB);
+    let mut app = App::new(None, vec![usb, volume_], env(Desktop::Mac), None, false);
+    let root = f.dir.path().display().to_string();
+    let mut list = text(&["volumes"], VOLUMES_HELP);
+    // `/Volumes` sorts before the temp dir
+    list[1] = volume(
+        "10.0 GiB",
+        ["64.0 GiB", "54.0 GiB"],
+        2,
+        Color::Red,
+        "/Volumes/USB",
+    );
+    list[2] = volume("0 B", ["100.0 GiB", "50.0 GiB"], 0, Color::DarkGray, &root);
+    draw_app(&mut app);
+    app.mouse(click(5, 2), after(0));
+    assert_eq!(draw_app(&mut app), plain(&list, Some(2)));
+    app.mouse(click(5, 2), after(200));
+    finish(&mut app);
+    let title = e.title.replacen("/fixture", &root, 1);
+    assert_eq!(draw_app(&mut app), first_view(&e, &title, HELP));
 }
 
 /// The app on a volume list of the fixture alone, using `used` bytes,
@@ -478,7 +861,7 @@ fn guides_to_full_disk_access_once_before_the_first_scan() {
     let total = disksweep::scan(f.dir.path(), &ScanOptions::default()).unwrap();
     let used = total.totals().size[0] + (1 << 20);
     let mut app = enter_volume(&f, used, FullDiskAccess::Missing);
-    let guide = [
+    let guide: Vec<Line> = [
         "Full Disk Access is off for iTerm",
         "",
         "macOS keeps some folders from every app without Full Disk Access: Mail, Messages, Safari, Time",
@@ -489,7 +872,9 @@ fn guides_to_full_disk_access_once_before_the_first_scan() {
         "o  open the Full Disk Access settings",
         "c  continue without",
         "q  quit",
-    ];
+    ]
+    .map(Line::raw)
+    .into();
     assert_eq!(draw_app(&mut app), plain(&guide, None));
 
     let settings = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
@@ -512,11 +897,10 @@ fn guides_to_full_disk_access_once_before_the_first_scan() {
 
     // back on the list and in again: the same browser, no guide
     press_app(&mut app, &[KeyCode::Esc]);
-    let used = format!("{:.1} MiB", used as f64 / (1 << 20) as f64);
-    let line = format!("{used:>10} used of  100.0 GiB    50.0 GiB free  {root}");
-    let mut list = vec!["volumes", &line];
-    list.resize(HEIGHT - 1, "");
-    list.push("arrows/jk move  enter scan  q quit");
+    let used = size(used);
+    let of = ["100.0 GiB", "50.0 GiB"];
+    let mut list = text(&["volumes"], VOLUMES_HELP);
+    list[1] = volume(&used, of, 0, Color::Yellow, &root);
     assert_eq!(draw_app(&mut app), plain(&list, Some(1)));
     press_app(&mut app, &[KeyCode::Enter]);
     assert_eq!(draw_app(&mut app), browsing);
@@ -541,12 +925,16 @@ fn shows_reclaimable_sizes() {
     let dir = common::clones();
     let mut b = scanned_as(dir.path(), "/clones", Desktop::None, true);
     // as `scan -r` prints them; APFS dirs allocate 0 B
+    let reclaimable = |row: Row, private| Row {
+        private: Some(private),
+        ..row
+    };
     let root = [
-        row_r("1.0 MiB", "0 B", "clone/"),
-        row_r("1.0 MiB", "0 B", "orig/"),
-        row_r("1.0 MiB", "1.0 MiB", "solo/"),
+        reclaimable(Row::dir(MIB, 3 * MIB, "clone"), 0),
+        reclaimable(Row::dir(MIB, 3 * MIB, "orig"), 0),
+        reclaimable(Row::dir(MIB, 3 * MIB, "solo"), MIB),
     ];
-    let clone = [row_r("1.0 MiB", "0 B", "f")];
+    let clone = [reclaimable(Row::file(MIB, MIB, "f"), 0)];
     let expected = screen("/clones  3.0 MiB", [&[], &root, &clone], None, 0, HELP);
     assert_eq!(draw(&mut b, now()), expected);
 }
@@ -588,20 +976,28 @@ fn labels_dirs_tools_rebuild() {
     }
     let d = common::own_bytes(root);
     let mut b = scanned_as(root, "/labels", Desktop::None, false);
+    let of = 45056 + 8 * d;
+    let label = |size, name, label| Row::new(size, of, name, Kind::Label(label));
     let rows = [
-        row(&kib(20480 + 2 * d), "rust/"),
-        row(&kib(12288 + d), "node_modules/  [cache: npm]"),
-        row(&kib(8192 + d), "target/"),
-        row(&kib(4096 + d), "__pycache__/  [cache: python]"),
-        row(&kib(d), ".venv/  [cache: venv]"),
-        row(&kib(d), "venv/"),
+        Row::dir(20480 + 2 * d, of, "rust"),
+        label(12288 + d, "node_modules", "cache: npm"),
+        Row::dir(8192 + d, of, "target"),
+        label(4096 + d, "__pycache__", "cache: python"),
+        label(d, ".venv", "cache: venv"),
+        Row::dir(d, of, "venv"),
     ];
     let rust = [
-        row(&kib(16384 + d), "target/  [cache: cargo]"),
-        row("4.0 KiB", "Cargo.toml"),
+        Row::new(
+            16384 + d,
+            20480 + 2 * d,
+            "target",
+            Kind::Label("cache: cargo"),
+        ),
+        Row::file(4096, 20480 + 2 * d, "Cargo.toml"),
     ];
-    let title = format!("/labels  {}{SCANNED}", kib(45056 + 8 * d));
+    let title = format!("/labels  {}{SCANNED}", kib(of));
     let expected = screen_in(
+        COLOR,
         WIDE,
         WIDE_COLUMNS,
         &title,
@@ -611,6 +1007,124 @@ fn labels_dirs_tools_rebuild() {
         HELP,
     );
     assert_eq!(render_in(WIDE, |f| b.draw(f, now())), expected);
+}
+
+/// `NO_COLOR`: no colours, but the selection is reversed, the parent
+/// column's row underlined and dirs bold.
+#[test]
+fn draws_without_colours_for_no_color() {
+    let f = fixture();
+    let e = expected(&f);
+    let env = Env {
+        color: false,
+        ..env(Desktop::None)
+    };
+    let mut b = Browser::new(f.dir.path(), "/fixture", env, None, None, false);
+    b.scan();
+    while b.poll(now()) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    press(&mut b, &[KeyCode::Down, KeyCode::Right, KeyCode::Right]);
+    let columns = [&e.a[..], &e.b, &e.c];
+    let expected = screen_in(
+        NO_COLOR,
+        WIDTH,
+        COLUMNS,
+        &e.title,
+        columns,
+        Some(0),
+        0,
+        HELP,
+    );
+    assert_eq!(draw(&mut b, now()), expected);
+}
+
+#[test]
+fn says_when_a_filter_matches_nothing() {
+    let f = fixture();
+    let e = expected(&f);
+    let mut b = scanned(f.dir.path(), Desktop::None);
+    press(
+        &mut b,
+        &[KeyCode::Char('/'), KeyCode::Char('z'), KeyCode::Char('z')],
+    );
+    let footer = "/zz  enter keep  esc clear";
+    let mut expected = screen(&e.title, [&[], &[], &[]], None, 0, footer);
+    expected.set_stringn(0, 1, "no matches for 'zz'", 33, COLOR.dim());
+    assert_eq!(draw(&mut b, now()), expected);
+}
+
+#[test]
+fn clicks_select_go_up_and_into_dirs() {
+    let f = fixture();
+    let e = expected(&f);
+    let mut b = scanned(f.dir.path(), Desktop::None);
+    draw(&mut b, now());
+    // `a/`, in the root's column
+    b.mouse(click(5, 2), after(0));
+    let expected = screen(&e.title, [&[], &e.root, &e.a], None, 1, HELP);
+    assert_eq!(draw(&mut b, now()), expected);
+    // `b/`, in the preview of `a/`: into `a/`, `b/` selected
+    b.mouse(click(40, 1), after(1000));
+    let in_a = screen(&e.title, [&e.root, &e.a, &e.b], Some(1), 0, HELP);
+    assert_eq!(draw(&mut b, now()), in_a);
+    // `big/`, in the parent column: up to the root, `big/` selected
+    b.mouse(click(5, 1), after(2000));
+    assert_eq!(draw(&mut b, now()), first_view(&e, &e.title, HELP));
+
+    // two clicks on `a/` within 400 ms go into it
+    b.mouse(click(5, 2), after(3000));
+    b.mouse(click(5, 2), after(3300));
+    assert_eq!(draw(&mut b, now()), in_a);
+    // 500 ms apart, they only select `h1`
+    b.mouse(click(40, 2), after(4000));
+    b.mouse(click(40, 2), after(4500));
+    let h1 = screen(&e.title, [&e.root, &e.a, &[]], Some(1), 1, HELP);
+    assert_eq!(draw(&mut b, now()), h1);
+
+    // the wheel over the current column moves its cursor
+    b.mouse(mouse(MouseEventKind::ScrollDown, 40, 9), after(5000));
+    let h2 = screen(&e.title, [&e.root, &e.a, &[]], Some(1), 2, HELP);
+    assert_eq!(draw(&mut b, now()), h2);
+}
+
+/// ```text
+/// root/
+///   many/f01 .. f25    4096 .. 102400: more than a column has rows for
+/// ```
+#[test]
+fn pages_and_scrolls_long_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("many")).unwrap();
+    for i in 1..=25 {
+        file(&root.join(format!("many/f{i:02}")), i * 4096);
+    }
+    let d = common::own_bytes(root);
+    let many = 325 * 4096 + d;
+    let files: Vec<Row> = (1..=25)
+        .rev()
+        .map(|i| Row::file(i * 4096, many, &format!("f{i:02}")))
+        .collect();
+    let mut b = scanned_as(root, "/many", Desktop::None, false);
+    let title = format!("/many  {}{SCANNED}", size(many + d));
+    let parent = [Row::dir(many, many + d, "many")];
+    // the wheel over the preview scrolls it, by a row
+    draw(&mut b, now());
+    b.mouse(mouse(MouseEventKind::ScrollDown, 40, 5), now());
+    let expected = screen(&title, [&[], &parent, &files[1..]], None, 0, HELP);
+    assert_eq!(draw(&mut b, now()), expected);
+
+    // a page is the 18 rows shown
+    press(&mut b, &[KeyCode::Right, KeyCode::PageDown]);
+    let expected = screen(&title, [&parent, &files[1..], &[]], Some(0), 17, HELP);
+    assert_eq!(draw(&mut b, now()), expected);
+    press(&mut b, &[KeyCode::End]);
+    let expected = screen(&title, [&parent, &files[7..], &[]], Some(0), 17, HELP);
+    assert_eq!(draw(&mut b, now()), expected);
+    press(&mut b, &[KeyCode::Char('g')]);
+    let expected = screen(&title, [&parent, &files, &[]], Some(0), 0, HELP);
+    assert_eq!(draw(&mut b, now()), expected);
 }
 
 /// The fixture with one of the hard links `a/h1` and `a/h2` removed, as
@@ -637,18 +1151,15 @@ fn top_files(f: &Fixture, from: usize) -> Buffer {
         files.push((f.sym_bytes, "sym"));
     }
     files.sort_by_key(|&(size, path)| (Reverse(size), path));
-    let rows: Vec<String> = files[from..]
-        .iter()
-        .map(|&(size, path)| match size {
-            1572864 => row("1.5 MiB", path),
-            _ => row(&kib(size), path),
-        })
-        .collect();
-    let mut lines = vec![expected(f).title];
-    lines.extend(rows);
-    let mut lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    lines.resize(HEIGHT - 1, "");
-    lines.push(TOP_HELP);
+    let mut lines = text(&[&expected(f).title], TOP_HELP);
+    // no bars: the files are in different dirs
+    for (line, &(bytes, path)) in lines[1..].iter_mut().zip(&files[from..]) {
+        let size = size(bytes);
+        *line = Line::from_iter([
+            Span::styled(format!("{size:>10}"), COLOR.size(&size)),
+            Span::raw(format!("  {path}")),
+        ]);
+    }
     plain(&lines, Some(1))
 }
 
@@ -716,11 +1227,12 @@ fn follows_changes(inotify: bool, within: Duration) {
     let shown_at = |scanned: &str, files: &[(u64, &str)]| {
         let a = d + files.iter().map(|&(size, _)| size).sum::<u64>();
         let title = format!("/live  {}{scanned}", kib(a + d));
-        let files: Vec<String> = files
+        let files: Vec<Row> = files
             .iter()
-            .map(|&(size, name)| row(&kib(size), name))
+            .map(|&(size, name)| Row::file(size, a, name))
             .collect();
-        screen(&title, [&[], &[row(&kib(a), "a/")], &files], None, 0, HELP)
+        let root = [Row::dir(a, a + d, "a")];
+        screen(&title, [&[], &root, &files], None, 0, HELP)
     };
     let shown = |files: &[(u64, &str)]| shown_at(SCANNED, files);
     let saved = Saved {

@@ -1,15 +1,19 @@
 //! The volume list `disksweep` starts on without a path: one row per real
-//! filesystem, with its size, used and free bytes.
+//! filesystem, with its size, used and free bytes, and a bar of its used
+//! share.
 
+use crate::browse::bar;
 use crate::report::format_size;
+use crate::style::Styles;
 use crate::sys;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use std::io;
 use std::path::{Path, PathBuf};
 
-const HELP: &str = "arrows/jk move  enter scan  q quit";
+const HELP: &str = "arrows/jk move  enter scan  ? help  q quit";
 
 /// Filesystem types never listed, though they have a size: memory, the
 /// layers of containers, and snap packages. Most other pseudo filesystems,
@@ -57,29 +61,47 @@ pub(crate) fn volumes(mounts: Vec<Mount>) -> Vec<Mount> {
     kept
 }
 
-/// Draws `volumes`, the row at `cursor` reversed and on screen.
-pub(crate) fn draw(frame: &mut Frame, volumes: &[Mount], cursor: usize) {
+/// The rows of volumes a screen of `area` has room for.
+pub(crate) fn height(area: Rect) -> usize {
+    area.height.saturating_sub(2).into()
+}
+
+/// The index of the volume drawn at row `y` of `area`, the cursor at
+/// `cursor`, if a volume could be drawn there.
+pub(crate) fn row_at(area: Rect, cursor: usize, y: u16) -> Option<usize> {
+    let y = usize::from(y.checked_sub(1)?);
+    (y < height(area)).then(|| offset(area, cursor) + y)
+}
+
+/// The first volume drawn.
+fn offset(area: Rect, cursor: usize) -> usize {
+    (cursor + 1).saturating_sub(height(area))
+}
+
+/// Draws `volumes`, each with a bar of its used share, the row at `cursor`
+/// selected and on screen.
+pub(crate) fn draw(frame: &mut Frame, volumes: &[Mount], cursor: usize, styles: &Styles) {
     let area = frame.area();
     let buf = frame.buffer_mut();
     let width = area.width.into();
     buf.set_stringn(0, 0, "volumes", width, Style::new());
-    let height = area.height.saturating_sub(2);
-    let offset = (cursor + 1).saturating_sub(height.into());
-    let rows = (1..1 + height).zip(volumes.iter().enumerate().skip(offset));
-    for (y, (i, v)) in rows {
-        let text = format!(
-            "{:>10} used of {:>10}  {:>10} free  {}",
-            format_size(v.used),
-            format_size(v.total),
-            format_size(v.free),
-            v.point.display()
-        );
-        let style = match i == cursor {
-            true => Style::new().add_modifier(Modifier::REVERSED),
-            false => Style::new(),
-        };
-        buf.set_style(Rect::new(0, y, area.width, 1), style);
-        buf.set_stringn(0, y, text, width, style);
+    let rows = (1..).zip(volumes.iter().enumerate().skip(offset(area, cursor)));
+    for (y, (i, v)) in rows.take(height(area)) {
+        let used = styles.size(v.used);
+        let mut line = Line::from_iter([
+            Span::styled(format!("{:>10}", format_size(v.used)), used),
+            Span::raw(format!(
+                " used of {:>10}  {:>10} free  ",
+                format_size(v.total),
+                format_size(v.free)
+            )),
+        ]);
+        line.extend(bar(v.used, v.total, used, styles));
+        line.push_span(Span::raw(format!("  {}", v.point.display())));
+        buf.set_line(0, y, &line, area.width);
+        if i == cursor {
+            buf.set_style(Rect::new(0, y, area.width, 1), styles.selected);
+        }
     }
     let bottom = area.height.saturating_sub(1);
     buf.set_stringn(0, bottom, HELP, width, Style::new());

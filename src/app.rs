@@ -1,13 +1,21 @@
 //! The screens `disksweep` moves between, the volume list, the Full Disk
-//! Access guide and the browser, and the terminal loop that drives them.
+//! Access guide and the browser, the help over them, and the terminal loop
+//! that drives them.
 
 use crate::access::{self, FullDiskAccess, draw_guide, settings_command};
-use crate::browse::{Browser, Env};
+use crate::browse::{Browser, Clicks, Env, nav};
 use crate::reveal;
+use crate::style::Styles;
 use crate::sys;
 use crate::volumes::{self, Mount};
 use ratatui::Frame;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
 use std::ffi::OsString;
 use std::io;
 use std::ops::ControlFlow;
@@ -17,6 +25,36 @@ use std::time::{Duration, Instant, SystemTime};
 /// How often the view catches up with a running scan or with changes on
 /// disk.
 const TICK: Duration = Duration::from_secs(1);
+
+/// Every key, and what it does, as the help lists them.
+const KEYS: [(&str, &str); 16] = [
+    ("Up Down k j", "move"),
+    ("PageUp PageDown", "move by a screen"),
+    ("Home End g G", "go to the first or the last row"),
+    (
+        "Right Enter l",
+        "go into the directory; on the volume list, scan the volume",
+    ),
+    ("Left Backspace h", "go to the parent directory"),
+    ("r", "reveal in Finder or the file manager"),
+    ("o", "open"),
+    ("R", "rescan"),
+    (
+        "/",
+        "filter the column by text; Enter keeps the filter, Esc clears it",
+    ),
+    ("d", "list the directories that could not be read, and why"),
+    ("t", "list the largest files"),
+    ("?", "show or hide this help"),
+    (
+        "q Esc",
+        "quit; Esc closes a filter or list first, or goes back to the volume list",
+    ),
+    ("click", "select; in the parent or preview column, go there"),
+    ("double click", "go into the directory, or scan the volume"),
+    ("wheel", "scroll the column under the pointer"),
+];
+const KEYS_HELP: &str = "? or esc close";
 
 /// Lists the folders macOS asks about and probes for Full Disk Access:
 /// [`access::preflight`], or a stand-in in tests.
@@ -43,9 +81,17 @@ pub fn browse(path: Option<&Path>, reclaimable: bool) -> io::Result<()> {
         .map(|home| Box::new(move || access::preflight(&home)) as Preflight);
     // the preflight runs here, before the terminal is taken over
     let mut app = App::new(path, mounts, Env::from_env(), preflight, reclaimable);
-    // restores the terminal on panic too
+    // gives the mouse back on panic too: `ratatui::init` restores the rest,
+    // then calls this hook
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        hook(info);
+    }));
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app);
+    let result =
+        execute!(io::stdout(), EnableMouseCapture).and_then(|()| run(&mut terminal, &mut app));
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -59,12 +105,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
     let mut tick = Instant::now();
     loop {
         terminal.draw(|f| app.draw(f, SystemTime::now()))?;
-        if event::poll(TICK.saturating_sub(tick.elapsed()))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && app.key(key, &mut reveal::spawn).is_break()
-        {
-            return Ok(());
+        if event::poll(TICK.saturating_sub(tick.elapsed()))? {
+            match event::read()? {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && app.key(key, &mut reveal::spawn).is_break() =>
+                {
+                    return Ok(());
+                }
+                Event::Mouse(m) => app.mouse(m, SystemTime::now()),
+                _ => {}
+            }
         }
         if tick.elapsed() >= TICK {
             app.poll(SystemTime::now());
@@ -74,7 +125,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
 }
 
 /// The screen shown and what moving between screens needs. Driven by
-/// [`App::key`] and [`App::poll`], drawn by [`App::draw`].
+/// [`App::key`], [`App::mouse`] and [`App::poll`], drawn by [`App::draw`].
 pub struct App {
     env: Env,
     /// The volumes worth listing, by mount point.
@@ -91,6 +142,12 @@ pub struct App {
     parked: Option<Box<Browser>>,
     /// Browsers scan with reclaimable sizes and show them.
     reclaimable: bool,
+    /// The help is shown over the screen.
+    help: bool,
+    /// The area last drawn, for the page keys and the mouse.
+    area: Rect,
+    /// Clicks on the volume list.
+    clicks: Clicks,
 }
 
 enum Screen {
@@ -129,6 +186,9 @@ impl App {
             screen: Screen::Volumes,
             parked: None,
             reclaimable,
+            help: false,
+            area: Rect::default(),
+            clicks: Clicks::default(),
         };
         if let Some(path) = path {
             let real = std::fs::canonicalize(path).ok();
@@ -165,21 +225,23 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return ControlFlow::Break(());
         }
+        if self.help {
+            self.help = !matches!(key.code, KeyCode::Char('?') | KeyCode::Esc);
+            return ControlFlow::Continue(());
+        }
+        // the guide lists its keys, and the filter takes a typed `?`
+        let typing = matches!(&self.screen, Screen::Browse(b) if b.typing());
+        if key.code == KeyCode::Char('?') && !typing && !matches!(self.screen, Screen::Guide(..)) {
+            self.help = true;
+            return ControlFlow::Continue(());
+        }
+        let page = volumes::height(self.area);
         match &mut self.screen {
             Screen::Volumes => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.cursor = (self.cursor + 1).min(self.volumes.len().saturating_sub(1));
+                code if let Some(at) = nav(code, self.cursor, self.volumes.len(), page) => {
+                    self.cursor = at;
                 }
-                KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => {
-                    if let Some(v) = self.volumes.get(self.cursor) {
-                        let target = Target {
-                            root: v.point.clone(),
-                            used: Some(v.used),
-                        };
-                        self.open(target);
-                    }
-                }
+                KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.scan_selected(),
                 KeyCode::Char('q') | KeyCode::Esc => return ControlFlow::Break(()),
                 _ => {}
             },
@@ -215,14 +277,64 @@ impl App {
         ControlFlow::Continue(())
     }
 
-    /// Draws the screen shown. `now` dates a saved scan.
-    pub fn draw(&mut self, frame: &mut Frame, now: SystemTime) {
+    /// Handles a mouse event at `now`. On the volume list, a click selects
+    /// the row under it, a second click on it within 400 ms scans it, and
+    /// the wheel moves the cursor. See [`Browser::mouse`] for the browser.
+    pub fn mouse(&mut self, event: MouseEvent, now: SystemTime) {
+        if self.help {
+            return;
+        }
         match &mut self.screen {
-            Screen::Volumes => volumes::draw(frame, &self.volumes, self.cursor),
+            Screen::Volumes => {
+                let n = self.volumes.len();
+                let key = match event.kind {
+                    MouseEventKind::ScrollUp => KeyCode::Up,
+                    MouseEventKind::ScrollDown => KeyCode::Down,
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let row = volumes::row_at(self.area, self.cursor, event.row);
+                        if let Some(at) = row.filter(|&at| at < n) {
+                            match self.clicks.double(now, (0, event.row)) {
+                                true => self.scan_selected(),
+                                false => self.cursor = at,
+                            }
+                        }
+                        return;
+                    }
+                    _ => return,
+                };
+                self.cursor = nav(key, self.cursor, n, 1).unwrap();
+            }
+            Screen::Browse(b) => b.mouse(event, now),
+            Screen::Guide(..) => {}
+        }
+    }
+
+    /// Draws the screen shown, or the help over it. `now` dates a saved
+    /// scan.
+    pub fn draw(&mut self, frame: &mut Frame, now: SystemTime) {
+        self.area = frame.area();
+        if self.help {
+            draw_help(frame);
+            return;
+        }
+        let styles = Styles::new(self.env.color);
+        match &mut self.screen {
+            Screen::Volumes => volumes::draw(frame, &self.volumes, self.cursor, styles),
             Screen::Guide(_, message) => {
                 draw_guide(frame, &self.env.terminal, message.as_deref());
             }
             Screen::Browse(b) => b.draw(frame, now),
+        }
+    }
+
+    /// Scans the volume at the cursor, if any.
+    fn scan_selected(&mut self) {
+        if let Some(v) = self.volumes.get(self.cursor) {
+            let target = Target {
+                root: v.point.clone(),
+                used: Some(v.used),
+            };
+            self.open(target);
         }
     }
 
@@ -252,4 +364,17 @@ impl App {
         b.scan();
         Box::new(b)
     }
+}
+
+/// Draws [`KEYS`] over the whole screen.
+fn draw_help(frame: &mut Frame) {
+    let area = frame.area();
+    let width = area.width.into();
+    let buf = frame.buffer_mut();
+    buf.set_stringn(0, 0, "keys", width, Style::new());
+    for (y, (keys, action)) in (1..area.height.saturating_sub(1)).zip(KEYS) {
+        buf.set_stringn(0, y, format!("{keys:<18}{action}"), width, Style::new());
+    }
+    let bottom = area.height.saturating_sub(1);
+    buf.set_stringn(0, bottom, KEYS_HELP, width, Style::new());
 }

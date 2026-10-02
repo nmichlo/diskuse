@@ -14,6 +14,7 @@ mod report;
 pub mod reveal;
 mod scan;
 mod store;
+mod style;
 mod sys;
 mod tree;
 mod volumes;

@@ -1,5 +1,8 @@
 //! The full-screen browser: three columns, the parent dir, the current dir
-//! and the selected child, each largest first, like OmniDiskSweeper. A scan
+//! and the selected child, each largest first, like OmniDiskSweeper. At the
+//! root, which has no parent column, the other two move left. Each row has
+//! a bar of its share of its dir. A click selects the row under it, a
+//! double click goes into it, and the wheel scrolls the column under it. A scan
 //! runs on its own thread meanwhile; a saved scan, if any, shows until the
 //! fresh one is done, or on macOS, until it is brought up to date from the
 //! changes since. Then the tree follows changes on disk ([`crate::watch`]):
@@ -18,17 +21,20 @@ use crate::report::{format_size, largest_files, largest_first, suffix};
 use crate::reveal::Desktop;
 use crate::scan::{ScanError, ScanOptions, scan_live};
 use crate::store::{CacheDir, Saved};
+use crate::style::Styles;
 use crate::sys::{self, Kind};
 use crate::tree::{ChildIndex, LARGEST, Progress, Record, Since, Totals, Tree, join};
 use crate::watch::{DirWatch, Poll, Watch};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
-use std::fmt::Write;
 use std::io;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -37,10 +43,19 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-const HELP: &str =
-    "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  q quit";
-const PANEL_HELP: &str = "arrows/jk scroll  d close  q quit";
-const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  q quit";
+const HELP: &str = "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  \
+                    ? help  q quit";
+const PANEL_HELP: &str = "arrows/jk scroll  d close  ? help  q quit";
+const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
+
+/// The width of the bar of a row's share of its dir.
+const BAR: u64 = 10;
+
+/// Columns narrower than this have no bars, so names keep the room.
+const BAR_COLUMN: u16 = 40;
+
+/// Two clicks on one row within this are a double click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// What a browser takes from its environment, given so tests can fix it.
 #[derive(Clone)]
@@ -53,6 +68,8 @@ pub struct Env {
     /// On Linux, watch the dirs shown with inotify. Off, they are listed
     /// again on a timer, as where inotify cannot watch them.
     pub inotify: bool,
+    /// Draw in colour. Off when `NO_COLOR` is set and not empty.
+    pub color: bool,
 }
 
 impl Env {
@@ -63,6 +80,7 @@ impl Env {
             terminal: terminal_app(std::env::var("TERM_PROGRAM").ok().as_deref()),
             cache: CacheDir::from_env().ok(),
             inotify: true,
+            color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         }
     }
 }
@@ -103,6 +121,17 @@ pub struct Browser {
     cursor: usize,
     /// The first row of `current` drawn.
     offset: usize,
+    /// The first row of the parent column drawn, once the wheel scrolled
+    /// it, until the current dir changes. `None`: the current dir's row
+    /// shows.
+    parent_offset: Option<usize>,
+    /// The first row of the preview column drawn, until the selection
+    /// changes.
+    preview_offset: usize,
+    /// Where the columns, the denied list or the largest files were last
+    /// drawn, for the page keys and the mouse.
+    body: Rect,
+    clicks: Clicks,
     filter: String,
     /// Keys type into `filter`.
     typing: bool,
@@ -240,6 +269,10 @@ impl Browser {
             current: Vec::new(),
             cursor: 0,
             offset: 0,
+            parent_offset: None,
+            preview_offset: 0,
+            body: Rect::default(),
+            clicks: Clicks::default(),
             filter: String::new(),
             typing: false,
             message: None,
@@ -339,11 +372,14 @@ impl Browser {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return ControlFlow::Break(());
         }
+        let page = usize::from(self.body.height);
         if let Some(offset) = &mut self.panel {
+            let n = self.view.as_ref().map_or(0, |v| v.denied.len());
+            // the head takes a row; clamped when drawn
+            if let Some(at) = nav(key.code, *offset, n, page.saturating_sub(1)) {
+                *offset = at;
+            }
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => *offset = offset.saturating_sub(1),
-                // clamped when drawn
-                KeyCode::Down | KeyCode::Char('j') => *offset += 1,
                 KeyCode::Char('d') | KeyCode::Esc => self.panel = None,
                 KeyCode::Char('q') => return ControlFlow::Break(()),
                 _ => {}
@@ -351,12 +387,11 @@ impl Browser {
             return ControlFlow::Continue(());
         }
         if let Some(top) = &mut self.top {
+            let n = (self.view.as_ref()).map_or(0, |v| top.paths(v).count());
+            if let Some(at) = nav(key.code, top.cursor, n, page) {
+                top.cursor = at;
+            }
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => top.cursor = top.cursor.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let n = (self.view.as_ref()).map_or(0, |v| top.paths(v).count());
-                    top.cursor = (top.cursor + 1).min(n.saturating_sub(1));
-                }
                 KeyCode::Char(c @ ('r' | 'o')) => {
                     let path = (self.view.as_ref()).and_then(|v| top.paths(v).nth(top.cursor));
                     let path = path.map(<[u8]>::to_vec);
@@ -369,8 +404,6 @@ impl Browser {
             return ControlFlow::Continue(());
         }
         match key.code {
-            KeyCode::Up => self.step(false),
-            KeyCode::Down => self.step(true),
             KeyCode::Esc if self.typing || !self.filter.is_empty() => {
                 self.filter.clear();
                 self.typing = false;
@@ -380,8 +413,9 @@ impl Browser {
                 self.filter.pop();
             }
             KeyCode::Char(c) if self.typing => self.filter.push(c),
-            KeyCode::Char('k') => self.step(false),
-            KeyCode::Char('j') => self.step(true),
+            code if let Some(at) = nav(code, self.cursor, self.current.len(), page) => {
+                self.select(at);
+            }
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => self.enter(),
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
             KeyCode::Char(c @ ('r' | 'o')) => self.reveal(self.cursor_path(), c == 'r', run),
@@ -401,6 +435,84 @@ impl Browser {
         }
         self.refresh();
         ControlFlow::Continue(())
+    }
+
+    /// Handles a mouse event at `now`. A click selects the row under it: in
+    /// the parent column, that goes up to it, and in the preview column,
+    /// into the selected dir. A second click on the same row within 400 ms
+    /// goes into the row the first selected. The wheel moves the cursor of
+    /// the current column, the largest files and the volume list, and
+    /// scrolls the other columns and the denied list.
+    pub fn mouse(&mut self, event: MouseEvent, now: SystemTime) {
+        let key = match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => None,
+            MouseEventKind::ScrollUp => Some(KeyCode::Up),
+            MouseEventKind::ScrollDown => Some(KeyCode::Down),
+            _ => return,
+        };
+        let at = Position::new(event.column, event.row);
+        if self.view.is_none() || !self.body.contains(at) {
+            return;
+        }
+        self.message = None;
+        // `nav` moves by one row for these keys
+        let moved = |from: usize, n: usize| key.and_then(|k| nav(k, from, n, 1)).unwrap_or(from);
+        let dy = usize::from(at.y - self.body.y);
+        if let Some(offset) = &mut self.panel {
+            // clamped when drawn
+            *offset = moved(*offset, usize::MAX);
+            return;
+        }
+        if let Some(top) = &mut self.top {
+            let n = (self.view.as_ref()).map_or(0, |v| top.paths(v).count());
+            match key {
+                Some(_) => top.cursor = moved(top.cursor, n),
+                None if top.offset + dy < n => top.cursor = top.offset + dy,
+                None => {}
+            }
+            return;
+        }
+        let mut columns = self.columns().into_iter().enumerate();
+        let Some((i, area)) = columns.find_map(|(i, a)| Some((i, a.filter(|a| a.contains(at))?)))
+        else {
+            return;
+        };
+        let Some((d, rows, offset, _)) = self.listing(i, area.height.into()) else {
+            return;
+        };
+        if key.is_some() {
+            let n = rows.len();
+            match i {
+                0 => self.parent_offset = Some(moved(offset, n)),
+                1 => self.select(moved(self.cursor, n)),
+                _ => self.preview_offset = moved(offset, n),
+            }
+            self.refresh();
+            return;
+        }
+        let index = offset + dy;
+        let Some(row) = rows.get(index) else {
+            return;
+        };
+        let name = name(self.view.as_ref().unwrap(), &self.files[&d], row.item).into();
+        if self.clicks.double(now, (area.x, at.y)) {
+            // into the row the first click selected
+            self.enter();
+        } else {
+            match i {
+                0 => self.back(),
+                1 => {}
+                _ => self.enter(),
+            }
+            self.selected = Some(name);
+            self.preview_offset = 0;
+        }
+        self.refresh();
+    }
+
+    /// Whether keys type into the filter.
+    pub(crate) fn typing(&self) -> bool {
+        self.typing
     }
 
     /// The root as given.
@@ -428,10 +540,9 @@ impl Browser {
             Constraint::Length(footer.len() as u16),
         ])
         .areas(frame.area());
-        let [left, mid, right] = Layout::horizontal([Constraint::Fill(1); 3])
-            .spacing(1)
-            .areas(body);
-        let (title, d) = (self.title(now), self.dir());
+        self.body = body;
+        let styles = Styles::new(self.env.color);
+        let title = self.title(now);
         let buf = frame.buffer_mut();
         buf.set_stringn(top.x, top.y, title, top.width.into(), Style::new());
         for (y, line) in (bottom.y..).zip(footer) {
@@ -442,45 +553,104 @@ impl Browser {
         };
         if let Some(offset) = &mut self.panel {
             let terminal = &self.env.terminal;
-            *offset = panel(buf, body, view, terminal, *offset);
+            *offset = panel(buf, body, view, terminal, *offset, styles);
             return;
         }
         if let Some(top) = &mut self.top {
-            top_files(buf, body, view, top);
+            top_files(buf, body, view, top, styles);
             return;
         }
-        if let [.., parent, _] = self.dirs[..] {
-            let rows = &self.rows[&parent];
-            let at = rows.iter().position(|r| r.item == Item::Dir(d)).unwrap();
-            let offset = scroll(0, at, left.height.into());
-            let mark = (at, Style::new().add_modifier(Modifier::BOLD));
-            column(
-                buf,
-                left,
-                view,
-                &self.files[&parent],
-                rows,
-                offset,
-                Some(mark),
-            );
+        let height = body.height.into();
+        self.offset = scroll(self.offset, self.cursor, height);
+        let marks = [Some(styles.parent), Some(styles.selected), None];
+        for (i, area) in self.columns().into_iter().enumerate() {
+            let listing = self.listing(i, height);
+            if let (Some(area), Some((d, rows, offset, mark))) = (area, listing) {
+                self.column(buf, area, d, rows, offset, mark.zip(marks[i]));
+            }
         }
-        self.offset = scroll(self.offset, self.cursor, mid.height.into());
-        let mark = (self.cursor, Style::new().add_modifier(Modifier::REVERSED));
-        let files = &self.files[&d];
-        column(
-            buf,
-            mid,
-            view,
-            files,
-            &self.current,
-            self.offset,
-            Some(mark),
-        );
-        if let Some(&Row {
-            item: Item::Dir(k), ..
-        }) = self.current.get(self.cursor)
-        {
-            column(buf, right, view, &self.files[&k], &self.rows[&k], 0, None);
+        if self.current.is_empty() && !self.filter.is_empty() {
+            let area = self.columns()[1].unwrap();
+            let text = format!("no matches for '{}'", self.filter);
+            buf.set_stringn(area.x, area.y, text, area.width.into(), styles.dim);
+        }
+    }
+
+    /// Where the parent, current and preview columns are drawn. At the
+    /// root, there is no parent column, and the other two move left.
+    fn columns(&self) -> [Option<Rect>; 3] {
+        let [left, mid, right] = Layout::horizontal([Constraint::Fill(1); 3])
+            .spacing(1)
+            .areas(self.body);
+        match self.dirs.len() {
+            1 => [None, Some(left), Some(mid)],
+            _ => [Some(left), Some(mid), Some(right)],
+        }
+    }
+
+    /// What column `i` of [`Browser::columns`] lists, in a column `height`
+    /// rows high: the dir, its rows, the first of them drawn, and the
+    /// marked one, if any. Nothing for the parent column at the root, or
+    /// the preview of a file.
+    fn listing(&self, i: usize, height: usize) -> Option<(u32, &[Row], usize, Option<usize>)> {
+        let d = self.dir();
+        match i {
+            0 => {
+                let [.., parent, _] = self.dirs[..] else {
+                    return None;
+                };
+                let rows = &self.rows[&parent];
+                let at = rows.iter().position(|r| r.item == Item::Dir(d)).unwrap();
+                let offset = match self.parent_offset {
+                    Some(offset) => offset.min(rows.len().saturating_sub(height)),
+                    None => scroll(0, at, height),
+                };
+                Some((parent, rows, offset, Some(at)))
+            }
+            1 => Some((d, &self.current, self.offset, Some(self.cursor))),
+            _ => {
+                let Some(&Row {
+                    item: Item::Dir(k), ..
+                }) = self.current.get(self.cursor)
+                else {
+                    return None;
+                };
+                let rows = &self.rows[&k];
+                let offset = self.preview_offset.min(rows.len().saturating_sub(height));
+                Some((k, rows, offset, None))
+            }
+        }
+    }
+
+    /// Draws `rows[offset..]` of dir `d` that fit in `area`, with `mark`, a
+    /// row index and its style, if given.
+    fn column(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        d: u32,
+        rows: &[Row],
+        offset: usize,
+        mark: Option<(usize, Style)>,
+    ) {
+        let view = self.view.as_ref().unwrap();
+        let styles = Styles::new(self.env.color);
+        let total = view.totals.size[d as usize];
+        let lines = (area.y..area.bottom()).zip(rows.iter().enumerate().skip(offset));
+        for (y, (i, row)) in lines {
+            let bar = area.width >= BAR_COLUMN;
+            let line = line(view, &self.files[&d], row, total, bar, styles);
+            buf.set_line(area.x, y, &line, area.width);
+            if let Some((_, style)) = mark.filter(|&(at, _)| at == i) {
+                buf.set_style(
+                    Rect {
+                        y,
+                        height: 1,
+                        ..area
+                    },
+                    style,
+                );
+            }
         }
     }
 
@@ -669,14 +839,12 @@ impl Browser {
         self.rows.insert(d, rows);
     }
 
-    fn step(&mut self, down: bool) {
-        let at = match down {
-            true => (self.cursor + 1).min(self.current.len().saturating_sub(1)),
-            false => self.cursor.saturating_sub(1),
-        };
+    /// Moves the cursor to row `at` of the current column.
+    fn select(&mut self, at: usize) {
         if let (Some(view), Some(row)) = (&self.view, self.current.get(at)) {
             let files = &self.files[&self.dir()];
             self.selected = Some(name(view, files, row.item).into());
+            self.preview_offset = 0;
         }
     }
 
@@ -709,6 +877,8 @@ impl Browser {
         self.filter.clear();
         self.typing = false;
         self.offset = 0;
+        self.parent_offset = None;
+        self.preview_offset = 0;
     }
 
     /// The path of the row at the cursor.
@@ -771,7 +941,8 @@ impl Browser {
             Some(message) => message.clone(),
             None if self.panel.is_some() => PANEL_HELP.into(),
             None if self.top.is_some() => TOP_HELP.into(),
-            None if self.typing || !self.filter.is_empty() => format!("/{}", self.filter),
+            None if self.typing => format!("/{}  enter keep  esc clear", self.filter),
+            None if !self.filter.is_empty() => format!("/{}  esc clear", self.filter),
             None => HELP.into(),
         }
     }
@@ -825,63 +996,84 @@ fn list(tree: &Tree, d: u32, private: bool) -> Files {
     files
 }
 
-/// Draws `rows[offset..]` that fit in `area`, with `mark`, a row index and
-/// its style, if given.
-fn column(
-    buf: &mut Buffer,
-    area: Rect,
+/// Row `row` of a dir of `total` bytes listed as `files`: its sizes, a bar
+/// of its share of `total` if `bar`, and its name.
+fn line(
     view: &View,
     files: &Files,
-    rows: &[Row],
-    offset: usize,
-    mark: Option<(usize, Style)>,
-) {
-    let lines = (area.y..area.bottom()).zip(rows.iter().enumerate().skip(offset));
-    for (y, (i, row)) in lines {
-        let label = String::from_utf8_lossy(name(view, files, row.item));
-        let flags = match row.item {
-            Item::Dir(k) => view.totals.flags[k as usize],
-            Item::File(_) => 0,
-        };
-        // something below was denied, so the sizes are lower bounds
-        let plus = match flags & Record::PARTIAL {
-            0 => ' ',
-            _ => '+',
-        };
-        let mut sizes = format!("{:>10}{plus}", format_size(row.size));
-        if view.reclaimable {
-            write!(sizes, "{:>10}{plus}", format_size(row.private)).unwrap();
-        }
-        let text = match row.item {
-            Item::Dir(k) => {
-                let marker = suffix(view.tree.record(k), flags & !Record::PARTIAL);
-                let cache = row.label.map(|l| format!("  [{l}]")).unwrap_or_default();
-                format!("{sizes} {label}/{marker}{cache}")
-            }
-            Item::File(_) => format!("{sizes} {label}"),
-        };
-        let style = match mark {
-            Some((at, style)) if at == i => style,
-            _ => Style::new(),
-        };
-        buf.set_style(
-            Rect {
-                y,
-                height: 1,
-                ..area
-            },
-            style,
-        );
-        buf.set_stringn(area.x, y, text, area.width.into(), style);
+    row: &Row,
+    total: u64,
+    bar: bool,
+    styles: &Styles,
+) -> Line<'static> {
+    let label = String::from_utf8_lossy(name(view, files, row.item)).into_owned();
+    let flags = match row.item {
+        Item::Dir(k) => view.totals.flags[k as usize],
+        Item::File(_) => 0,
+    };
+    // something below was denied, so the sizes are lower bounds
+    let plus = match flags & Record::PARTIAL {
+        0 => " ",
+        _ => "+",
+    };
+    let size = |n: u64| Span::styled(format!("{:>10}", format_size(n)), styles.size(n));
+    let mut spans = vec![size(row.size), Span::styled(plus, styles.dim)];
+    if view.reclaimable {
+        spans.extend([size(row.private), Span::styled(plus, styles.dim)]);
     }
+    spans.push(Span::raw(" "));
+    if bar {
+        spans.extend(self::bar(row.size, total, styles.size(row.size), styles));
+        spans.push(Span::raw(" "));
+    }
+    match row.item {
+        Item::Dir(k) => {
+            spans.push(Span::styled(format!("{label}/"), styles.dir));
+            let marker = suffix(view.tree.record(k), flags & !Record::PARTIAL);
+            spans.push(match flags & Record::DENIED {
+                0 => Span::styled(marker, styles.dim),
+                _ => Span::styled(marker, styles.denied),
+            });
+            if let Some(l) = row.label {
+                spans.push(Span::styled(format!("  [{l}]"), styles.dim));
+            }
+        }
+        Item::File(_) => spans.push(Span::raw(label)),
+    }
+    Line::from(spans)
+}
+
+/// A bar of `size`'s share of `total`: a `#`, in `style`, for each tenth,
+/// rounded to the nearest, at least one from 1%, then a dim `.` for each
+/// tenth left.
+pub(crate) fn bar(size: u64, total: u64, style: Style, styles: &Styles) -> [Span<'static>; 2] {
+    let (size, total) = (u128::from(size), u128::from(total));
+    let n = match total {
+        0 => 0,
+        _ if size * 100 < total => 0,
+        _ => ((size * 20 + total) / (2 * total)).clamp(1, BAR.into()),
+    };
+    let n = n as usize;
+    [
+        Span::styled("#".repeat(n), style),
+        Span::styled(".".repeat(BAR as usize - n), styles.dim),
+    ]
 }
 
 /// Draws the denied dirs of `view` from row `offset`, each with why it
 /// could not be read. Returns `offset`, clamped so the last row is drawn
 /// as low as it can be.
-fn panel(buf: &mut Buffer, area: Rect, view: &View, terminal: &str, offset: usize) -> usize {
+fn panel(
+    buf: &mut Buffer,
+    area: Rect,
+    view: &View,
+    terminal: &str,
+    offset: usize,
+    styles: &Styles,
+) -> usize {
     let head = match view.denied.len() {
         0 => "every directory could be read".into(),
+        1 => "1 directory could not be read, so its contents are not counted:".into(),
         n => format!("{n} directories could not be read, so their contents are not counted:"),
     };
     buf.set_stringn(area.x, area.y, head, area.width.into(), Style::new());
@@ -890,16 +1082,19 @@ fn panel(buf: &mut Buffer, area: Rect, view: &View, terminal: &str, offset: usiz
     let lines = (area.y + 1..area.bottom()).zip(&view.denied[offset..]);
     for (y, (path, id)) in lines {
         let why = reason(view.tree.record(*id), terminal);
-        let text = format!("{}  {why}", String::from_utf8_lossy(path));
-        buf.set_stringn(area.x, y, text, area.width.into(), Style::new());
+        let line = Line::from_iter([
+            Span::raw(format!("{}  ", String::from_utf8_lossy(path))),
+            Span::styled(why, styles.denied),
+        ]);
+        buf.set_line(area.x, y, &line, area.width);
     }
     offset
 }
 
 /// Draws the largest files of `view` still there, as paths below the root,
-/// from `top`'s offset, the one at its cursor reversed. A file is checked
+/// from `top`'s offset, the one at its cursor selected. A file is checked
 /// with one `lstat` when first drawn, and left out if gone.
-fn top_files(buf: &mut Buffer, area: Rect, view: &View, top: &mut Top) {
+fn top_files(buf: &mut Buffer, area: Rect, view: &View, top: &mut Top, styles: &Styles) {
     if view.largest.is_empty() && view.status == Status::Scanning {
         buf.set_stringn(
             area.x,
@@ -937,24 +1132,55 @@ fn top_files(buf: &mut Buffer, area: Rect, view: &View, top: &mut Top) {
     let lines = (area.y..area.bottom()).zip(shown.iter().enumerate().skip(top.offset));
     for (y, (i, &(size, path))) in lines {
         let below = path[root..].strip_prefix(b"/").unwrap_or(&path[root..]);
-        let text = format!(
-            "{:>10}  {}",
-            format_size(size),
-            String::from_utf8_lossy(below)
-        );
-        let style = match i == top.cursor {
-            true => Style::new().add_modifier(Modifier::REVERSED),
-            false => Style::new(),
-        };
-        buf.set_style(
-            Rect {
-                y,
-                height: 1,
-                ..area
-            },
-            style,
-        );
-        buf.set_stringn(area.x, y, text, area.width.into(), style);
+        let line = Line::from_iter([
+            Span::styled(format!("{:>10}", format_size(size)), styles.size(size)),
+            Span::raw(format!("  {}", String::from_utf8_lossy(below))),
+        ]);
+        buf.set_line(area.x, y, &line, area.width);
+        if i == top.cursor {
+            buf.set_style(
+                Rect {
+                    y,
+                    height: 1,
+                    ..area
+                },
+                styles.selected,
+            );
+        }
+    }
+}
+
+/// Where `key` moves a cursor from row `at` of `len`, `page` of them shown,
+/// if it is a key that moves it: up or down a row or a page, or to the
+/// first or the last.
+pub(crate) fn nav(key: KeyCode, at: usize, len: usize, page: usize) -> Option<usize> {
+    let page = page.max(1);
+    let to = match key {
+        KeyCode::Up | KeyCode::Char('k') => at.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => at.saturating_add(1),
+        KeyCode::PageUp => at.saturating_sub(page),
+        KeyCode::PageDown => at.saturating_add(page),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => usize::MAX,
+        _ => return None,
+    };
+    Some(to.min(len.saturating_sub(1)))
+}
+
+/// The last click, to tell a double click.
+#[derive(Default)]
+pub(crate) struct Clicks(Option<(SystemTime, (u16, u16))>);
+
+impl Clicks {
+    /// Whether a click at `now` on `row`, the x of its column and its y,
+    /// is the second of a double click. A third click starts a new one.
+    pub fn double(&mut self, now: SystemTime, row: (u16, u16)) -> bool {
+        let double = self.0.is_some_and(|(then, was)| {
+            let soon = now.duration_since(then).is_ok_and(|d| d <= DOUBLE_CLICK);
+            was == row && soon
+        });
+        self.0 = (!double).then_some((now, row));
+        double
     }
 }
 
@@ -980,19 +1206,28 @@ mod tests {
     use crate::tree::Builder;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
 
-    /// 100x20: `title`, then `body` lines, the first row of the current
-    /// column reversed if there is one, and the help.
-    fn screen(title: &str, body: &[&str]) -> Buffer {
+    /// 100x20: `title`, empty columns and the help.
+    fn screen(title: &str) -> Buffer {
         let mut lines = vec![format!("{title:<100}")];
-        lines.extend((0..18).map(|y| format!("{:<100}", body.get(y).unwrap_or(&""))));
+        lines.extend((0..18).map(|_| format!("{:100}", "")));
         lines.push(format!("{HELP:<100}"));
-        let mut buf = Buffer::with_lines(lines);
-        if !body.is_empty() {
-            let reversed = Style::new().add_modifier(Modifier::REVERSED);
-            buf.set_style(Rect::new(34, 1, 32, 1), reversed);
-        }
-        buf
+        Buffer::with_lines(lines)
+    }
+
+    /// A dir's row of `size` KiB, green, with no bar: the columns are
+    /// narrower than 40.
+    fn dir_row(size: &str, name: &str) -> Line<'static> {
+        Line::from_iter([
+            Span::styled(format!("{size:>10}"), Style::new().fg(Color::Green)),
+            Span::styled(" ", Style::new().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(
+                format!("{name}/"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+        ])
     }
 
     fn draw(b: &mut Browser) -> Buffer {
@@ -1012,10 +1247,11 @@ mod tests {
             terminal: "Terminal".into(),
             cache: None,
             inotify: true,
+            color: true,
         };
         let mut b = Browser::new(dir.path(), "/scan", env, None, None, false);
         assert!(tree.progress().snapshot().is_none());
-        assert_eq!(draw(&mut b), screen("/scan  scanning...", &[]));
+        assert_eq!(draw(&mut b), screen("/scan  scanning..."));
 
         let ids = tree.intern([&b"a"[..], b"x"].into_iter());
         let dir = |parent, name, own| Record {
@@ -1030,9 +1266,15 @@ mod tests {
         tree.push(dir(0, ids[0], 4096));
         tree.push(dir(1, ids[1], 8192));
         b.show(tree.progress().snapshot().unwrap(), Status::Scanning);
-        // the columns start at x 34 and 67
-        let a = format!("{:34}{:<33}{}", "", "  12.0 KiB  a/", "   8.0 KiB  x/");
-        let expected = screen("/scan  scanning... at least 12.0 KiB", &[&a]);
+        // the root's column starts at x 0, the preview at 34
+        let mut expected = screen("/scan  scanning... at least 12.0 KiB");
+        expected.set_line(0, 1, &dir_row("12.0 KiB", "a"), 33);
+        let selected = Style::new().fg(Color::White).bg(Color::Blue);
+        expected.set_style(
+            Rect::new(0, 1, 33, 1),
+            selected.add_modifier(Modifier::BOLD),
+        );
+        expected.set_line(34, 1, &dir_row("8.0 KiB", "x"), 32);
         assert_eq!(draw(&mut b), expected);
     }
 }
