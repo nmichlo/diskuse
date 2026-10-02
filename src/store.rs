@@ -2,30 +2,37 @@
 //! without scanning, and the next `scan` can start from it. The only module
 //! that writes files, and only inside [`CacheDir`].
 //!
-//! The format is little-endian and versioned, with no migrations: a file of
-//! another version is ignored, and the next scan replaces it.
+//! A file is a fixed header, then an [rkyv] archive of [`Body`], which
+//! `show` reads in place ([`SavedTree`]), then a CRC-32 of all the bytes
+//! before it. The format is versioned, with no migrations: a file of another
+//! version is ignored, and the next scan replaces it. So is a damaged one.
+//! The CRC catches any one flipped bit and all but 1 in 2^32 other damage,
+//! and rkyv's checks and [`valid`] keep a file that still passes from making
+//! [`ReadTree`] index out of bounds.
 //!
 //! ```text
 //! magic     b"DSWP"
-//! version   u8 = 2
+//! version   u8 = 3
 //! flags     u8: bit 0 = scanned with reclaimable sizes
 //! event_id  u64: the tree has every change up to this event, 0 if the OS
 //!           keeps no record of changes
 //! store     u128: the id of that record, 0 if none
-//! root      u32 len + bytes: the canonical root
-//! records   u32 count, then 32 bytes each: parent u32, name u32,
-//!           flags u32, errno u16, 0 u16, own u64, own_private u64
-//! names     u32 count, then u16 len + bytes each, for name ids from 1;
-//!           id 0 is the root's, which `load` sets to the path asked for
-//! largest   u32 count, then bytes u64, dir u32, u16 len + name bytes each
-//! links     u32 count, then dev u64, ino u64, dir u32 each: the dir that
-//!           counts each multiply-linked file
+//! 0         u16, so the archive starts aligned, at byte 32
+//! archive   rkyv, of `Body`
+//! crc       u32: CRC-32 of every byte before it
 //! ```
+//!
+//! Numbers are little-endian, in the archive too.
+//!
+//! [rkyv]: https://rkyv.org
 
 use crate::sys;
-use crate::tree::{LargeFile, Links, Record, Since, Tree};
+use crate::tree::{LargeFile, ReadTree, Record, Since, Tree};
+use rkyv::rancor::Failure;
+use rkyv::util::AlignedVec;
+use rkyv::with::AsVec;
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -33,18 +40,19 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"DSWP";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const RECLAIMABLE: u8 = 1 << 0;
-const RECORD_LEN: usize = 32;
+const HEADER_LEN: usize = 32;
 
 /// The directory saved scans live in. Only built from the environment, so
 /// the store cannot write anywhere else.
 #[derive(Clone)]
 pub struct CacheDir(PathBuf);
 
-/// A scan read back by [`CacheDir::load`].
-pub struct Saved {
-    pub tree: Tree,
+/// A scan read back by [`CacheDir::load`], or in place by
+/// [`SavedFile::check`].
+pub struct Saved<T = Tree> {
+    pub tree: T,
     /// Scanned with [`crate::ScanOptions::reclaimable`].
     pub reclaimable: bool,
     /// When the scan was saved: the file's modification time.
@@ -109,20 +117,170 @@ impl CacheDir {
         saved
     }
 
-    /// The saved scan of `root`, with `root` as the root's name. `None` if
-    /// there is none, or it is malformed or of another version.
-    pub fn load(&self, root: &Path) -> io::Result<Option<Saved>> {
+    /// The saved file of `root`, unchecked: see [`SavedFile::check`].
+    /// `None` if there is none.
+    pub fn read(&self, root: &Path) -> io::Result<Option<SavedFile>> {
         let (canonical, name) = key(root)?;
-        let mut file = match File::open(self.0.join(name)) {
+        let file = match File::open(self.0.join(name)) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let modified = file.metadata()?.modified()?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(decode(&bytes, &canonical, root, modified))
+        Ok(Some(SavedFile {
+            modified: file.metadata()?.modified()?,
+            // page-aligned, so the archive is read in place
+            bytes: sys::map(&file)?,
+            canonical,
+            root: root.into(),
+        }))
     }
+
+    /// The saved scan of `root`, with `root` as the root's name. `None` if
+    /// there is none, or it is damaged or of another version.
+    pub fn load(&self, root: &Path) -> io::Result<Option<Saved>> {
+        let file = self.read(root)?;
+        Ok(file.as_ref().and_then(SavedFile::check).map(|s| Saved {
+            tree: s.tree.to_tree(),
+            reclaimable: s.reclaimable,
+            modified: s.modified,
+        }))
+    }
+}
+
+/// A saved file as read by [`CacheDir::read`], to check and read in place.
+pub struct SavedFile {
+    bytes: memmap2::Mmap,
+    canonical: PathBuf,
+    /// The root as asked for, the root's name.
+    root: PathBuf,
+    modified: SystemTime,
+}
+
+impl SavedFile {
+    /// The scan in the file, read in place. `None` if the file is damaged
+    /// or of another version.
+    pub fn check(&self) -> Option<Saved<SavedTree<'_>>> {
+        let (data, crc) = self.bytes.split_last_chunk::<4>()?;
+        let (header, archive) = data.split_first_chunk::<HEADER_LEN>()?;
+        if header[..4] != *MAGIC || header[4] != VERSION {
+            return None;
+        }
+        if crc32fast::hash(data) != u32::from_le_bytes(*crc) {
+            return None;
+        }
+        let body = rkyv::access::<ArchivedBody<'_>, Failure>(archive).ok()?;
+        // guards against FNV collisions
+        if body.root[..] != *self.canonical.as_os_str().as_bytes() || !valid(body) {
+            return None;
+        }
+        let since = Since {
+            id: u64::from_le_bytes(header[6..14].try_into().unwrap()),
+            store: u128::from_le_bytes(header[14..30].try_into().unwrap()),
+        };
+        Some(Saved {
+            tree: SavedTree {
+                body,
+                root: self.root.as_os_str().as_bytes(),
+                since,
+            },
+            reclaimable: header[5] & RECLAIMABLE != 0,
+            modified: self.modified,
+        })
+    }
+}
+
+/// A saved scan, read in place from its [`SavedFile`].
+pub struct SavedTree<'a> {
+    body: &'a ArchivedBody<'a>,
+    root: &'a [u8],
+    since: Since,
+}
+
+impl SavedTree<'_> {
+    /// An owned copy, which updates can change.
+    fn to_tree(&self) -> Tree {
+        let body = self.body;
+        let names = boxcar::Vec::with_capacity(body.ends.len());
+        for id in 0..body.ends.len() {
+            names.push(self.name(id as u32).into());
+        }
+        let n = body.records.len();
+        Tree {
+            records: (0..n).map(|id| self.record(id as u32)).collect(),
+            names: Arc::new(names),
+            largest: (self.largest())
+                .map(|(bytes, dir, name)| LargeFile {
+                    bytes,
+                    dir,
+                    name: name.into(),
+                })
+                .collect(),
+            links: (body.links.iter())
+                .map(|l| ((l.dev.to_native(), l.ino.to_native()), l.dir.to_native()))
+                .collect(),
+            since: self.since,
+        }
+    }
+}
+
+impl ReadTree for SavedTree<'_> {
+    fn len(&self) -> usize {
+        self.body.records.len()
+    }
+
+    fn record(&self, id: u32) -> Record {
+        let r = &self.body.records[id as usize];
+        Record {
+            parent: r.parent.to_native(),
+            name: r.name.to_native(),
+            flags: r.flags.to_native(),
+            errno: r.errno.to_native(),
+            own: r.own.to_native(),
+            own_private: r.own_private.to_native(),
+        }
+    }
+
+    fn name(&self, name: u32) -> &[u8] {
+        let ends = &self.body.ends;
+        match name as usize {
+            0 => self.root,
+            id => {
+                &self.body.names[ends[id - 1].to_native() as usize..ends[id].to_native() as usize]
+            }
+        }
+    }
+
+    fn largest(&self) -> impl Iterator<Item = (u64, u32, &[u8])> {
+        let files = self.body.largest.iter();
+        files.map(|f| (f.bytes.to_native(), f.dir.to_native(), &f.name[..]))
+    }
+}
+
+/// The archived part of a saved file.
+#[derive(rkyv::Archive, rkyv::Serialize)]
+struct Body<'a> {
+    /// The canonical root.
+    #[rkyv(with = AsVec)]
+    root: &'a [u8],
+    #[rkyv(with = AsVec)]
+    records: &'a [Record],
+    /// Every name but the root's, back to back.
+    names: Vec<u8>,
+    /// Where each name ends in `names`, by name id. Id 0 is the root's,
+    /// which [`SavedFile::check`] sets to the path asked for, so 0.
+    ends: Vec<u32>,
+    /// In no particular order.
+    #[rkyv(with = AsVec)]
+    largest: &'a [LargeFile],
+    links: Vec<Link>,
+}
+
+/// The dir that counts a multiply-linked file: see [`Links`].
+#[derive(rkyv::Archive, rkyv::Serialize)]
+struct Link {
+    dev: u64,
+    ino: u64,
+    dir: u32,
 }
 
 /// The canonical root, as the scan follows a symlinked root, and its file
@@ -143,168 +301,72 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + tree.records.len() * RECORD_LEN);
+fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> AlignedVec {
+    let mut names = Vec::new();
+    let mut ends = Vec::with_capacity(tree.names.count());
+    ends.push(0);
+    for (_, name) in tree.names.iter().skip(1) {
+        names.extend_from_slice(name);
+        // each name is stored once, so even a whole disk's take a few MB
+        ends.push(u32::try_from(names.len()).expect("over 4 GiB of names"));
+    }
+    let body = Body {
+        root: canonical.as_os_str().as_bytes(),
+        records: &tree.records,
+        names,
+        ends,
+        largest: &tree.largest,
+        links: (tree.links.iter())
+            .map(|(&(dev, ino), &dir)| Link { dev, ino, dir })
+            .collect(),
+    };
+    // a little over the file's length, so it never grows, which would copy
+    // it all
+    let largest: usize = (tree.largest.iter()).map(|f| 32 + f.name.len()).sum();
+    let len = HEADER_LEN
+        + size_of_val(body.root)
+        + size_of_val(body.records)
+        + size_of_val(&body.names[..])
+        + size_of_val(&body.ends[..])
+        + largest
+        + size_of_val(&body.links[..])
+        + 256;
+    let mut out = AlignedVec::with_capacity(len);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(if reclaimable { RECLAIMABLE } else { 0 });
     out.extend_from_slice(&tree.since.id.to_le_bytes());
     out.extend_from_slice(&tree.since.store.to_le_bytes());
-    let root = canonical.as_os_str().as_bytes();
-    out.extend_from_slice(&len32(root.len()).to_le_bytes());
-    out.extend_from_slice(root);
-
-    out.extend_from_slice(&len32(tree.records.len()).to_le_bytes());
-    for r in &tree.records {
-        out.extend_from_slice(&r.parent.to_le_bytes());
-        out.extend_from_slice(&r.name.to_le_bytes());
-        out.extend_from_slice(&r.flags.to_le_bytes());
-        out.extend_from_slice(&r.errno.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&r.own.to_le_bytes());
-        out.extend_from_slice(&r.own_private.to_le_bytes());
-    }
-    // name 0 is the root as given, which `show` replaces
-    out.extend_from_slice(&len32(tree.names.count() - 1).to_le_bytes());
-    for (_, name) in tree.names.iter().skip(1) {
-        put16(&mut out, name);
-    }
-    out.extend_from_slice(&len32(tree.largest.len()).to_le_bytes());
-    for f in &tree.largest {
-        out.extend_from_slice(&f.bytes.to_le_bytes());
-        out.extend_from_slice(&f.dir.to_le_bytes());
-        put16(&mut out, &f.name);
-    }
-    out.extend_from_slice(&len32(tree.links.len()).to_le_bytes());
-    for (&(dev, ino), &dir) in &tree.links {
-        out.extend_from_slice(&dev.to_le_bytes());
-        out.extend_from_slice(&ino.to_le_bytes());
-        out.extend_from_slice(&dir.to_le_bytes());
-    }
+    out.extend_from_slice(&[0; 2]);
+    // the archive's positions count from the file's start, which is
+    // aligned, and serializing to memory cannot fail
+    let mut out = rkyv::api::high::to_bytes_in::<_, Failure>(&body, out).unwrap();
+    let crc = crc32fast::hash(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
     out
 }
 
-fn len32(n: usize) -> u32 {
-    // record and name ids are u32, and paths are far shorter
-    u32::try_from(n).unwrap()
-}
-
-/// Writes a name with a u16 length. File names are a few hundred bytes at
-/// most on every filesystem.
-fn put16(out: &mut Vec<u8>, name: &[u8]) {
-    out.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
-    out.extend_from_slice(name);
-}
-
-/// Parses a saved file, checking every id so a damaged file cannot make
-/// [`Tree`] index out of bounds.
-fn decode(bytes: &[u8], canonical: &Path, root: &Path, modified: SystemTime) -> Option<Saved> {
-    let mut b = Bytes(bytes);
-    if b.take(4)? != MAGIC || b.u8()? != VERSION {
-        return None;
-    }
-    let flags = b.u8()?;
-    let since = Since {
-        id: b.u64()?,
-        store: b.u128()?,
+/// Whether every id in `body` is in bounds, and parents come before their
+/// children, as [`Tree`] needs.
+fn valid(body: &ArchivedBody<'_>) -> bool {
+    let (records, ends) = (&body.records, &body.ends);
+    let Some((first, rest)) = records.split_first() else {
+        return false;
     };
-    let len = b.u32()? as usize;
-    // guards against FNV collisions
-    if b.take(len)? != canonical.as_os_str().as_bytes() {
-        return None;
-    }
-
-    let count = b.u32()? as usize;
-    let mut raw = Bytes(b.take(count.checked_mul(RECORD_LEN)?)?);
-    let mut records = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (parent, name, flags, errno) = (raw.u32()?, raw.u32()?, raw.u32()?, raw.u16()?);
-        let _padding = raw.u16()?;
-        records.push(Record {
-            parent,
-            name,
-            flags,
-            errno,
-            own: raw.u64()?,
-            own_private: raw.u64()?,
-        });
-    }
-
-    let count = b.u32()? as usize;
-    let names = boxcar::Vec::with_capacity(1 + count.min(b.0.len() / 2));
-    names.push(root.as_os_str().as_bytes().into());
-    for _ in 0..count {
-        let len = b.u16()? as usize;
-        names.push(b.take(len)?.into());
-    }
-
-    let count = b.u32()? as usize;
-    let mut largest = Vec::with_capacity(count.min(b.0.len() / 14));
-    for _ in 0..count {
-        let bytes = b.u64()?;
-        let dir = b.u32()?;
-        let len = b.u16()? as usize;
-        let name = b.take(len)?.into();
-        largest.push(LargeFile { bytes, dir, name });
-    }
-
-    let count = b.u32()? as usize;
-    let mut links = Links::with_capacity(count.min(b.0.len() / 20));
-    for _ in 0..count {
-        let key = (b.u64()?, b.u64()?);
-        links.insert(key, b.u32()?);
-    }
-
-    let (first, rest) = records.split_first()?;
-    let valid = b.0.is_empty()
-        && first.parent == Record::NO_PARENT
+    let below = |id: u32, len: usize| (id as usize) < len;
+    first.parent.to_native() == Record::NO_PARENT
         && first.name == 0
         && rest.iter().enumerate().all(|(i, r)| {
             // a parent always comes before its children
-            (r.parent as usize) <= i && r.name != 0 && (r.name as usize) < names.count()
+            (r.parent.to_native() as usize) <= i
+                && r.name != 0
+                && below(r.name.to_native(), ends.len())
         })
-        && largest.iter().all(|f| (f.dir as usize) < records.len())
-        && links.values().all(|&dir| (dir as usize) < records.len());
-    valid.then_some(Saved {
-        tree: Tree {
-            records,
-            names: Arc::new(names),
-            largest,
-            links,
-            since,
-        },
-        reclaimable: flags & RECLAIMABLE != 0,
-        modified,
-    })
-}
-
-/// A cursor over a saved file. Every read is `None` past the end.
-struct Bytes<'a>(&'a [u8]);
-
-impl<'a> Bytes<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let (head, tail) = self.0.split_at_checked(n)?;
-        self.0 = tail;
-        Some(head)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        Some(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn u128(&mut self) -> Option<u128> {
-        Some(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
-    }
+        && ends.first().is_some_and(|&e| e == 0)
+        && ends.windows(2).all(|w| w[0] <= w[1])
+        && ends
+            .last()
+            .is_some_and(|&e| e.to_native() as usize == body.names.len())
+        && (body.largest.iter()).all(|f| below(f.dir.to_native(), records.len()))
+        && (body.links.iter()).all(|l| below(l.dir.to_native(), records.len()))
 }

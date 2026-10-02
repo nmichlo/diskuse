@@ -306,6 +306,11 @@ largest files, so they are created with mode 0600, and the directory, if
 missing, with mode 0700. To clear the cache, delete the directory. This cache
 directory is the only place disksweep ever writes.
 
+`show` reads a saved file in place, memory-mapped, without copying it. Each
+file ends in a CRC-32 of its bytes. A file that fails that check, or comes from
+another disksweep version, counts as no saved scan, and the next `scan`
+replaces it.
+
 ## Benchmarks
 
 Results land before 0.1.0. The method is in

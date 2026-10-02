@@ -84,7 +84,7 @@ impl Output {
         self.reclaimable.on()
     }
 
-    fn print(&self, tree: &disksweep::Tree) {
+    fn print(&self, tree: &impl disksweep::ReadTree) {
         let top = self.top.map(usize::from);
         match self.json {
             true => print!(
@@ -165,8 +165,9 @@ fn scan(
 }
 
 fn show(path: &Path, output: &Output) -> ExitCode {
-    let loaded = disksweep::CacheDir::from_env().and_then(|cache| cache.load(path));
-    let error = match loaded {
+    let file = disksweep::CacheDir::from_env().and_then(|cache| cache.read(path));
+    // read in place: no tree is built
+    let error = match file.as_ref().map(|f| f.as_ref().and_then(|f| f.check())) {
         Ok(Some(saved)) if output.reclaimable() && !saved.reclaimable => {
             format!("saved scan for {} has no reclaimable sizes", path.display())
         }

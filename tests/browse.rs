@@ -6,7 +6,7 @@ mod common;
 
 use common::{Fixture, file, fixture, kib};
 use disksweep::reveal::Desktop;
-use disksweep::{App, Browser, Env, FullDiskAccess, Mount, Saved, ScanOptions};
+use disksweep::{App, Browser, Env, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{

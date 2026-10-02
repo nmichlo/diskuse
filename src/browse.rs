@@ -23,7 +23,7 @@ use crate::scan::{ScanError, ScanOptions, scan_live};
 use crate::store::{CacheDir, Saved};
 use crate::style::Styles;
 use crate::sys::{self, Kind};
-use crate::tree::{ChildIndex, LARGEST, Progress, Record, Since, Totals, Tree, join};
+use crate::tree::{ChildIndex, LARGEST, Progress, ReadTree, Record, Since, Totals, Tree, join};
 use crate::watch::{DirWatch, Poll, Watch};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -1029,7 +1029,7 @@ fn line(
     match row.item {
         Item::Dir(k) => {
             spans.push(Span::styled(format!("{label}/"), styles.dir));
-            let marker = suffix(view.tree.record(k), flags & !Record::PARTIAL);
+            let marker = suffix(&view.tree.record(k), flags & !Record::PARTIAL);
             spans.push(match flags & Record::DENIED {
                 0 => Span::styled(marker, styles.dim),
                 _ => Span::styled(marker, styles.denied),
@@ -1081,7 +1081,7 @@ fn panel(
     let offset = offset.min(view.denied.len().saturating_sub(height));
     let lines = (area.y + 1..area.bottom()).zip(&view.denied[offset..]);
     for (y, (path, id)) in lines {
-        let why = reason(view.tree.record(*id), terminal);
+        let why = reason(&view.tree.record(*id), terminal);
         let line = Line::from_iter([
             Span::raw(format!("{}  ", String::from_utf8_lossy(path))),
             Span::styled(why, styles.denied),

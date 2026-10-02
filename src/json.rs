@@ -2,13 +2,13 @@
 //! nested in `children`. Written by hand, as the schema is small.
 
 use crate::report::{denied, largest_files, largest_first};
-use crate::tree::{Record, Tree};
+use crate::tree::{ReadTree, Record};
 use std::fmt::Write;
 
 /// The root and `depth` levels of subdirectories below it, each level
 /// ordered like [`crate::report`]. `reclaimable` adds `reclaimable` sizes,
 /// and `top` a `largest_files` list to the root.
-pub fn json(tree: &Tree, reclaimable: bool, depth: usize, top: Option<usize>) -> String {
+pub fn json(tree: &impl ReadTree, reclaimable: bool, depth: usize, top: Option<usize>) -> String {
     let totals = tree.totals();
     let index = tree.child_index();
     let kids = |id: u32| {
@@ -33,7 +33,7 @@ pub fn json(tree: &Tree, reclaimable: bool, depth: usize, top: Option<usize>) ->
         let flags = totals.flags[i];
         if flags & Record::DENIED != 0 {
             out.push_str(",\"denied\":");
-            string(out, denied(r).as_bytes());
+            string(out, denied(&r).as_bytes());
         }
         if flags & Record::OTHER_DEVICE != 0 {
             out.push_str(",\"other_device\":true");

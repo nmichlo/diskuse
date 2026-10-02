@@ -6,7 +6,7 @@
 //! the subdirectories new in them with the same walk.
 
 use crate::sys::{self, DirStat, Kind};
-use crate::tree::{Builder, ChildIndex, LargeFile, Links, Progress, Record, Since, Tree};
+use crate::tree::{Builder, ChildIndex, LargeFile, Links, Progress, ReadTree, Record, Since, Tree};
 use crate::watch::Changes;
 use rayon::ThreadPool;
 use rustix::fd::{AsFd, OwnedFd};

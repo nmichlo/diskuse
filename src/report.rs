@@ -1,7 +1,7 @@
 //! The `disksweep scan` text output.
 
 use crate::sys;
-use crate::tree::{Record, Tree};
+use crate::tree::{ReadTree, Record};
 use std::cmp::Ordering;
 use std::fmt::Write;
 
@@ -9,7 +9,7 @@ use std::fmt::Write;
 /// first, ties by name bytes. `reclaimable` adds a second size column, the
 /// bytes not shared with a clone. `top` appends that many of the largest
 /// files.
-pub fn report(tree: &Tree, reclaimable: bool, top: Option<usize>) -> String {
+pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> String {
     let totals = tree.totals();
     let index = tree.child_index();
     let denied = count_denied(tree);
@@ -38,7 +38,7 @@ pub fn report(tree: &Tree, reclaimable: bool, top: Option<usize>) -> String {
             let label = format!(
                 "{}/{}",
                 String::from_utf8_lossy(name),
-                suffix(r, totals.flags[i as usize])
+                suffix(&r, totals.flags[i as usize])
             );
             let i = i as usize;
             (totals.size[i], totals.private[i], name, label)
@@ -69,11 +69,9 @@ pub(crate) fn largest_first(a: (u64, &[u8]), b: (u64, &[u8])) -> Ordering {
 }
 
 /// The `n` largest files as `(bytes, path)`, ties by path bytes.
-pub(crate) fn largest_files(tree: &Tree, n: usize) -> Vec<(u64, Vec<u8>)> {
-    let mut files: Vec<_> = tree
-        .largest()
-        .iter()
-        .map(|f| (f.bytes, tree.path(f)))
+pub(crate) fn largest_files(tree: &impl ReadTree, n: usize) -> Vec<(u64, Vec<u8>)> {
+    let mut files: Vec<_> = (tree.largest())
+        .map(|(bytes, dir, name)| (bytes, tree.path(dir, name)))
         .collect();
     files.sort_by(|a, b| largest_first((a.0, &a.1), (b.0, &b.1)));
     files.truncate(n);
@@ -81,10 +79,9 @@ pub(crate) fn largest_files(tree: &Tree, n: usize) -> Vec<(u64, Vec<u8>)> {
 }
 
 /// How many directories could not be read.
-fn count_denied(tree: &Tree) -> usize {
-    tree.records
-        .iter()
-        .filter(|r| r.flags & Record::DENIED != 0)
+fn count_denied(tree: &impl ReadTree) -> usize {
+    (0..tree.len() as u32)
+        .filter(|&i| tree.record(i).flags & Record::DENIED != 0)
         .count()
 }
 

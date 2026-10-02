@@ -11,7 +11,7 @@
 use crate::scan::ScanOptions;
 use crate::store::CacheDir;
 use crate::sys::{self, Event, What};
-use crate::tree::{Record, Tree};
+use crate::tree::{ReadTree, Record, Tree};
 use rustix::fd::AsFd;
 use std::collections::BTreeSet;
 use std::ffi::CString;

@@ -3,7 +3,7 @@
 //! Directory readers live in their own files and all yield [`Entry`].
 //! [`read_dir`] picks the fastest one for the OS. [`watch`] reports the
 //! changes below a path, on macOS only, and [`Inotify`] those in a few
-//! dirs, on Linux only.
+//! dirs, on Linux only. [`map`] maps a saved scan into memory, read-only.
 
 #[cfg(target_os = "macos")]
 mod fsevents;
@@ -21,6 +21,7 @@ use rustix::fs::{AtFlags, FileType, OFlags, Stat};
 use rustix::io::{Errno, Result};
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use std::ffi::CStr;
+use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -221,6 +222,18 @@ pub fn event_store(dev: u64) -> u128 {
     return fsevents::store_uuid(dev);
     #[cfg(not(target_os = "macos"))]
     0
+}
+
+/// All of `file`, mapped read-only, so a saved scan is read in place
+/// rather than copied.
+#[allow(unsafe_code)]
+pub fn map(file: &File) -> io::Result<memmap2::Mmap> {
+    // SAFETY: the map is sound while no one changes the file in place.
+    // disksweep never does: `CacheDir::save` writes a new file and renames
+    // it over the old one, so a mapped file keeps its bytes. Only another
+    // program writing into the owner-only cache dir could, as for any
+    // mapped file.
+    unsafe { memmap2::Mmap::map(file) }
 }
 
 /// Whether `path` is still there, by one `lstat`, which never follows a

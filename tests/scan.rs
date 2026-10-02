@@ -264,10 +264,25 @@ fn show_fails_without_a_usable_saved_scan() {
     let [file] = &saved(cache.path())[..] else {
         panic!("not one saved file");
     };
-    let mut bytes = fs::read(file).unwrap();
-    bytes[4] += 1;
-    fs::write(file, bytes).unwrap();
-    fails(&[], none);
+    let bytes = fs::read(file).unwrap();
+    let mut other = bytes.clone();
+    other[4] += 1;
+    fs::write(file, other).unwrap();
+    fails(&[], none.clone());
+
+    // so is a damaged one: one bit flipped anywhere, here at places picked
+    // by a seeded xorshift, so every run flips the same bits
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    for _ in 0..32 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let bit = (x % (bytes.len() as u64 * 8)) as usize;
+        let mut damaged = bytes.clone();
+        damaged[bit / 8] ^= 1 << (bit % 8);
+        fs::write(file, damaged).unwrap();
+        fails(&[], none.clone());
+    }
 }
 
 /// Creates `root/d/d/.../d/f` with `depth` dirs and a 4096 byte `f`.
