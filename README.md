@@ -70,6 +70,32 @@ Sizes are allocated bytes like `du -x`. Scans stay on one disk, never follow sym
 
 <br/>
 
+## 🐍 &nbsp;Python
+
+The same package can also be used from Python:
+
+```python
+import diskuse
+
+tree = diskuse.scan("~/src")
+print(tree.root.size)  # allocated bytes, like du
+for d in tree.root.children():  # largest first
+    print(d.size, d.name)
+tree.largest_files(10)  # [(path, bytes), ...]
+tree.to_arrow()  # every folder as a row, needs pyarrow
+
+for e in diskuse.live("~/src"):  # or: async for e in ...
+    match e:
+        case diskuse.Ready(tree):
+            ...  # the scan finished
+        case diskuse.Changed(tree, changes):
+            ...  # [(path, delta_bytes), ...]
+```
+
+See [python/examples/tui.py](python/examples/tui.py) for a small browser written in Python with this API.
+
+<br/>
+
 ## 🔐 &nbsp;Full Disk Access (macOS)
 
 macOS hides some folders like Mail, Messages and Safari from apps without Full Disk Access.
