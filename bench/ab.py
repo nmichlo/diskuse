@@ -3,9 +3,9 @@
 
     python3 bench/ab.py --bin base=path/to/a --bin new=path/to/b DIR...
 
-Each round runs every build once on every dir, in a shuffled order, so
-drift in load or caches hits all builds alike. The first round only warms
-the caches. Reports medians and quartiles of wall time and CPU (user + sys), and
+Each round runs every build once, in a shuffled order, so drift in load
+hits all builds alike, and all rounds of a dir run before the next dir's.
+The first round only warms the caches. Reports medians and quartiles of wall time and CPU (user + sys), and
 median instructions retired and peak memory from `/usr/bin/time -l`
 (macOS), as a change against the first build, and fails if any build's output differs.
 """
@@ -54,14 +54,16 @@ def main() -> int:
     args = a.args.split()
     runs = {(d, n): [] for d in a.dirs for n, _ in bins}
     outs = {}
-    for r in range(a.rounds + 1):
-        for d in a.dirs:
+    # one dir at a time: on a small machine, another dir's scan evicts
+    # this one's metadata from the cache
+    for d in a.dirs:
+        for r in range(a.rounds + 1):
             for name, path in random.sample(bins, len(bins)):
                 stats, out = run(path, d, args)
                 outs.setdefault(d, {})[name] = out
                 if r > 0:
                     runs[d, name].append(stats)
-        print(f"round {r} done", file=sys.stderr)
+        print(f"{d} done", file=sys.stderr)
     ok = True
     for d in a.dirs:
         print(f"\n{d}")
