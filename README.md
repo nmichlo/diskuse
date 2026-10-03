@@ -129,3 +129,11 @@ This is the only place diskuse ever writes to.
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+
+<br/>
+
+## 🤖 &nbsp;AI Use
+
+diskuse was written with the help of an AI coding assistant (Claude Code).
+I designed the features, made the decisions, and reviewed and tested every change.
+The benchmarks are real runs on real machines, see [bench/README.md](bench/README.md).
