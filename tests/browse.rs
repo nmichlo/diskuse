@@ -5,8 +5,8 @@
 mod common;
 
 use common::{Fixture, file, fixture, kib};
-use disksweep::reveal::Desktop;
-use disksweep::{App, Browser, CacheDir, Env, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions};
+use diskuse::reveal::Desktop;
+use diskuse::{App, Browser, CacheDir, Env, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
@@ -70,7 +70,7 @@ impl Look {
         }
     }
 
-    /// A size, by its unit: like OmniDiskSweeper, red from 1 GiB, yellow
+    /// A size, by its unit: like OmniDiskUseer, red from 1 GiB, yellow
     /// from 1 MiB, green from 1 KiB, dim below.
     fn size(self, text: &str) -> Style {
         match text.rsplit(' ').next().unwrap() {
@@ -604,7 +604,7 @@ fn shows_a_saved_scan_with_its_age() {
     let f = fixture();
     let e = expected(&f);
     let saved = Saved {
-        tree: disksweep::scan(f.dir.path(), &ScanOptions::default()).unwrap(),
+        tree: diskuse::scan(f.dir.path(), &ScanOptions::default()).unwrap(),
         reclaimable: false,
         modified: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
     };
@@ -956,7 +956,7 @@ fn finish(app: &mut App) {
 fn guides_to_full_disk_access_once_before_the_first_scan() {
     let f = fixture();
     let e = expected(&f);
-    let total = disksweep::scan(f.dir.path(), &ScanOptions::default()).unwrap();
+    let total = diskuse::scan(f.dir.path(), &ScanOptions::default()).unwrap();
     let used = total.totals().size[0] + (1 << 20);
     let mut app = enter_volume(&f, used, FullDiskAccess::Missing);
     let guide: Vec<Line> = [
@@ -965,7 +965,7 @@ fn guides_to_full_disk_access_once_before_the_first_scan() {
         "macOS keeps some folders from every app without Full Disk Access: Mail, Messages, Safari, Time",
         "Machine and other apps' data. The scan lists them as denied, and their sizes are missing. To grant",
         "it, turn on iTerm in System Settings > Privacy & Security > Full Disk Access, then quit and reopen",
-        "iTerm. disksweep stays read-only either way.",
+        "iTerm. diskuse stays read-only either way.",
         "",
         "o  open the Full Disk Access settings",
         "c  continue without",
@@ -1416,7 +1416,7 @@ fn follows_changes(inotify: bool, within: Duration, at: fn(&Path) -> PathBuf) {
     };
     let shown = |files: &[(u64, &str)]| shown_at("0 s", files);
     let saved = Saved {
-        tree: disksweep::scan(root, &ScanOptions::default()).unwrap(),
+        tree: diskuse::scan(root, &ScanOptions::default()).unwrap(),
         reclaimable: false,
         modified: now(),
     };
@@ -1541,11 +1541,11 @@ fn rescans_over_a_stopped_saved_scan() {
         file(&root.join(name).join("f"), 4096);
     }
     let opts = ScanOptions {
-        stop: disksweep::Stop::new(|| true),
+        stop: diskuse::Stop::new(|| true),
         ..ScanOptions::default()
     };
     let saved = Saved {
-        tree: disksweep::scan(root, &opts).unwrap(),
+        tree: diskuse::scan(root, &opts).unwrap(),
         reclaimable: false,
         modified: now(),
     };

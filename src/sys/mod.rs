@@ -80,7 +80,7 @@ pub struct DirStat {
 }
 
 /// Opens the scan root. Unlike children, a symlinked root is followed (like
-/// `du -H`), so `disksweep scan /tmp` works on macOS where `/tmp` is a link.
+/// `du -H`), so `diskuse scan /tmp` works on macOS where `/tmp` is a link.
 pub fn open_root(path: &Path) -> Result<OwnedFd> {
     let flags = DIR_FLAGS.difference(OFlags::NOFOLLOW);
     // sys owns the only openat, with fixed read-only flags.
@@ -234,7 +234,7 @@ pub fn firmlinks() -> Vec<Firmlink> {
 #[allow(unsafe_code)]
 pub fn map(file: &File) -> io::Result<memmap2::Mmap> {
     // SAFETY: the map is sound while no one changes the file in place.
-    // disksweep never does: `CacheDir::save` writes a new file and renames
+    // diskuse never does: `CacheDir::save` writes a new file and renames
     // it over the old one, so a mapped file keeps its bytes. Only another
     // program writing into the owner-only cache dir could, as for any
     // mapped file.

@@ -205,7 +205,7 @@ impl Stream {
             return None;
         }
         // SAFETY: a serial queue of our own, and the live `stream`.
-        let queue = unsafe { dispatch_queue_create(c"disksweep.fsevents".as_ptr(), ptr::null()) };
+        let queue = unsafe { dispatch_queue_create(c"diskuse.fsevents".as_ptr(), ptr::null()) };
         let s = Self {
             api,
             stream,

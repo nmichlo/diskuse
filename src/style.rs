@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 /// How the parts of a screen are drawn.
 pub(crate) struct Styles {
     /// Sizes of at least 1 GiB, 1 MiB and 1 KiB, and smaller ones, like
-    /// OmniDiskSweeper.
+    /// OmniDiskUseer.
     sizes: [Style; 4],
     /// The name of a directory.
     pub dir: Style,

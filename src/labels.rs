@@ -1,6 +1,6 @@
 //! Labels for directories, shown after the name and coloured by how safe
 //! deleting one is: `node_modules/  [cache: npm]`. The selected row's
-//! label is explained in the footer. Only a label: disksweep deletes
+//! label is explained in the footer. Only a label: diskuse deletes
 //! nothing, so deleting one is done by hand, after a reveal.
 //!
 //! Three tiers, the first that matches wins:

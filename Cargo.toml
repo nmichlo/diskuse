@@ -1,10 +1,10 @@
 [package]
-name = "disksweep"
+name = "diskuse"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/nmichlo/disksweep"
+repository = "https://github.com/nmichlo/diskuse"
 description = "Read-only disk usage browser for macOS and Linux, built for speed"
 readme = "README.md"
 keywords = ["disk", "du", "disk-usage", "cli", "tui"]

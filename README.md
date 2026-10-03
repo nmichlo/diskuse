@@ -1,10 +1,10 @@
-# disksweep
+# diskuse
 
 A read-only disk usage browser for macOS and Linux, built for speed.
 
 ## Read-only
 
-disksweep never deletes, renames or writes your files. It can only show you
+diskuse never deletes, renames or writes your files. It can only show you
 where the space went. Deleting is done by hand, in Finder or your file manager.
 
 ## Install
@@ -12,25 +12,25 @@ where the space went. Deleting is done by hand, in Finder or your file manager.
 Prebuilt for macOS and Linux, on x86_64 and arm64:
 
 ```sh
-uvx disksweep scan .          # run once, without installing
-uv tool install disksweep
-pipx install disksweep
-cargo binstall disksweep      # prebuilt, from GitHub Releases
-cargo install disksweep       # builds from source
+uvx diskuse scan .          # run once, without installing
+uv tool install diskuse
+pipx install diskuse
+cargo binstall diskuse      # prebuilt, from GitHub Releases
+cargo install diskuse       # builds from source
 ```
 
 Or download a `.tar.gz` from
-[GitHub Releases](https://github.com/nmichlo/disksweep/releases).
+[GitHub Releases](https://github.com/nmichlo/diskuse/releases).
 
 ## Status
 
 Pre-release. The commands so far:
 
 ```sh
-disksweep [-r]
-disksweep [-r] <path>
-disksweep scan <path> [--threads N] [-r] [--json [--depth N]] [--top N]
-disksweep show <path> [-r] [--json [--depth N]] [--top N]
+diskuse [-r]
+diskuse [-r] <path>
+diskuse scan <path> [--threads N] [-r] [--json [--depth N]] [--top N]
+diskuse show <path> [-r] [--json [--depth N]] [--top N]
 ```
 
 `scan` prints the total size of `<path>`, then each direct child largest
@@ -74,13 +74,13 @@ records every change to a volume (FSEvents), but Apple calls that record
 "advisory rather than a definitive list of all changes to the volume": a disk
 changed by another OS, from Recovery or by another Mac can miss changes with
 no sign. So `scan`, and every launch of the browser, scans afresh. Changes
-seen while disksweep is open are applied live (see [Browse](#browse)), as
+seen while diskuse is open are applied live (see [Browse](#browse)), as
 the kernel reports them and says when it drops any.
 
 ## Stop
 
 Ctrl-C stops a `scan`, and so does SIGTERM. In the browser, `q`, Esc and
-Ctrl-C stop the scan when quitting. Either way disksweep lists no more
+Ctrl-C stop the scan when quitting. Either way diskuse lists no more
 directories, saves what it found, and marks the result incomplete:
 
 ```text
@@ -93,7 +93,7 @@ directories, saves what it found, and marks the result incomplete:
 
 ## Browse
 
-`disksweep` with no path lists the volumes, one per row:
+`diskuse` with no path lists the volumes, one per row:
 
 ```text
 volumes
@@ -109,7 +109,7 @@ and `efivarfs`. `/` is always listed. On macOS it stands for the whole main
 disk: a scan of `/` also covers the hidden Data volume, where your files are,
 and the used bytes of an APFS volume are those of its whole container.
 
-`disksweep <path>` browses `<path>` full screen, in three columns: the parent
+`diskuse <path>` browses `<path>` full screen, in three columns: the parent
 directory, the current one, and a preview of the selected item. At the top of
 `<path>` there is no parent, so the current directory takes the first column.
 Each lists directories and files together, largest first. In a column at
@@ -123,7 +123,7 @@ tenths, rounded, and at least one `#` from 1%:
  439.5 MiB  #......... Library/              490.3 MiB  #......... go/
 ```
 
-Sizes are coloured by magnitude, like OmniDiskSweeper: red from 1 GiB, yellow
+Sizes are coloured by magnitude, like OmniDiskUseer: red from 1 GiB, yellow
 from 1 MiB, green from 1 KiB, grey below. Directories are bold. With
 [`NO_COLOR`](https://no-color.org) set, nothing is coloured; the selection is
 reversed instead.
@@ -132,7 +132,7 @@ It scans while you browse. The title says `scanning... at least <size>` and
 the sizes grow, about once a second, until the scan is done and saved. If
 `<path>` was scanned before, the saved scan shows at once, marked
 `saved 5 min ago, rescanning...`, until the fresh scan is done. Then, while
-disksweep is open, sizes follow changes on disk, about once a second: on
+diskuse is open, sizes follow changes on disk, about once a second: on
 macOS every change below `<path>`, including those made while it scanned.
 
 On Linux only the directories on screen follow changes: those
@@ -195,7 +195,7 @@ macOS records no changes for, like a network share, is followed the same way.
 The move keys, the mouse and `?` work the same on the volume list, the `d`
 list, the `t` list and the `p` list.
 
-Picks collect what to delete by hand later, since disksweep deletes
+Picks collect what to delete by hand later, since diskuse deletes
 nothing. In the `p` list, `r` and `o` reveal and open a pick, and Space
 unpicks it. Picks are saved per scanned path, next to the saved scan, so
 they are there next time; one deleted since shows as `gone`:
@@ -205,7 +205,7 @@ they are there next time; one deleted since shows as `gone`:
   38.2 GiB  Library/Developer/Xcode/DerivedData
    3.3 GiB  Downloads/old.dmg
       gone  Movies/export.mov
-``` disksweep takes the mouse, so to select text on screen,
+``` diskuse takes the mouse, so to select text on screen,
 hold Shift (Option in Terminal and iTerm) while dragging.
 
 Reveal and open run `open -R` and `open` on macOS, and `xdg-open` on Linux,
@@ -232,7 +232,7 @@ checks again. During a scan it lists the largest files found so far.
  640.0 MiB  .git/objects/pack/pack-1a2b.pack
 ```
 
-On macOS, `disksweep -r` scans with reclaimable sizes, like `scan -r`, and
+On macOS, `diskuse -r` scans with reclaimable sizes, like `scan -r`, and
 shows them in a second column after each size. A saved scan made without
 `-r` is not shown first in this mode; the fresh scan is.
 
@@ -302,12 +302,12 @@ them as denied, with `needs Full Disk Access for <your terminal>` in the `d`
 list. `EACCES` instead means plain Unix permissions; `sudo` can read those.
 
 Before its first scan of a volume, or of a path that holds or is in your home
-directory, disksweep reads `~/Desktop`, `~/Documents` and `~/Downloads` once,
+directory, diskuse reads `~/Desktop`, `~/Documents` and `~/Downloads` once,
 so any macOS popups asking for them appear together, before the scan. Then it
 tries a folder only Full Disk Access can read. If that fails, it says which
 terminal app needs access, and `o` opens the settings pane. To grant it, turn
 on your terminal app in System Settings > Privacy & Security > Full Disk
-Access, then quit and reopen it. `c` scans without it. disksweep never asks
+Access, then quit and reopen it. `c` scans without it. diskuse never asks
 for `sudo`.
 
 ## JSON
@@ -344,23 +344,23 @@ Every `scan` saves its result, which `show` reads. Saved scans live in:
 
 | OS    | Directory                                                    |
 | ----- | ------------------------------------------------------------ |
-| macOS | `~/Library/Caches/disksweep`                                 |
-| Linux | `$XDG_CACHE_HOME/disksweep`, else `~/.cache/disksweep`       |
+| macOS | `~/Library/Caches/diskuse`                                 |
+| Linux | `$XDG_CACHE_HOME/diskuse`, else `~/.cache/diskuse`       |
 
-`DISKSWEEP_CACHE_DIR` overrides both. There is one file per scanned path (per
+`DISKUSE_CACHE_DIR` overrides both. There is one file per scanned path (per
 volume and real path), and one of its picks if any. The files contain
 directory names, the names of the largest files and picked paths, so they are created with mode 0600, and the directory, if
 missing, with mode 0700. To clear the cache, delete the directory. This cache
-directory is the only place disksweep ever writes.
+directory is the only place diskuse ever writes.
 
 `show` reads a saved file in place, memory-mapped, without copying it. Each
 file ends in a CRC-32 of its bytes. A file that fails that check, or comes from
-another disksweep version, counts as no saved scan, and the next `scan`
+another diskuse version, counts as no saved scan, and the next `scan`
 replaces it.
 
 ## Benchmarks
 
-**disksweep had the fastest mean in both runs below, and builds a browsable tree while doing it.** These are quick runs (3 timed runs each), so its lead over dua and dumac (2-6%) is within the noise; the gap to every other tool is clear. Every tool's total matched `du`.
+**diskuse had the fastest mean in both runs below, and builds a browsable tree while doing it.** These are quick runs (3 timed runs each), so its lead over dua and dumac (2-6%) is within the noise; the gap to every other tool is clear. Every tool's total matched `du`.
 
 Apple M4, 10 cores, 24 GB, macOS 27, warm cache, 2026-10-02. How to reproduce: [bench/README.md](bench/README.md#reproducing-the-readme-numbers).
 
@@ -368,7 +368,7 @@ Apple M4, 10 cores, 24 GB, macOS 27, warm cache, 2026-10-02. How to reproduce: [
 
 | tool | kind | warm time | peak memory |
 | --- | --- | --- | --- |
-| **disksweep** | tree | **0.342 s** | **7.7 MiB** |
+| **diskuse** | tree | **0.342 s** | **7.7 MiB** |
 | dua | tree | 0.350 s | 9.2 MiB |
 | dumac | totals only | 0.446 s | - |
 
@@ -376,7 +376,7 @@ Apple M4, 10 cores, 24 GB, macOS 27, warm cache, 2026-10-02. How to reproduce: [
 
 | tool | kind | warm, default threads | warm, best | peak memory |
 | --- | --- | --- | --- | --- |
-| **disksweep** | tree | **0.610 s** | **0.610 s** | 13.8 MiB |
+| **diskuse** | tree | **0.610 s** | **0.610 s** | 13.8 MiB |
 | dumac | totals only | 0.636 s | 0.636 s | 31.8 MiB |
 | dua | tree | 0.722 s | 0.647 s | **12.7 MiB** |
 | diskus | totals only | 0.997 s | 0.950 s | 20.2 MiB |

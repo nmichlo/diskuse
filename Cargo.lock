@@ -334,7 +334,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "disksweep"
+name = "diskuse"
 version = "0.0.0"
 dependencies = [
  "boxcar",

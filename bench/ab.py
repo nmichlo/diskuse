@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A/B test disksweep builds: interleaved runs, medians, identical output.
+"""A/B test diskuse builds: interleaved runs, medians, identical output.
 
     python3 bench/ab.py --bin base=path/to/a --bin new=path/to/b DIR...
 

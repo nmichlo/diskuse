@@ -1,5 +1,5 @@
-# The PyPI package: a wheel holding only the disksweep binary, for
-# `uvx disksweep` and `pipx install disksweep`. No Python code.
+# The PyPI package: a wheel holding only the diskuse binary, for
+# `uvx diskuse` and `pipx install diskuse`. No Python code.
 
 [build-system]
 # 1.9.3: the first to put `license-files` in the sdist too
@@ -7,7 +7,7 @@ requires = ["maturin>=1.9.3,<2"]
 build-backend = "maturin"
 
 [project]
-name = "disksweep"
+name = "diskuse"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-*", "THIRD_PARTY_LICENSES.txt"]
@@ -24,8 +24,8 @@ classifiers = [
 dynamic = ["version", "description"]
 
 [project.urls]
-Repository = "https://github.com/nmichlo/disksweep"
-Issues = "https://github.com/nmichlo/disksweep/issues"
+Repository = "https://github.com/nmichlo/diskuse"
+Issues = "https://github.com/nmichlo/diskuse/issues"
 
 [tool.maturin]
 bindings = "bin"

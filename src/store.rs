@@ -12,7 +12,7 @@
 //! [`ReadTree`] index out of bounds.
 //!
 //! ```text
-//! magic     b"DSWP"
+//! magic     b"DUSE"
 //! version   u8 = 6
 //! flags     u8: bit 0 = scanned with reclaimable sizes, bit 1 = stopped
 //! 0         u16, so the archive starts aligned, at byte 8
@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-const MAGIC: &[u8; 4] = b"DSWP";
+const MAGIC: &[u8; 4] = b"DUSE";
 const VERSION: u8 = 6;
 const RECLAIMABLE: u8 = 1 << 0;
 const STOPPED: u8 = 1 << 1;
@@ -64,30 +64,30 @@ impl CacheDir {
         &self.0
     }
 
-    /// The cache dir at `dir`, as for a test. disksweep itself only uses
+    /// The cache dir at `dir`, as for a test. diskuse itself only uses
     /// [`CacheDir::from_env`].
     pub fn at(dir: PathBuf) -> Self {
         Self(dir)
     }
 
-    /// `$DISKSWEEP_CACHE_DIR` if set, else `~/Library/Caches/disksweep` on
-    /// macOS, and `$XDG_CACHE_HOME/disksweep` or `~/.cache/disksweep`
+    /// `$DISKUSE_CACHE_DIR` if set, else `~/Library/Caches/diskuse` on
+    /// macOS, and `$XDG_CACHE_HOME/diskuse` or `~/.cache/diskuse`
     /// elsewhere. Not created until a save.
     pub fn from_env() -> io::Result<Self> {
         let var = |k| std::env::var_os(k).filter(|v| !v.is_empty());
-        if let Some(dir) = var("DISKSWEEP_CACHE_DIR") {
+        if let Some(dir) = var("DISKUSE_CACHE_DIR") {
             return Ok(Self(dir.into()));
         }
         // the XDG spec says to ignore a relative path
         #[cfg(not(target_os = "macos"))]
         if let Some(xdg) = var("XDG_CACHE_HOME").filter(|v| Path::new(v).is_absolute()) {
-            return Ok(Self(Path::new(&xdg).join("disksweep")));
+            return Ok(Self(Path::new(&xdg).join("diskuse")));
         }
         let home = var("HOME").ok_or_else(|| io::Error::other("HOME is not set"))?;
         #[cfg(target_os = "macos")]
-        return Ok(Self(Path::new(&home).join("Library/Caches/disksweep")));
+        return Ok(Self(Path::new(&home).join("Library/Caches/diskuse")));
         #[cfg(not(target_os = "macos"))]
-        Ok(Self(Path::new(&home).join(".cache/disksweep")))
+        Ok(Self(Path::new(&home).join(".cache/diskuse")))
     }
 
     /// Saves `tree`, the scan of `root`, over any earlier save of it. Readers
@@ -146,7 +146,7 @@ impl CacheDir {
             .and_then(|mut f| f.write_all(bytes))
             .and_then(|()| std::fs::rename(&tmp, &path));
         if saved.is_err() {
-            // the disk is often full when disksweep runs, so leave no
+            // the disk is often full when diskuse runs, so leave no
             // partial file behind. The store may delete its own temp file.
             #[allow(clippy::disallowed_methods)]
             let _ = std::fs::remove_file(&tmp);

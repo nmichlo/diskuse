@@ -1,4 +1,4 @@
-//! The screens `disksweep` moves between, the volume list, the Full Disk
+//! The screens `diskuse` moves between, the volume list, the Full Disk
 //! Access guide and the browser, the help over them, and the terminal loop
 //! that drives them.
 
@@ -105,7 +105,7 @@ pub fn browse(path: Option<&Path>, reclaimable: bool) -> io::Result<()> {
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     if let Err(e) = app.quit() {
-        eprintln!("disksweep: warning: scan not saved: {e}");
+        eprintln!("diskuse: warning: scan not saved: {e}");
     }
     result
 }

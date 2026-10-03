@@ -1,4 +1,4 @@
-//! The `disksweep scan` text output.
+//! The `diskuse scan` text output.
 
 use crate::sys;
 use crate::tree::{ReadTree, Record};

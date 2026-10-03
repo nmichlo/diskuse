@@ -1,5 +1,5 @@
 //! The full-screen browser: three columns, the parent dir, the current dir
-//! and the selected child, each largest first, like OmniDiskSweeper. At the
+//! and the selected child, each largest first, like OmniDiskUseer. At the
 //! root, which has no parent column, the other two move left. Each row has
 //! a bar of its share of its dir. A click selects the row under it, a
 //! double click goes into it, and the wheel scrolls the column under it. A scan
@@ -1227,7 +1227,7 @@ impl Browser {
         Some(path)
     }
 
-    /// `path`, below the root, as a path from where disksweep runs.
+    /// `path`, below the root, as a path from where diskuse runs.
     fn below_root(&self, path: &[u8]) -> Vec<u8> {
         let mut full = self.root.as_os_str().as_bytes().to_vec();
         join(&mut full, path);

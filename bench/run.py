@@ -1,4 +1,4 @@
-"""Benchmarks disksweep against other disk usage tools. See bench/README.md.
+"""Benchmarks diskuse against other disk usage tools. See bench/README.md.
 
 python3 bench/run.py warm <dataset> <path> [--runs N]
 python3 bench/run.py cold <dataset> <path> [--runs N]
@@ -102,8 +102,8 @@ def opt(flag: str, threads: int | None) -> list[str]:
 
 TOOLS = [
     Tool(
-        "disksweep",
-        str(REPO / "target" / "release" / "disksweep"),
+        "diskuse",
+        str(REPO / "target" / "release" / "diskuse"),
         "tree",
         lambda p, t: ["scan", p, *opt("--threads", t)],
         lambda out: json.loads(out)["size"],
@@ -214,7 +214,7 @@ def version(tool: Tool) -> str:
         out = next((x for x in out.splitlines() if x.startswith(tool.name + " ")), "")
     else:
         out = run([tool.exe, *tool.version]).stdout
-    if tool.name == "disksweep":
+    if tool.name == "diskuse":
         out += " #" + git("describe", "--always", "--dirty").strip()
     num = re.search(r"\d+\.\d+[\w.]*", out)
     rev = re.search(r"#([\w-]+)", out)
@@ -339,13 +339,13 @@ def bench(args, kind: str) -> None:
     if not os.path.isdir(path):
         sys.exit(f"{path}: not a directory")
     if not Path(TOOLS[0].exe).exists():
-        sys.exit("disksweep is not built: run `cargo build --release`")
+        sys.exit("diskuse is not built: run `cargo build --release`")
     tools, skipped = installed()
     file = RESULTS / machine(args) / f"{TODAY}-{label}.json"
     data = json.loads(file.read_text()) if file.exists() else {}
     cache = tempfile.TemporaryDirectory()
     # the tools that save scans save them here, never in the user's cache
-    os.environ["DISKSWEEP_CACHE_DIR"] = os.path.join(cache.name, "disksweep")
+    os.environ["DISKUSE_CACHE_DIR"] = os.path.join(cache.name, "diskuse")
     os.environ["DISKSCOUR_CACHE_DIR"] = os.path.join(cache.name, "diskscour")
     if kind == "cold":
         prepare = (
@@ -491,8 +491,8 @@ def gates(d: dict) -> list[tuple[bool | None, str]]:
     """(True pass / False fail / None skip, line) for each gate of a dataset."""
     out = []
     warm, cold = d.get("warm", []), d.get("cold", [])
-    ours = default(warm, "disksweep")
-    others = {r["tool"]: r["league"] for r in warm + cold if r["tool"] != "disksweep"}
+    ours = default(warm, "diskuse")
+    others = {r["tool"]: r["league"] for r in warm + cold if r["tool"] != "diskuse"}
     for league in ("tree", "totals"):
         rivals = [t for t, lg in others.items() if lg == league]
         theirs = [b for t in rivals if (b := best(warm, t))]
@@ -504,10 +504,10 @@ def gates(d: dict) -> list[tuple[bool | None, str]]:
             out.append(
                 (
                     ok,
-                    f"warm/{league}: disksweep {fmt(ours)} s vs {rival['tool']} {fmt(rival)} s (threads {rival['threads'] or 'default'})",
+                    f"warm/{league}: diskuse {fmt(ours)} s vs {rival['tool']} {fmt(rival)} s (threads {rival['threads'] or 'default'})",
                 )
             )
-        our_cold = default(cold, "disksweep")
+        our_cold = default(cold, "diskuse")
         their_cold = [r for r in cold if r["tool"] in rivals and is_cold(r, warm)]
         if our_cold is None or not their_cold:
             out.append((None, f"cold/{league}: no cold runs"))
@@ -515,7 +515,7 @@ def gates(d: dict) -> list[tuple[bool | None, str]]:
             out.append(
                 (
                     None,
-                    f"cold/{league}: disksweep cold median {our_cold['median']:.3f} s is under 2x warm, not cold",
+                    f"cold/{league}: diskuse cold median {our_cold['median']:.3f} s is under 2x warm, not cold",
                 )
             )
         else:
@@ -524,26 +524,26 @@ def gates(d: dict) -> list[tuple[bool | None, str]]:
             out.append(
                 (
                     ok,
-                    f"cold/{league}: disksweep median {our_cold['median']:.3f} s vs {rival['tool']} {rival['median']:.3f} s (limit 1.05x)",
+                    f"cold/{league}: diskuse median {our_cold['median']:.3f} s vs {rival['tool']} {rival['median']:.3f} s (limit 1.05x)",
                 )
             )
     mem = d.get("memory", {})
     tree_mem = {t: b for t, b in mem.items() if others.get(t) == "tree"}
-    if "disksweep" in mem and tree_mem:
+    if "diskuse" in mem and tree_mem:
         rival = min(tree_mem, key=tree_mem.get)
-        ok = mem["disksweep"] <= tree_mem[rival]
+        ok = mem["diskuse"] <= tree_mem[rival]
         out.append(
             (
                 ok,
-                f"memory: disksweep {mib(mem['disksweep'])} MiB vs {rival} {mib(tree_mem[rival])} MiB",
+                f"memory: diskuse {mib(mem['diskuse'])} MiB vs {rival} {mib(tree_mem[rival])} MiB",
             )
         )
-    ours_all = [r for r in warm + cold if r["tool"] == "disksweep"]
+    ours_all = [r for r in warm + cold if r["tool"] == "diskuse"]
     bad = [r for r in ours_all if not r.get("valid")]
     out.append(
         (
             bool(ours_all) and not bad,
-            f"totals: {len(ours_all) - len(bad)}/{len(ours_all)} disksweep runs valid",
+            f"totals: {len(ours_all) - len(bad)}/{len(ours_all)} diskuse runs valid",
         )
     )
     return out
@@ -613,7 +613,7 @@ def git(*args: str) -> str:
 
 
 def check(args) -> int:
-    """Fails if a disksweep warm median is > 10% above the last committed one."""
+    """Fails if a diskuse warm median is > 10% above the last committed one."""
     machine_dir = RESULTS / machine(args)
     tracked = set(git("ls-files", str(machine_dir)).split())
     failed = False
@@ -629,8 +629,8 @@ def check(args) -> int:
         ]
         # an unchanged committed copy of the newest result is not "previous"
         previous = [c for c in committed if c != current and "warm" in c]
-        now = default(current["warm"], "disksweep")
-        then = previous and default(previous[-1]["warm"], "disksweep")
+        now = default(current["warm"], "diskuse")
+        then = previous and default(previous[-1]["warm"], "diskuse")
         if not (now and then and timed(now) and timed(then)):
             print(f"SKIP {name}: no previous committed result")
             continue

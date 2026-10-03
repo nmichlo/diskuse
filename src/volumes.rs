@@ -1,4 +1,4 @@
-//! The volume list `disksweep` starts on without a path: one row per real
+//! The volume list `diskuse` starts on without a path: one row per real
 //! filesystem, with its size, used and free bytes, and a bar of its used
 //! share.
 

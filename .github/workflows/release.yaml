@@ -27,12 +27,12 @@ jobs:
       id-token: write
     uses: nmichlo/.github/.github/workflows/release-rust.yaml@main
     with:
-      package-name: disksweep
+      package-name: diskuse
       # a binary-only wheel (pyproject.toml), and per-target tarballs of the
       # same binary on the GitHub release, for `cargo binstall`
       bindings: bin
       bin-archives: true
-      # no Windows: disksweep is macOS and Linux only
+      # no Windows: diskuse is macOS and Linux only
       targets: >-
         [
           {"runs-on": "macos-15", "target": "aarch64"},
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/disksweep
+      url: https://pypi.org/p/diskuse
     permissions:
       id-token: write  # for trusted publishing
     steps:

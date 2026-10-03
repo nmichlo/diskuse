@@ -102,7 +102,7 @@ pub(crate) fn draw_guide(frame: &mut Frame, terminal: &str, message: Option<&str
              Mail, Messages, Safari, Time Machine and other apps' data. The scan \
              lists them as denied, and their sizes are missing. To grant it, turn \
              on {terminal} in System Settings > Privacy & Security > Full Disk \
-             Access, then quit and reopen {terminal}. disksweep stays read-only \
+             Access, then quit and reopen {terminal}. diskuse stays read-only \
              either way."
         ),
         String::new(),

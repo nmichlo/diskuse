@@ -16,7 +16,7 @@ licenses:
 bench-gen ID DIR:
     cargo run --release --example bench-gen -- {{ID}} {{DIR}}
 
-# warm runs, e.g. `just bench S1 /tmp/disksweep-bench/S1 --runs 2`
+# warm runs, e.g. `just bench S1 /tmp/diskuse-bench/S1 --runs 2`
 bench DATASET PATH *ARGS:
     cargo build --release
     python3 bench/run.py warm {{DATASET}} {{PATH}} {{ARGS}}
@@ -30,7 +30,7 @@ bench-cold DATASET PATH *ARGS:
 bench-report:
     python3 bench/run.py report
 
-# fails if disksweep got > 10% slower than the last committed result
+# fails if diskuse got > 10% slower than the last committed result
 bench-check:
     python3 bench/run.py check
 

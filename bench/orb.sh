@@ -7,9 +7,9 @@
 # not the shared macOS home, which would benchmark the file sharing.
 set -euo pipefail
 
-MACHINE=disksweep-bench
-SRC=/var/tmp/disksweep-src
-DATA=/var/tmp/disksweep-bench
+MACHINE=diskuse-bench
+SRC=/var/tmp/diskuse-src
+DATA=/var/tmp/diskuse-bench
 RUNS=""
 if [[ "${1:-}" == --runs ]]; then
     RUNS="--runs $2"
@@ -38,7 +38,7 @@ command -v cargo >/dev/null || [ -x ~/.cargo/bin/cargo ] ||
 export PATH=\$HOME/.local/bin:\$PATH
 command -v pdu >/dev/null || $SRC/bench/install.sh
 cd $SRC
-cargo build --release --bin disksweep --example bench-gen
+cargo build --release --bin diskuse --example bench-gen
 for id in $DATASETS; do
     [ -d $DATA/\$id ] || target/release/examples/bench-gen \$id $DATA/\$id
     python3 bench/run.py --machine $LABEL warm \$id $DATA/\$id $RUNS

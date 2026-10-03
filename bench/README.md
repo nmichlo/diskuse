@@ -1,6 +1,6 @@
 # Benchmarks
 
-`bench/run.py` times disksweep and 9 other disk usage tools on the same
+`bench/run.py` times diskuse and 9 other disk usage tools on the same
 directories, checks every tool's total against `du`, and writes the results
 to `bench/results/<machine>/`. The machine label comes from the hardware and
 OS only, for example `m4-10c-24g-macos27`.
@@ -15,7 +15,7 @@ Datasets are made by a seeded generator: the same ID gives the same files.
 It refuses a non-empty DIR.
 
 ```sh
-just bench-gen S1 /tmp/disksweep-bench/S1
+just bench-gen S1 /tmp/diskuse-bench/S1
 ```
 
 | ID | shape | files |
@@ -35,12 +35,12 @@ APFS. S3 on ext4 allocates 4 GiB more, for its 1M dirs of 4 KiB each.
 ## Running
 
 ```sh
-just bench S1 /tmp/disksweep-bench/S1     # warm, 10 runs per config
+just bench S1 /tmp/diskuse-bench/S1     # warm, 10 runs per config
 just bench R1 "$BENCH_R1" --runs 3
 just bench R2 /System/Volumes/Data   # macOS; `/` on Linux
-just bench-cold S1 /tmp/disksweep-bench/S1
+just bench-cold S1 /tmp/diskuse-bench/S1
 just bench-report                         # README table and gates
-just bench-check                          # disksweep regressions
+just bench-check                          # diskuse regressions
 just bench-orb                            # S1 to S5 on Linux, in OrbStack
 ```
 
@@ -69,17 +69,17 @@ volume twice and would be a wrong reference.
 
 `report` evaluates these per dataset, from its newest warm, cold and memory
 results, and exits 1 if any fails. League: "tree" tools build a browsable
-tree, "totals" tools (diskus, dumac, du) only print a sum. disksweep must win
+tree, "totals" tools (diskus, dumac, du) only print a sum. diskuse must win
 both.
 
 | gate | passes if |
 | ---- | --------- |
-| warm | disksweep at default threads has a 95% interval (mean +/- 1.96 sd / sqrt(n)) entirely below the fastest valid rival at its best threads |
-| cold | disksweep's median is at most 1.05x the best rival's; a cold set counts only if its median is at least 2x the warm one |
-| memory | disksweep has the lowest peak RSS of the tree tools |
-| totals | every disksweep total is valid |
+| warm | diskuse at default threads has a 95% interval (mean +/- 1.96 sd / sqrt(n)) entirely below the fastest valid rival at its best threads |
+| cold | diskuse's median is at most 1.05x the best rival's; a cold set counts only if its median is at least 2x the warm one |
+| memory | diskuse has the lowest peak RSS of the tree tools |
+| totals | every diskuse total is valid |
 
-`check` fails if a disksweep warm median is more than 10% above the last
+`check` fails if a diskuse warm median is more than 10% above the last
 committed result for the same dataset and machine.
 
 ## Reproducing the README numbers
@@ -89,8 +89,8 @@ The tables in the top-level README come from these commands, run at commit
 
 ```sh
 bench/install.sh                                   # the 9 other tools
-just bench-gen S1 /tmp/disksweep-bench/S1          # about 1 minute
-just bench S1 /tmp/disksweep-bench/S1 --runs 3
+just bench-gen S1 /tmp/diskuse-bench/S1          # about 1 minute
+just bench S1 /tmp/diskuse-bench/S1 --runs 3
 just bench R3 /opt/homebrew --runs 3               # any real dir works; R3 is just a label
 just bench-report                                  # writes bench/results/<machine>/README.md
 ```

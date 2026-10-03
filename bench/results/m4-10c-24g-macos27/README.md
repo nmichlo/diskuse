@@ -8,7 +8,7 @@ Reference `du -skx R3`: 12,892,590,080 bytes. Times in seconds, mean +/- 95% int
 
 | tool | league | total | warm, default threads | warm, best | best threads | cold median | peak RSS MiB |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| disksweep | tree | valid | 0.610 +/- 0.040 | 0.610 +/- 0.040 | default | - | 13.8 |
+| diskuse | tree | valid | 0.610 +/- 0.040 | 0.610 +/- 0.040 | default | - | 13.8 |
 | dua | tree | valid | 0.722 +/- 0.079 | 0.647 +/- 0.012 | 20 | - | 12.7 |
 | gdu | tree | valid | 1.844 +/- 0.507 | 1.177 +/- 0.077 | 40 | - | 41.9 |
 | dust | tree | valid | 1.086 +/- 0.068 | 1.086 +/- 0.068 | default | - | 156.7 |
@@ -21,14 +21,14 @@ Reference `du -skx R3`: 12,892,590,080 bytes. Times in seconds, mean +/- 95% int
 
 Gates:
 
-- FAIL warm/tree: disksweep 0.610 +/- 0.040 s vs dua 0.647 +/- 0.012 s (threads 20)
+- FAIL warm/tree: diskuse 0.610 +/- 0.040 s vs dua 0.647 +/- 0.012 s (threads 20)
 - SKIP cold/tree: no cold runs
-- FAIL warm/totals: disksweep 0.610 +/- 0.040 s vs dumac 0.636 +/- 0.005 s (threads default)
+- FAIL warm/totals: diskuse 0.610 +/- 0.040 s vs dumac 0.636 +/- 0.005 s (threads default)
 - SKIP cold/totals: no cold runs
-- FAIL memory: disksweep 13.8 MiB vs dua 12.7 MiB
-- PASS totals: 4/4 disksweep runs valid
+- FAIL memory: diskuse 13.8 MiB vs dua 12.7 MiB
+- PASS totals: 4/4 diskuse runs valid
 
-Versions: disksweep 0.0.0@532fd05, dua 2.45.1, gdu 5.37.0, dust 1.2.6, pdu 0.24.0, ncdu 2.9.2, diskscour 0.5.0, diskus 0.9.0, dumac 0.1.0@1ffbe3c3, du system.
+Versions: diskuse 0.0.0@532fd05, dua 2.45.1, gdu 5.37.0, dust 1.2.6, pdu 0.24.0, ncdu 2.9.2, diskscour 0.5.0, diskus 0.9.0, dumac 0.1.0@1ffbe3c3, du system.
 
 ## S1 (2026-10-02)
 
@@ -36,7 +36,7 @@ Reference `du -skx S1`: 731,758,592 bytes. Times in seconds, mean +/- 95% interv
 
 | tool | league | total | warm, default threads | warm, best | best threads | cold median | peak RSS MiB |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| disksweep | tree | valid | 0.342 +/- 0.009 | 0.342 +/- 0.009 | default | - | 7.7 |
+| diskuse | tree | valid | 0.342 +/- 0.009 | 0.342 +/- 0.009 | default | - | 7.7 |
 | dua | tree | valid | 0.350 +/- 0.005 | 0.350 +/- 0.005 | default | - | 9.2 |
 | gdu | tree | valid | 0.908 +/- 0.057 | 0.908 +/- 0.057 | default | - | 33.3 |
 | dust | tree | valid | 1.107 +/- 0.106 | 1.107 +/- 0.106 | default | - | 121.3 |
@@ -49,11 +49,11 @@ Reference `du -skx S1`: 731,758,592 bytes. Times in seconds, mean +/- 95% interv
 
 Gates:
 
-- FAIL warm/tree: disksweep 0.342 +/- 0.009 s vs dua 0.350 +/- 0.005 s (threads default)
+- FAIL warm/tree: diskuse 0.342 +/- 0.009 s vs dua 0.350 +/- 0.005 s (threads default)
 - SKIP cold/tree: no cold runs
-- PASS warm/totals: disksweep 0.342 +/- 0.009 s vs dumac 0.446 +/- 0.049 s (threads default)
+- PASS warm/totals: diskuse 0.342 +/- 0.009 s vs dumac 0.446 +/- 0.049 s (threads default)
 - SKIP cold/totals: no cold runs
-- PASS memory: disksweep 7.7 MiB vs dua 9.2 MiB
-- PASS totals: 4/4 disksweep runs valid
+- PASS memory: diskuse 7.7 MiB vs dua 9.2 MiB
+- PASS totals: 4/4 diskuse runs valid
 
-Versions: disksweep 0.0.0@532fd05, dua 2.45.1, gdu 5.37.0, dust 1.2.6, pdu 0.24.0, ncdu 2.9.2, diskscour 0.5.0, diskus 0.9.0, dumac 0.1.0@1ffbe3c3, du system.
+Versions: diskuse 0.0.0@532fd05, dua 2.45.1, gdu 5.37.0, dust 1.2.6, pdu 0.24.0, ncdu 2.9.2, diskscour 0.5.0, diskus 0.9.0, dumac 0.1.0@1ffbe3c3, du system.

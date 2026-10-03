@@ -30,7 +30,7 @@ enum Command {
         threads: Option<NonZeroUsize>,
         /// Directory reader, for the differential test and benchmarks
         #[arg(long, value_enum, default_value_t, hide = true)]
-        reader: disksweep::Reader,
+        reader: diskuse::Reader,
         /// Stop after listing N directories below PATH, as Ctrl-C would, for
         /// the tests
         #[arg(long, value_name = "N", hide = true)]
@@ -79,7 +79,7 @@ struct Output {
     depth: Option<usize>,
     /// Also list the N largest files
     #[arg(long, value_name = "N",
-          value_parser = clap::value_parser!(u16).range(1..=disksweep::LARGEST as i64))]
+          value_parser = clap::value_parser!(u16).range(1..=diskuse::LARGEST as i64))]
     top: Option<u16>,
 }
 
@@ -88,14 +88,14 @@ impl Output {
         self.reclaimable.on()
     }
 
-    fn print(&self, tree: &impl disksweep::ReadTree) {
+    fn print(&self, tree: &impl diskuse::ReadTree) {
         let top = self.top.map(usize::from);
         match self.json {
             true => print!(
                 "{}",
-                disksweep::json(tree, self.reclaimable(), self.depth.unwrap_or(1), top)
+                diskuse::json(tree, self.reclaimable(), self.depth.unwrap_or(1), top)
             ),
-            false => print!("{}", disksweep::report(tree, self.reclaimable(), top)),
+            false => print!("{}", diskuse::report(tree, self.reclaimable(), top)),
         }
     }
 }
@@ -119,14 +119,14 @@ fn main() -> ExitCode {
 }
 
 fn browse(path: Option<&Path>, reclaimable: bool) -> ExitCode {
-    match (disksweep::browse(path, reclaimable), path) {
+    match (diskuse::browse(path, reclaimable), path) {
         (Ok(()), _) => ExitCode::SUCCESS,
         (Err(e), Some(path)) => {
-            eprintln!("disksweep: {}: {e}", path.display());
+            eprintln!("diskuse: {}: {e}", path.display());
             ExitCode::FAILURE
         }
         (Err(e), None) => {
-            eprintln!("disksweep: cannot list volumes: {e}");
+            eprintln!("diskuse: cannot list volumes: {e}");
             ExitCode::FAILURE
         }
     }
@@ -135,7 +135,7 @@ fn browse(path: Option<&Path>, reclaimable: bool) -> ExitCode {
 fn scan(
     path: &Path,
     threads: Option<NonZeroUsize>,
-    reader: disksweep::Reader,
+    reader: diskuse::Reader,
     stop_after: Option<usize>,
     output: &Output,
 ) -> ExitCode {
@@ -147,29 +147,29 @@ fn scan(
     }
     let listed = AtomicUsize::new(0);
     let stopped = Arc::clone(&signal);
-    let stop = disksweep::Stop::new(move || {
+    let stop = diskuse::Stop::new(move || {
         let enough = stop_after.is_some_and(|n| listed.fetch_add(1, Ordering::Relaxed) >= n);
         enough || stopped.load(Ordering::Relaxed) != 0
     });
-    let opts = disksweep::ScanOptions {
+    let opts = diskuse::ScanOptions {
         threads,
         reclaimable: output.reclaimable(),
         reader,
         stop,
     };
-    let tree = match disksweep::scan(path, &opts) {
+    let tree = match diskuse::scan(path, &opts) {
         Ok(tree) => tree,
         Err(e) => {
-            eprintln!("disksweep: {}: {e}", path.display());
+            eprintln!("diskuse: {}: {e}", path.display());
             return ExitCode::FAILURE;
         }
     };
     output.print(&tree);
     // the printed result stands even if it cannot be saved
     let saved =
-        disksweep::CacheDir::from_env().and_then(|cache| cache.save(path, &tree, opts.reclaimable));
+        diskuse::CacheDir::from_env().and_then(|cache| cache.save(path, &tree, opts.reclaimable));
     if let Err(e) = saved {
-        eprintln!("disksweep: warning: scan not saved: {e}");
+        eprintln!("diskuse: warning: scan not saved: {e}");
     }
     // like a shell reports a process the signal ended
     match signal.load(Ordering::Relaxed) {
@@ -179,7 +179,7 @@ fn scan(
 }
 
 fn show(path: &Path, output: &Output) -> ExitCode {
-    let file = disksweep::CacheDir::from_env().and_then(|cache| cache.read(path));
+    let file = diskuse::CacheDir::from_env().and_then(|cache| cache.read(path));
     // read in place: no tree is built
     let error = match file.as_ref().map(|f| f.as_ref().and_then(|f| f.check())) {
         Ok(Some(saved)) if output.reclaimable() && !saved.reclaimable => {
@@ -192,6 +192,6 @@ fn show(path: &Path, output: &Output) -> ExitCode {
         Ok(None) => format!("no saved scan for {}", path.display()),
         Err(e) => format!("cannot read saved scan for {}: {e}", path.display()),
     };
-    eprintln!("disksweep: {error}");
+    eprintln!("diskuse: {error}");
     ExitCode::FAILURE
 }

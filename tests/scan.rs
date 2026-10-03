@@ -11,11 +11,11 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Runs `disksweep <cmd> <path> <args>` with its saved scans in `cache`, so
+/// Runs `diskuse <cmd> <path> <args>` with its saved scans in `cache`, so
 /// tests never touch the user's cache dir.
-fn disksweep(cache: &Path, cmd: &str, path: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_disksweep"))
-        .env("DISKSWEEP_CACHE_DIR", cache)
+fn diskuse(cache: &Path, cmd: &str, path: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_diskuse"))
+        .env("DISKUSE_CACHE_DIR", cache)
         .arg(cmd)
         .arg(path)
         .args(args)
@@ -30,10 +30,10 @@ fn ok(out: Output) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// `disksweep scan <path> <args>`, saving into a throwaway cache.
+/// `diskuse scan <path> <args>`, saving into a throwaway cache.
 fn scan(path: &Path, args: &[&str]) -> String {
     let cache = tempfile::tempdir().unwrap();
-    ok(disksweep(cache.path(), "scan", path, args))
+    ok(diskuse(cache.path(), "scan", path, args))
 }
 
 /// The saved scan files in `cache`.
@@ -208,8 +208,8 @@ fn show_prints_what_scan_printed() {
         flags.push(&["-r"]);
     }
     for args in flags {
-        let scanned = ok(disksweep(cache.path(), "scan", f.dir.path(), args));
-        let shown = ok(disksweep(cache.path(), "show", f.dir.path(), args));
+        let scanned = ok(diskuse(cache.path(), "scan", f.dir.path(), args));
+        let shown = ok(diskuse(cache.path(), "show", f.dir.path(), args));
         assert_eq!(shown, scanned, "{args:?}");
     }
 
@@ -222,8 +222,8 @@ fn show_prints_what_scan_printed() {
         &root.display().to_string(),
         1,
     );
-    ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
-    assert_eq!(ok(disksweep(cache.path(), "show", &root, &[])), expected);
+    ok(diskuse(cache.path(), "scan", f.dir.path(), &[]));
+    assert_eq!(ok(diskuse(cache.path(), "show", &root, &[])), expected);
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn saved_scans_are_owner_only() {
     let f = fixture();
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("cache");
-    ok(disksweep(&cache, "scan", f.dir.path(), &[]));
+    ok(diskuse(&cache, "scan", f.dir.path(), &[]));
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode(&cache), 0o700);
     let modes: Vec<u32> = saved(&cache).iter().map(|p| mode(p)).collect();
@@ -244,19 +244,19 @@ fn show_fails_without_a_usable_saved_scan() {
     let cache = tempfile::tempdir().unwrap();
     let path = f.dir.path().display();
     let fails = |args: &[&str], message: String| {
-        let out = disksweep(cache.path(), "show", f.dir.path(), args);
+        let out = diskuse(cache.path(), "show", f.dir.path(), args);
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert_eq!(
             (stderr, out.stdout, out.status.code()),
             (message, vec![], Some(1))
         );
     };
-    let none = format!("disksweep: no saved scan for {path}\n");
+    let none = format!("diskuse: no saved scan for {path}\n");
     fails(&[], none.clone());
 
-    ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
+    ok(diskuse(cache.path(), "scan", f.dir.path(), &[]));
     if cfg!(target_os = "macos") {
-        let message = format!("disksweep: saved scan for {path} has no reclaimable sizes\n");
+        let message = format!("diskuse: saved scan for {path} has no reclaimable sizes\n");
         fails(&["-r"], message);
     }
 
@@ -405,14 +405,14 @@ fn changed_json(f: &common::Fixture, big_file: u64) -> String {
 }
 
 /// A saved scan is never used for a new one: changes made while
-/// disksweep is not running always show, as no record of them is trusted.
+/// diskuse is not running always show, as no record of them is trusted.
 #[test]
 fn scan_never_starts_from_a_saved_scan() {
     let f = fixture();
     let cache = tempfile::tempdir().unwrap();
-    ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
+    ok(diskuse(cache.path(), "scan", f.dir.path(), &[]));
     let big_file = change(&f);
-    let out = ok(disksweep(cache.path(), "scan", f.dir.path(), &["--json"]));
+    let out = ok(diskuse(cache.path(), "scan", f.dir.path(), &["--json"]));
     assert_eq!(out, changed_json(&f, big_file));
 }
 
@@ -428,15 +428,15 @@ fn show_ignores_a_damaged_saved_scan() {
     for (i, corrupt) in corruptions.into_iter().enumerate() {
         let f = fixture();
         let cache = tempfile::tempdir().unwrap();
-        ok(disksweep(cache.path(), "scan", f.dir.path(), &[]));
+        ok(diskuse(cache.path(), "scan", f.dir.path(), &[]));
         let [saved] = &saved(cache.path())[..] else {
             panic!("not one saved file");
         };
         let mut bytes = fs::read(saved).unwrap();
         corrupt(&mut bytes);
         fs::write(saved, bytes).unwrap();
-        let out = disksweep(cache.path(), "show", f.dir.path(), &[]);
-        let err = format!("disksweep: no saved scan for {}\n", f.dir.path().display());
+        let out = diskuse(cache.path(), "show", f.dir.path(), &[]);
+        let err = format!("diskuse: no saved scan for {}\n", f.dir.path().display());
         assert_eq!(
             (out.status.code(), String::from_utf8(out.stderr).unwrap()),
             (Some(1), err),
@@ -463,7 +463,7 @@ fn a_stopped_scan_is_marked_and_the_next_one_is_full() {
     };
     for k in 0..=dirs {
         let cache = tempfile::tempdir().unwrap();
-        let stopped = ok(disksweep(
+        let stopped = ok(diskuse(
             cache.path(),
             "scan",
             root,
@@ -478,12 +478,12 @@ fn a_stopped_scan_is_marked_and_the_next_one_is_full() {
                 "{files:>10}  {}{INCOMPLETE}\n{files:>10}  [files]\n",
                 root.display()
             );
-            assert_eq!(ok(disksweep(cache.path(), "show", root, &[])), shown);
+            assert_eq!(ok(diskuse(cache.path(), "show", root, &[])), shown);
         }
-        let finished = ok(disksweep(cache.path(), "scan", root, &full));
+        let finished = ok(diskuse(cache.path(), "scan", root, &full));
         assert_eq!(finished, expected, "{k}");
         assert_eq!(
-            ok(disksweep(cache.path(), "show", root, &[])),
+            ok(diskuse(cache.path(), "show", root, &[])),
             f.expected,
             "{k}"
         );
@@ -520,8 +520,8 @@ fn sigterm_stops_a_scan() {
         }
         let cache = tempfile::tempdir().unwrap();
         let before = accessed(path);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_disksweep"))
-            .env("DISKSWEEP_CACHE_DIR", cache.path())
+        let mut child = Command::new(env!("CARGO_BIN_EXE_diskuse"))
+            .env("DISKUSE_CACHE_DIR", cache.path())
             .arg("scan")
             .arg(path)
             .args(args)
@@ -549,7 +549,7 @@ fn sigterm_stops_a_scan() {
             continue;
         }
         assert_eq!(out.status.code(), Some(128 + 15));
-        assert_eq!(ok(disksweep(cache.path(), "show", path, &args)), stopped);
+        assert_eq!(ok(diskuse(cache.path(), "show", path, &args)), stopped);
         return;
     }
     panic!("every scan was done before SIGTERM landed");

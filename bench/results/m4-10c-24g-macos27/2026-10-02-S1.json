@@ -8,7 +8,7 @@
   "bytes": 731758592
  },
  "versions": {
-  "disksweep": "0.0.0@532fd05",
+  "diskuse": "0.0.0@532fd05",
   "dua": "2.45.1",
   "gdu": "5.37.0",
   "dust": "1.2.6",
@@ -22,10 +22,10 @@
  "skipped": [],
  "warm": [
   {
-   "tool": "disksweep",
+   "tool": "diskuse",
    "league": "tree",
    "threads": null,
-   "command": "disksweep scan S1 --full",
+   "command": "diskuse scan S1 --full",
    "total": 731758592,
    "valid": true,
    "mean": 0.3420509026666667,
@@ -41,10 +41,10 @@
    "failed_runs": 0
   },
   {
-   "tool": "disksweep",
+   "tool": "diskuse",
    "league": "tree",
    "threads": 10,
-   "command": "disksweep scan S1 --full --threads 10",
+   "command": "diskuse scan S1 --full --threads 10",
    "total": 731758592,
    "valid": true,
    "mean": 0.43598944433333336,
@@ -60,10 +60,10 @@
    "failed_runs": 0
   },
   {
-   "tool": "disksweep",
+   "tool": "diskuse",
    "league": "tree",
    "threads": 20,
-   "command": "disksweep scan S1 --full --threads 20",
+   "command": "diskuse scan S1 --full --threads 20",
    "total": 731758592,
    "valid": true,
    "mean": 0.409705333,
@@ -79,10 +79,10 @@
    "failed_runs": 0
   },
   {
-   "tool": "disksweep",
+   "tool": "diskuse",
    "league": "tree",
    "threads": 40,
-   "command": "disksweep scan S1 --full --threads 40",
+   "command": "diskuse scan S1 --full --threads 40",
    "total": 731758592,
    "valid": true,
    "mean": 0.40825388900000004,
@@ -612,7 +612,7 @@
   }
  ],
  "memory": {
-  "disksweep": 8110080,
+  "diskuse": 8110080,
   "dua": 9617408,
   "gdu": 34914304,
   "dust": 127188992,

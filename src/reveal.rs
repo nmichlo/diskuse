@@ -58,7 +58,7 @@ impl Desktop {
 /// Starts `program` with `args`, no shell, its output discarded. Returns
 /// without waiting; a thread reaps it.
 pub fn spawn(program: &str, args: &[OsString]) -> io::Result<()> {
-    // the one place disksweep runs a program: `open` or `xdg-open`
+    // the one place diskuse runs a program: `open` or `xdg-open`
     #[allow(clippy::disallowed_methods)]
     let mut child = Command::new(program)
         .args(args)
