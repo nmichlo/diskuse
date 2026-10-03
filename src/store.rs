@@ -43,8 +43,8 @@ const RECLAIMABLE: u8 = 1 << 0;
 const STOPPED: u8 = 1 << 1;
 const HEADER_LEN: usize = 8;
 
-/// The directory saved scans live in. Only built from the environment, so
-/// the store cannot write anywhere else.
+/// The directory saved scans and picks live in, the only place the store
+/// writes.
 #[derive(Clone)]
 pub struct CacheDir(PathBuf);
 
@@ -62,6 +62,12 @@ impl CacheDir {
     /// The directory itself, which [`crate::update`] ignores changes in.
     pub(crate) fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// The cache dir at `dir`, as for a test. disksweep itself only uses
+    /// [`CacheDir::from_env`].
+    pub fn at(dir: PathBuf) -> Self {
+        Self(dir)
     }
 
     /// `$DISKSWEEP_CACHE_DIR` if set, else `~/Library/Caches/disksweep` on
@@ -87,8 +93,40 @@ impl CacheDir {
     /// Saves `tree`, the scan of `root`, over any earlier save of it. Readers
     /// see the old file or the new one, never half of one.
     pub fn save(&self, root: &Path, tree: &Tree, reclaimable: bool) -> io::Result<()> {
-        let (canonical, name) = key(root)?;
+        let (canonical, stem) = key(root)?;
         let bytes = encode(&canonical, tree, reclaimable);
+        self.write(&format!("{stem}.scan"), &bytes)
+    }
+
+    /// Saves the paths picked below `root` ([`crate::Browser`]), each
+    /// relative to it, over any earlier save of them.
+    pub fn save_picks(&self, root: &Path, picks: &[Vec<u8>]) -> io::Result<()> {
+        let (_, stem) = key(root)?;
+        // a name may hold any byte but NUL
+        let bytes: Vec<u8> = picks
+            .iter()
+            .flat_map(|p| [&p[..], b"\0"].concat())
+            .collect();
+        self.write(&format!("{stem}.picks"), &bytes)
+    }
+
+    /// The paths picked below `root`, as [`CacheDir::save_picks`] saved
+    /// them, or none.
+    pub fn load_picks(&self, root: &Path) -> io::Result<Vec<Vec<u8>>> {
+        let (_, stem) = key(root)?;
+        match std::fs::read(self.0.join(format!("{stem}.picks"))) {
+            Ok(bytes) => Ok((bytes.split(|&b| b == 0))
+                .filter(|p| !p.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Writes file `name` in the cache dir, over any earlier one. Readers
+    /// see the old file or the new one, never half of one.
+    fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         // owner-only, like the files: they list directory names. The store
         // may create its own cache dir.
         #[allow(clippy::disallowed_methods)]
@@ -96,7 +134,7 @@ impl CacheDir {
             .recursive(true)
             .mode(0o700)
             .create(&self.0)?;
-        let path = self.0.join(&name);
+        let path = self.0.join(name);
         let tmp = self.0.join(format!("{name}.{}.tmp", std::process::id()));
         // the store may write and rename its own files in the cache dir
         #[allow(clippy::disallowed_methods)]
@@ -105,7 +143,7 @@ impl CacheDir {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)
-            .and_then(|mut f| f.write_all(&bytes))
+            .and_then(|mut f| f.write_all(bytes))
             .and_then(|()| std::fs::rename(&tmp, &path));
         if saved.is_err() {
             // the disk is often full when disksweep runs, so leave no
@@ -119,8 +157,8 @@ impl CacheDir {
     /// The saved file of `root`, unchecked: see [`SavedFile::check`].
     /// `None` if there is none.
     pub fn read(&self, root: &Path) -> io::Result<Option<SavedFile>> {
-        let (canonical, name) = key(root)?;
-        let file = match File::open(self.0.join(name)) {
+        let (canonical, stem) = key(root)?;
+        let file = match File::open(self.0.join(format!("{stem}.scan"))) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
@@ -272,14 +310,14 @@ struct Body<'a> {
     largest: &'a [LargeFile],
 }
 
-/// The canonical root, as the scan follows a symlinked root, and its file
-/// name: `<volume id>-<FNV-1a of the canonical root>.scan`. The volume id
-/// tells apart disks mounted at the same path.
+/// The canonical root, as the scan follows a symlinked root, and the stem
+/// of its files' names: `<volume id>-<FNV-1a of the canonical root>`. The
+/// volume id tells apart disks mounted at the same path.
 fn key(root: &Path) -> io::Result<(PathBuf, String)> {
     let canonical = std::fs::canonicalize(root)?;
     let volume = sys::volume_id(&canonical)?;
     let hash = fnv1a(canonical.as_os_str().as_bytes());
-    Ok((canonical, format!("{volume:032x}-{hash:016x}.scan")))
+    Ok((canonical, format!("{volume:032x}-{hash:016x}")))
 }
 
 /// FNV-1a, 64 bit. std's hasher may change between Rust versions, which

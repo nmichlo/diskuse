@@ -44,10 +44,11 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-const HELP: &str = "arrows/hjkl move  r reveal  o open  s/S rescan  / filter  d denied  t top files  \
+const HELP: &str = "hjkl move  r reveal  o open  space pick  p picks  s/S rescan  / filter  t top  \
                     ? help  q quit";
 const PANEL_HELP: &str = "arrows/jk scroll  d close  ? help  q quit";
 const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
+const PICKS_HELP: &str = "arrows/jk move  r reveal  o open  space unpick  p close  ? help  q quit";
 
 /// The width of the bar of a row's share of its dir.
 const BAR: u64 = 10;
@@ -146,6 +147,18 @@ pub struct Browser {
     top: Option<Top>,
     /// Sizes when the first scan of the session was done.
     baseline: Option<Baseline>,
+    /// Paths picked, below the root, in the order picked. Saved with the
+    /// scan, so they outlive the session.
+    picks: Vec<Vec<u8>>,
+    /// The list of picks, while it is shown.
+    picking: Option<Picks>,
+}
+
+/// The cursor and first row drawn of the list of picks.
+#[derive(Default)]
+struct Picks {
+    cursor: usize,
+    offset: usize,
 }
 
 /// The sizes of every dir when the first scan of the session was done, so
@@ -352,7 +365,15 @@ impl Browser {
             panel: None,
             top: None,
             baseline: None,
+            picks: Vec::new(),
+            picking: None,
         };
+        if let Some(cache) = &b.env.cache {
+            match cache.load_picks(root) {
+                Ok(picks) => b.picks = picks,
+                Err(e) => b.message = Some(format!("cannot read picks: {e}")),
+            }
+        }
         if let Some(saved) = saved.filter(|s| s.reclaimable || !reclaimable) {
             b.show(saved.tree, Status::Saved { at: saved.modified });
         }
@@ -404,21 +425,12 @@ impl Browser {
         if d == 0 {
             return self.rescan_all();
         }
-        let tree = &view.tree;
-        let mut names = Vec::new();
-        let mut i = d;
-        while i != 0 {
-            let r = tree.record(i);
-            names.push(tree.name(r.name));
-            i = r.parent;
-        }
-        names.reverse();
-        let dir = names.join(&b'/');
+        let dir = below(&view.tree, d);
         let changes = Changes {
             rescan: vec![dir.clone().into()],
             ..Changes::default()
         };
-        let mut tree = tree.clone();
+        let mut tree = view.tree.clone();
         let opts = self.options();
         let (_, started) = mpsc::channel();
         let thread = thread::spawn(move || match tree.apply(&changes, &opts) {
@@ -554,6 +566,33 @@ impl Browser {
             }
             return ControlFlow::Continue(());
         }
+        if let Some(list) = &mut self.picking {
+            // the head takes a row
+            if let Some(at) = nav(
+                key.code,
+                list.cursor,
+                self.picks.len(),
+                page.saturating_sub(1),
+            ) {
+                list.cursor = at;
+            }
+            let at = self.picks.get(list.cursor).cloned();
+            match key.code {
+                KeyCode::Char(c @ ('r' | 'o')) => {
+                    let path = at.map(|p| self.below_root(&p));
+                    self.reveal(path, c == 'r', run);
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(p) = at {
+                        self.pick(p);
+                    }
+                }
+                KeyCode::Char('p') | KeyCode::Esc => self.picking = None,
+                KeyCode::Char('q') => return ControlFlow::Break(()),
+                _ => {}
+            }
+            return ControlFlow::Continue(());
+        }
         if let Some(top) = &mut self.top {
             let n = (self.view.as_ref()).map_or(0, |v| top.paths(v).count());
             if let Some(at) = nav(key.code, top.cursor, n, page) {
@@ -593,6 +632,12 @@ impl Browser {
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Char('d') => self.panel = Some(0),
             KeyCode::Char('t') => self.top = Some(Top::default()),
+            KeyCode::Char(' ') => {
+                if let Some(p) = self.cursor_below() {
+                    self.pick(p);
+                }
+            }
+            KeyCode::Char('p') => self.picking = Some(Picks::default()),
             KeyCode::Char('q') | KeyCode::Esc => return ControlFlow::Break(()),
             _ => {}
         }
@@ -631,6 +676,16 @@ impl Browser {
             match key {
                 Some(_) => top.cursor = moved(top.cursor, n),
                 None if top.offset + dy < n => top.cursor = top.offset + dy,
+                None => {}
+            }
+            return;
+        }
+        if let Some(list) = &mut self.picking {
+            let n = self.picks.len();
+            match key {
+                Some(_) => list.cursor = moved(list.cursor, n),
+                // the head takes the first row
+                None if dy > 0 && list.offset + dy - 1 < n => list.cursor = list.offset + dy - 1,
                 None => {}
             }
             return;
@@ -723,6 +778,11 @@ impl Browser {
             top_files(buf, body, view, top, styles);
             return;
         }
+        if let Some(list) = &mut self.picking {
+            let root = self.root.as_os_str().as_bytes();
+            picks(buf, body, view, root, &self.picks, list, styles);
+            return;
+        }
         let height = body.height.into();
         self.offset = scroll(self.offset, self.cursor, height);
         let marks = [Some(styles.parent), Some(styles.selected), None];
@@ -799,10 +859,17 @@ impl Browser {
         let view = self.view.as_ref().unwrap();
         let styles = Styles::new(self.env.color);
         let total = view.totals.size[d as usize];
+        let dir = below(&view.tree, d);
         let lines = (area.y..area.bottom()).zip(rows.iter().enumerate().skip(offset));
         for (y, (i, row)) in lines {
             let bar = area.width >= BAR_COLUMN;
-            let line = line(view, &self.files[&d], row, total, bar, styles);
+            let files = &self.files[&d];
+            let picked = !self.picks.is_empty() && {
+                let mut path = dir.clone();
+                join_below(&mut path, name(view, files, row.item));
+                self.picks.contains(&path)
+            };
+            let line = line(view, files, row, total, bar, picked, styles);
             buf.set_line(area.x, y, &line, area.width);
             if let Some((_, style)) = mark.filter(|&(at, _)| at == i) {
                 buf.set_style(
@@ -1054,6 +1121,40 @@ impl Browser {
         self.preview_offset = 0;
     }
 
+    /// Picks `path`, below the root, or unpicks it if picked, and saves
+    /// the picks.
+    fn pick(&mut self, path: Vec<u8>) {
+        match self.picks.iter().position(|p| *p == path) {
+            Some(at) => {
+                self.picks.remove(at);
+            }
+            None => self.picks.push(path),
+        }
+        if let Some(list) = &mut self.picking {
+            list.cursor = list.cursor.min(self.picks.len().saturating_sub(1));
+        }
+        if let Some(cache) = &self.env.cache
+            && let Err(e) = cache.save_picks(&self.root, &self.picks)
+        {
+            self.message = Some(format!("warning: picks not saved: {e}"));
+        }
+    }
+
+    /// The path of the row at the cursor, below the root.
+    fn cursor_below(&self) -> Option<Vec<u8>> {
+        let (view, (_, name)) = (self.view.as_ref()?, self.at_cursor()?);
+        let mut path = below(&view.tree, self.dir());
+        join_below(&mut path, name);
+        Some(path)
+    }
+
+    /// `path`, below the root, as a path from where disksweep runs.
+    fn below_root(&self, path: &[u8]) -> Vec<u8> {
+        let mut full = self.root.as_os_str().as_bytes().to_vec();
+        join(&mut full, path);
+        full
+    }
+
     /// The path of the row at the cursor.
     fn cursor_path(&self) -> Option<Vec<u8>> {
         let (view, (_, name)) = (self.view.as_ref()?, self.at_cursor()?);
@@ -1139,6 +1240,7 @@ impl Browser {
             Some(message) => message.clone(),
             None if self.panel.is_some() => PANEL_HELP.into(),
             None if self.top.is_some() => TOP_HELP.into(),
+            None if self.picking.is_some() => PICKS_HELP.into(),
             None if self.typing => format!("/{}  enter keep  esc clear", self.filter),
             None if !self.filter.is_empty() => format!("/{}  esc clear", self.filter),
             None => HELP.into(),
@@ -1202,6 +1304,7 @@ fn line(
     row: &Row,
     total: u64,
     bar: bool,
+    picked: bool,
     styles: &Styles,
 ) -> Line<'static> {
     let label = String::from_utf8_lossy(name(view, files, row.item)).into_owned();
@@ -1242,6 +1345,9 @@ fn line(
             }
         }
         Item::File(_) => spans.push(Span::raw(label)),
+    }
+    if picked {
+        spans.push(Span::styled(" *", styles.picked));
     }
     Line::from(spans)
 }
@@ -1391,6 +1497,91 @@ impl Clicks {
 /// that row `at` is among the `height` drawn.
 fn scroll(offset: usize, at: usize, height: usize) -> usize {
     offset.min(at).max((at + 1).saturating_sub(height))
+}
+
+/// The path of dir `d` below the root: its names joined by `/`, empty
+/// for the root.
+fn below(tree: &Tree, d: u32) -> Vec<u8> {
+    let mut names = Vec::new();
+    let mut i = d;
+    while i != 0 {
+        let r = tree.record(i);
+        names.push(tree.name(r.name));
+        i = r.parent;
+    }
+    names.reverse();
+    names.join(&b'/')
+}
+
+/// Appends `name` to `path`, a path below the root, which may be empty.
+fn join_below(path: &mut Vec<u8>, name: &[u8]) {
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+}
+
+/// The record id of the dir at `path` below the root of `view`, if it is
+/// in the tree.
+fn find(view: &View, path: &[u8]) -> Option<u32> {
+    let mut d = 0;
+    for name in path.split(|&b| b == b'/').filter(|n| !n.is_empty()) {
+        let named = |&&k: &&u32| view.tree.name(view.tree.record(k).name) == name;
+        d = *view.index.children(d).iter().find(named)?;
+    }
+    Some(d)
+}
+
+/// Draws the picks, below the root `root`, from `list`'s offset, the one
+/// at its cursor selected, after a head with their count and total. A
+/// dir's size is from the tree, a file's from one `lstat`, and either is
+/// `gone` if not found.
+fn picks(
+    buf: &mut Buffer,
+    area: Rect,
+    view: &View,
+    root: &[u8],
+    picks: &[Vec<u8>],
+    list: &mut Picks,
+    styles: &Styles,
+) {
+    let size = |path: &[u8]| match find(view, path) {
+        Some(d) => Some(view.totals.size[d as usize]),
+        None => {
+            let mut full = root.to_vec();
+            join(&mut full, path);
+            sys::allocated(Path::new(OsStr::from_bytes(&full)))
+        }
+    };
+    let sizes: Vec<Option<u64>> = picks.iter().map(|p| size(p)).collect();
+    let total: u64 = sizes.iter().flatten().sum();
+    let head = match picks.len() {
+        0 => "nothing picked: space picks the item at the cursor".into(),
+        n => format!("{n} picked, {} in all:", format_size(total)),
+    };
+    buf.set_stringn(area.x, area.y, head, area.width.into(), Style::new());
+    let height = usize::from(area.height.saturating_sub(1));
+    list.offset = scroll(list.offset, list.cursor, height);
+    let rows = picks.iter().zip(&sizes).enumerate().skip(list.offset);
+    for (y, (i, (path, size))) in (area.y + 1..area.bottom()).zip(rows) {
+        let size = match size {
+            Some(n) => Span::styled(format!("{:>10}", format_size(*n)), styles.size(*n)),
+            None => Span::styled(format!("{:>10}", "gone"), styles.dim),
+        };
+        let line = Line::from_iter([
+            size,
+            Span::raw(format!("  {}", String::from_utf8_lossy(path))),
+        ]);
+        buf.set_line(area.x, y, &line, area.width);
+        if i == list.cursor {
+            let row = Rect {
+                y,
+                height: 1,
+                ..area
+            };
+            buf.set_style(row, styles.selected);
+        }
+    }
 }
 
 /// `+1.5 GiB` or `-4.0 KiB`.

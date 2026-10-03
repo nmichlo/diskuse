@@ -19,6 +19,8 @@ pub(crate) struct Styles {
     pub selected: Style,
     /// The current dir's row in the parent column.
     pub parent: Style,
+    /// The `*` after a picked item's name.
+    pub picked: Style,
     /// How much a dir grew or shrank since the session started.
     pub grew: Style,
     pub shrank: Style,
@@ -43,6 +45,7 @@ const COLOR: Styles = Styles {
         .bg(Color::Blue)
         .add_modifier(Modifier::BOLD),
     parent: Style::new().fg(Color::White).bg(Color::DarkGray),
+    picked: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     grew: Style::new().fg(Color::Magenta),
     shrank: Style::new().fg(Color::Cyan),
 };
@@ -55,6 +58,7 @@ const PLAIN: Styles = Styles {
     selected: Style::new().add_modifier(Modifier::REVERSED),
     // dirs are bold already
     parent: Style::new().add_modifier(Modifier::UNDERLINED),
+    picked: Style::new().add_modifier(Modifier::BOLD),
     grew: Style::new(),
     shrank: Style::new(),
 };

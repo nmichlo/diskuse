@@ -173,6 +173,8 @@ macOS records no changes for, like a network share, is followed the same way.
 | Left, Backspace, `h` | Go to the parent directory, not above `<path>`             |
 | `r`                  | Reveal the selected item in Finder or the file manager     |
 | `o`                  | Open the selected item                                     |
+| Space                | Pick or unpick the selected item, marked `*`               |
+| `p`                  | List the picks, with their sizes now and a total           |
 | `s`                  | Rescan the selected directory (at a file, the current one) |
 | `S`                  | Rescan all of `<path>`                                     |
 | `/`                  | Filter the current column by text; Enter keeps, Esc clears |
@@ -185,7 +187,19 @@ macOS records no changes for, like a network share, is followed the same way.
 | Wheel                | Move the cursor, or scroll the parent or preview column    |
 
 The move keys, the mouse and `?` work the same on the volume list, the `d`
-list and the `t` list. disksweep takes the mouse, so to select text on screen,
+list, the `t` list and the `p` list.
+
+Picks collect what to delete by hand later, since disksweep deletes
+nothing. In the `p` list, `r` and `o` reveal and open a pick, and Space
+unpicks it. Picks are saved per scanned path, next to the saved scan, so
+they are there next time; one deleted since shows as `gone`:
+
+```text
+3 picked, 41.5 GiB in all:
+  38.2 GiB  Library/Developer/Xcode/DerivedData
+   3.3 GiB  Downloads/old.dmg
+      gone  Movies/export.mov
+``` disksweep takes the mouse, so to select text on screen,
 hold Shift (Option in Terminal and iTerm) while dragging.
 
 Reveal and open run `open -R` and `open` on macOS, and `xdg-open` on Linux,
@@ -302,8 +316,8 @@ Every `scan` saves its result, which `show` reads. Saved scans live in:
 | Linux | `$XDG_CACHE_HOME/disksweep`, else `~/.cache/disksweep`       |
 
 `DISKSWEEP_CACHE_DIR` overrides both. There is one file per scanned path (per
-volume and real path). The files contain directory names and the names of the
-largest files, so they are created with mode 0600, and the directory, if
+volume and real path), and one of its picks if any. The files contain
+directory names, the names of the largest files and picked paths, so they are created with mode 0600, and the directory, if
 missing, with mode 0700. To clear the cache, delete the directory. This cache
 directory is the only place disksweep ever writes.
 

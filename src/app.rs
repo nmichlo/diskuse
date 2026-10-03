@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime};
 const TICK: Duration = Duration::from_secs(1);
 
 /// Every key, and what it does, as the help lists them.
-const KEYS: [(&str, &str); 17] = [
+const KEYS: [(&str, &str); 19] = [
     ("Up Down k j", "move"),
     ("PageUp PageDown", "move by a screen"),
     ("Home End g G", "go to the first or the last row"),
@@ -38,6 +38,11 @@ const KEYS: [(&str, &str); 17] = [
     ("Left Backspace h", "go to the parent directory"),
     ("r", "reveal in Finder or the file manager"),
     ("o", "open"),
+    (
+        "space",
+        "pick or unpick the selected item, to delete by hand later",
+    ),
+    ("p", "list the picks, with their sizes now; space unpicks"),
     ("s", "rescan the selected directory"),
     ("S", "rescan everything"),
     (

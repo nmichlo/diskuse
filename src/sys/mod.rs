@@ -241,6 +241,15 @@ pub fn map(file: &File) -> io::Result<memmap2::Mmap> {
     unsafe { memmap2::Mmap::map(file) }
 }
 
+/// The allocated bytes of `path` by one `lstat`, or `None` if it cannot be
+/// read, as when it is gone.
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_cast))]
+pub fn allocated(path: &Path) -> Option<u64> {
+    rustix::fs::lstat(path)
+        .ok()
+        .map(|st| st.st_blocks as u64 * 512)
+}
+
 /// Whether `path` is still there, by one `lstat`, which never follows a
 /// final symlink. Only "no such file" counts as gone; any other error
 /// cannot tell, so counts as there.

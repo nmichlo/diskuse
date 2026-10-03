@@ -6,7 +6,7 @@ mod common;
 
 use common::{Fixture, file, fixture, kib};
 use disksweep::reveal::Desktop;
-use disksweep::{App, Browser, Env, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions};
+use disksweep::{App, Browser, CacheDir, Env, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
@@ -32,7 +32,9 @@ const COLUMNS: [(usize, usize); 3] = [(0, 33), (34, 32), (67, 33)];
 /// A wider terminal, for rows too long for 100 columns.
 const WIDE: usize = 130;
 const WIDE_COLUMNS: [(usize, usize); 3] = [(0, 43), (44, 42), (87, 43)];
-const HELP: &str = "arrows/hjkl move  r reveal  o open  s/S rescan  / filter  d denied  t top files  ? help  q quit";
+const HELP: &str =
+    "hjkl move  r reveal  o open  space pick  p picks  s/S rescan  / filter  t top  ? help  q quit";
+const PICKS_HELP: &str = "arrows/jk move  r reveal  o open  space unpick  p close  ? help  q quit";
 const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
 const VOLUMES_HELP: &str = "arrows/jk move  enter scan  ? help  q quit";
 const GIB: u64 = 1 << 30;
@@ -156,6 +158,8 @@ struct Row {
     /// Bytes a dir grew by since the session started, shrank by if
     /// negative.
     delta: i64,
+    /// Marked `*` as picked.
+    picked: bool,
 }
 
 impl Row {
@@ -167,6 +171,14 @@ impl Row {
             name: name.into(),
             kind,
             delta: 0,
+            picked: false,
+        }
+    }
+
+    fn picked(self) -> Self {
+        Row {
+            picked: true,
+            ..self
         }
     }
 
@@ -218,6 +230,13 @@ impl Row {
                 Span::styled(name + "/", bold()),
                 Span::styled(format!("  [{label}]"), look.dim()),
             ]),
+        }
+        if self.picked {
+            let style = match look.color {
+                true => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                false => bold(),
+            };
+            spans.push(Span::styled(" *", style));
         }
         if self.delta != 0 {
             let color = match self.delta > 0 {
@@ -786,6 +805,8 @@ fn shows_every_key_on_question_mark() {
         "Left Backspace h  go to the parent directory",
         "r                 reveal in Finder or the file manager",
         "o                 open",
+        "space             pick or unpick the selected item, to delete by hand later",
+        "p                 list the picks, with their sizes now; space unpicks",
         "s                 rescan the selected directory",
         "S                 rescan everything",
         "/                 filter the column by text; Enter keeps the filter, Esc clears it",
@@ -1484,4 +1505,80 @@ fn rescans_the_selected_dir_or_all() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(draw(&mut b, now()), shown(8192, ""));
+}
+
+/// ```text
+/// root/
+///   a/f    8192
+///   g      4096
+/// ```
+///
+/// `space` picks the item at the cursor, marked `*`, and `p` lists the
+/// picks with their sizes now. They are saved, so a later browser has
+/// them, and one deleted since shows as gone.
+#[test]
+fn picks_items_and_lists_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("a")).unwrap();
+    file(&root.join("a/f"), 8192);
+    file(&root.join("g"), 4096);
+    let cache = tempfile::tempdir().unwrap();
+    let browse = || {
+        let env = Env {
+            cache: Some(CacheDir::at(cache.path().into())),
+            ..env(Desktop::None)
+        };
+        let mut b = Browser::new(root, "/picks", env, None, None, false);
+        b.scan();
+        while b.poll(now()) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        b
+    };
+    let d = common::own_bytes(root);
+    let (a, total) = (8192 + d, 8192 + 4096 + 2 * d);
+    let title = format!("/picks  {}{SCANNED}", kib(total));
+    let mut b = browse();
+    press(
+        &mut b,
+        &[KeyCode::Char(' '), KeyCode::Down, KeyCode::Char(' ')],
+    );
+    let rows = [
+        Row::dir(a, total, "a").picked(),
+        Row::file(4096, total, "g").picked(),
+    ];
+    let expected = screen(&title, [&[], &rows, &[]], None, 1, HELP);
+    assert_eq!(draw(&mut b, now()), expected);
+
+    let listed = |title: &str, head: &str, picks: &[(Option<u64>, &str)], selected: usize| {
+        let mut lines = text(&[title, head], PICKS_HELP);
+        for (line, &(bytes, path)) in lines[2..].iter_mut().zip(picks) {
+            let size = match bytes {
+                Some(bytes) => {
+                    let size = size(bytes);
+                    Span::styled(format!("{size:>10}"), COLOR.size(&size))
+                }
+                None => Span::styled(format!("{:>10}", "gone"), COLOR.dim()),
+            };
+            *line = Line::from_iter([size, Span::raw(format!("  {path}"))]);
+        }
+        plain(&lines, Some(2 + selected))
+    };
+    press(&mut b, &[KeyCode::Char('p')]);
+    let head = format!("2 picked, {} in all:", kib(a + 4096));
+    let both = [(Some(a), "a"), (Some(4096), "g")];
+    assert_eq!(draw(&mut b, now()), listed(&title, &head, &both, 0));
+    drop(b);
+
+    fs::remove_file(root.join("g")).unwrap();
+    let mut b = browse();
+    press(&mut b, &[KeyCode::Char('p'), KeyCode::Down]);
+    let head = format!("2 picked, {} in all:", kib(a));
+    let gone = [(Some(a), "a"), (None, "g")];
+    let title = format!("/picks  {}{SCANNED}", kib(a + d));
+    assert_eq!(draw(&mut b, now()), listed(&title, &head, &gone, 1));
+    press(&mut b, &[KeyCode::Char(' ')]);
+    let head = format!("1 picked, {} in all:", kib(a));
+    assert_eq!(draw(&mut b, now()), listed(&title, &head, &gone[..1], 0));
 }
