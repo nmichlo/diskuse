@@ -70,7 +70,7 @@ impl Look {
         }
     }
 
-    /// A size, by its unit: like OmniDiskUseer, red from 1 GiB, yellow
+    /// A size, by its unit: like OmniDiskSweeper, red from 1 GiB, yellow
     /// from 1 MiB, green from 1 KiB, dim below.
     fn size(self, text: &str) -> Style {
         match text.rsplit(' ').next().unwrap() {
