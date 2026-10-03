@@ -7,8 +7,7 @@ name: lint
 on:
   pull_request:
   push:
-    # stacked branches are pushed without PRs, so they are checked on push
-    branches: [main, "nathan/diskuse/**"]
+    branches: [main]
 
 # least privilege: jobs that need more declare it themselves, and a job-level
 # `permissions:` replaces this one rather than adding to it.
