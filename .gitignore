@@ -2,3 +2,6 @@
 *.whl
 dist/
 __pycache__/
+
+# the extension uv builds in place
+*.so
