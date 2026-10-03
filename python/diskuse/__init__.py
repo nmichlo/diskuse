@@ -1,11 +1,11 @@
 """A fast, read-only disk usage scanner.
 
-    tree = diskuse.scan("~/src")
-    tree.root.size                      # allocated bytes, like du
-    for d in tree.root.children():      # largest first
-        print(d.size, d.name)
-    tree.largest_files(10)              # [(Path, bytes), ...]
-    tree.to_arrow()                     # every folder as a row (needs pyarrow)
+tree = diskuse.scan("~/src")
+tree.root.size                      # allocated bytes, like du
+for d in tree.root.children():      # largest first
+    print(d.size, d.name)
+tree.largest_files(10)              # [(Path, bytes), ...]
+tree.to_arrow()                     # every folder as a row (needs pyarrow)
 """
 
 import os

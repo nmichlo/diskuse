@@ -6,10 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import diskuse
 import pyarrow as pa
 import pytest
-
-import diskuse
 
 
 def blocks(path):
@@ -111,13 +110,17 @@ def test_to_arrow_has_a_row_per_folder(root):
     ]
     key = lambda r: r["name"]
     assert sorted(got, key=key) == sorted(rows(t.root, None), key=key)
-    assert table.schema.field("name").type == pa.dictionary(pa.uint32(), pa.large_string())
+    assert table.schema.field("name").type == pa.dictionary(
+        pa.uint32(), pa.large_string()
+    )
     assert table.column("id").to_pylist() == list(range(len(table)))
 
 
 def test_the_console_script_is_the_cli(root):
     script = Path(sys.executable).parent / "diskuse"
-    got = subprocess.run([script, "scan", root], capture_output=True, text=True, check=True)
+    got = subprocess.run(
+        [script, "scan", root], capture_output=True, text=True, check=True
+    )
     want = subprocess.run(
         ["cargo", "run", "-q", "--bin", "diskuse", "--", "scan", root],
         capture_output=True,
