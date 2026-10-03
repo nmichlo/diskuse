@@ -1,17 +1,20 @@
-//! Keeping a tree up to date from the OS's record of changes, so a saved
-//! scan is brought up to date instead of scanned again, and an open browser
-//! follows changes live. One mechanism serves both: a stream from the
-//! tree's event id first replays the changes recorded since, then reports
-//! live ones, and [`Tree::apply`] lists the dirs they touched again.
+//! Following changes on disk while the browser is open. On macOS an
+//! FSEvents stream from the event id taken when the scan started reports
+//! every change below the root, the ones made while the scan ran first,
+//! and [`Tree::apply`] lists the dirs they touched again.
 //!
-//! macOS only. Elsewhere [`Watch::start`] is always `None`, so every scan
-//! is a full one, unless it finishes a stopped one, and an open browser
-//! follows only the dirs it shows ([`DirWatch`]).
+//! A saved scan is never brought up to date this way: Apple calls the
+//! recorded history "advisory rather than a definitive list of all changes
+//! to the volume", as another OS or another Mac can change a disk without
+//! it. So every launch scans afresh, and only changes seen live, which the
+//! kernel reports and flags when it drops any, are applied.
+//!
+//! Elsewhere [`Watch::start`] is always `None`, and an open browser follows
+//! only the dirs it shows ([`DirWatch`]).
 
-use crate::scan::ScanOptions;
 use crate::store::CacheDir;
-use crate::sys::{self, Event, What};
-use crate::tree::{Progress, ReadTree, Record, Tree};
+use crate::sys::{self, Event};
+use crate::tree::{ReadTree, Record, Tree};
 use rustix::fd::AsFd;
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -20,9 +23,10 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime};
 
-/// How long the stream must stay quiet after the replay ends before the
-/// replay is trusted. FSEvents sends the changes of the moments before the
-/// stream started again, just after the replay ends.
+/// How long the stream must stay quiet after the replay of the changes
+/// made during the scan ends before they are applied. FSEvents sends the
+/// changes of the moments before the stream started again, just after the
+/// replay ends.
 const QUIET: Duration = Duration::from_millis(200);
 /// The longest wait for that quiet after the replay ends, as a busy disk is
 /// never quiet. Later changes are applied with the live ones.
@@ -36,40 +40,6 @@ const POLL: Duration = Duration::from_secs(2);
 /// listing took, so it takes at most a tenth of a core.
 const BACKOFF: u32 = 10;
 
-/// Brings `tree`, an earlier scan of `root`, up to date from the changes
-/// the OS recorded since, listing again only the dirs they touched, and
-/// finishes it if it was stopped, scanning only what it lacks. Changes in
-/// `cache` are ignored. `None` if only a full scan is right: when the OS
-/// recorded the changes, but no longer has them all, or keeps no record of
-/// changes and the tree is finished. So on Linux, a stopped scan is
-/// finished, and the dirs it listed are left as they were.
-pub fn update(
-    root: &Path,
-    tree: Tree,
-    opts: &ScanOptions,
-    cache: Option<&CacheDir>,
-) -> Option<Tree> {
-    update_live(root, tree, opts, cache, |_| {})
-}
-
-/// [`update`], handing `progress` a [`Progress`] of the scan of what is
-/// new or missing, if any.
-pub(crate) fn update_live(
-    root: &Path,
-    mut tree: Tree,
-    opts: &ScanOptions,
-    cache: Option<&CacheDir>,
-    progress: impl FnOnce(Progress),
-) -> Option<Tree> {
-    let changes = match tree.since.store {
-        0 if tree.unfinished(&tree.child_index()).next().is_some() => Changes::default(),
-        0 => return None,
-        _ => Watch::start(root, &tree, cache)?.replay()?,
-    };
-    tree.apply(&changes, opts, progress)?;
-    Some(tree)
-}
-
 /// Changes below a root, as paths relative to it: names joined by `/`,
 /// `""` for the root itself. Or as dirs of a tree of it.
 #[derive(Debug, Default)]
@@ -80,8 +50,6 @@ pub(crate) struct Changes {
     pub rescan: Vec<Box<[u8]>>,
     /// Dirs to list again, by record id in the tree they are for.
     pub dirs: Vec<u32>,
-    /// The latest event id seen.
-    pub id: u64,
 }
 
 impl Changes {
@@ -99,13 +67,14 @@ pub(crate) enum Poll {
     Changes(Changes),
 }
 
-/// A stream of the changes below a root, from where a tree of it stands.
+/// A stream of the changes below a root, from when a scan of it started.
 pub(crate) struct Watch {
     stream: sys::Stream,
     rx: Receiver<Vec<Event>>,
     /// The real root and cache dir, without a trailing `/`, so `/` is `""`.
     root: Vec<u8>,
     cache: Option<Vec<u8>>,
+    firmlinks: Firmlinks,
     pending: Changes,
     lost: bool,
     started: Instant,
@@ -120,23 +89,22 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
-    /// Watches `root` from where `tree`, a scan of it, stands, ignoring
-    /// changes in `cache`. `None` if the OS's record of changes does not
-    /// reach back there.
+    /// Watches `root` from when `tree`, a scan of it, started, ignoring
+    /// changes in `cache`. `None` where the OS keeps no record of changes
+    /// ([`sys::records_changes`]).
     pub fn start(root: &Path, tree: &Tree, cache: Option<&CacheDir>) -> Option<Self> {
-        if tree.since.id == 0 {
+        if tree.since == 0 {
             return None;
         }
         // event paths are real paths
         let real = std::fs::canonicalize(root).ok()?;
         let dev = sys::dir_stat(sys::open_root(&real).ok()?.as_fd()).ok()?.dev;
-        // the record was purged, erased or wrapped since
-        if tree.since.store == 0 || sys::event_store(dev) != tree.since.store {
+        if !sys::records_changes(dev) {
             return None;
         }
         let (tx, rx) = mpsc::channel();
         let path = CString::new(real.as_os_str().as_bytes()).ok()?;
-        let stream = sys::watch(&path, tree.since.id, tx)?;
+        let stream = sys::watch(&path, tree.since, tx)?;
         let trim = |path: &Path| {
             let path = path.as_os_str().as_bytes();
             path.strip_suffix(b"/").unwrap_or(path).to_vec()
@@ -149,6 +117,7 @@ impl Watch {
             rx,
             root: trim(&real),
             cache: cache.as_deref().map(trim),
+            firmlinks: Firmlinks(sys::firmlinks()),
             pending: Changes::default(),
             lost: false,
             started: now,
@@ -194,39 +163,20 @@ impl Watch {
         Poll::Changes(std::mem::take(&mut self.pending))
     }
 
-    /// [`Watch::poll`], waiting until the replay ends and the stream goes
-    /// quiet. `None` if only a full scan is right.
-    pub fn replay(&mut self) -> Option<Changes> {
-        loop {
-            match self.poll() {
-                Poll::Wait => {
-                    // wakes for the next batch, or soon after the quiet
-                    // time may be up
-                    if let Ok(batch) = self.rx.recv_timeout(QUIET / 4) {
-                        self.add(batch);
-                    }
-                }
-                Poll::Lost => return None,
-                Poll::Changes(changes) => return Some(changes),
-            }
-        }
-    }
-
     fn add(&mut self, batch: Vec<Event>) {
         self.last = Instant::now();
         for e in batch {
-            self.pending.id = self.pending.id.max(e.id);
-            match e.what {
-                What::Lost => self.lost = true,
-                What::HistoryDone => self.replayed = self.replayed.or(Some(self.last)),
-                What::Changed(path) => {
+            match e {
+                Event::Lost => self.lost = true,
+                Event::HistoryDone => self.replayed = self.replayed.or(Some(self.last)),
+                Event::Changed(path) => {
                     if let Some(path) = self.below(&path) {
-                        self.pending.changed.push(path.into());
+                        self.pending.changed.push(path);
                     }
                 }
-                What::Rescan(path) => {
+                Event::Rescan(path) => {
                     if let Some(path) = self.below(&path) {
-                        self.pending.rescan.push(path.into());
+                        self.pending.rescan.push(path);
                     }
                 }
             }
@@ -234,19 +184,47 @@ impl Watch {
     }
 
     /// `path` relative to the root, unless it is outside it or in the cache
-    /// dir.
-    fn below<'a>(&self, path: &'a [u8]) -> Option<&'a [u8]> {
+    /// dir. Tried in both forms [`Firmlinks::forms`] gives, firmlink first.
+    fn below(&self, path: &[u8]) -> Option<Box<[u8]>> {
         let path = path.strip_suffix(b"/").unwrap_or(path);
-        let inside = |dir: &[u8]| {
-            path == dir || (path.strip_prefix(dir)).is_some_and(|rest| rest.starts_with(b"/"))
-        };
-        if self.cache.as_deref().is_some_and(inside) {
+        let forms = self.firmlinks.forms(path);
+        if let Some(cache) = &self.cache
+            && forms.iter().any(|p| inside(p, cache))
+        {
             return None;
         }
-        if path == self.root {
-            return Some(b"");
-        }
-        path.strip_prefix(&self.root[..])?.strip_prefix(b"/")
+        forms.iter().find_map(|p| match p[..] == self.root {
+            true => Some(Box::default()),
+            false => Some(p.strip_prefix(&self.root[..])?.strip_prefix(b"/")?.into()),
+        })
+    }
+}
+
+/// Whether `path` is `dir` or below it.
+fn inside(path: &[u8], dir: &[u8]) -> bool {
+    path == dir || (path.strip_prefix(dir)).is_some_and(|rest| rest.starts_with(b"/"))
+}
+
+/// The macOS firmlinks, `(firmlink, its target)`, such as `/Users` and
+/// `/System/Volumes/Data/Users`: one dir seen at two paths. FSEvents reports
+/// a change below one at the firmlink's path, even to a watch of the
+/// target's, so a root below `/System/Volumes/Data` needs the target's form
+/// and `/` the firmlink's.
+struct Firmlinks(Vec<sys::Firmlink>);
+
+impl Firmlinks {
+    /// `path` in firmlink form, then in target form. Both are `path` if no
+    /// firmlink leads to it.
+    fn forms(&self, path: &[u8]) -> [Vec<u8>; 2] {
+        let swap = |from: &[u8], to: &[u8]| {
+            (inside(path, from)).then(|| [to, &path[from.len()..]].concat())
+        };
+        let link = self.0.iter().find_map(|(l, t)| swap(t, l));
+        let target = self.0.iter().find_map(|(l, t)| swap(l, t));
+        [
+            link.unwrap_or_else(|| path.to_vec()),
+            target.unwrap_or_else(|| path.to_vec()),
+        ]
     }
 }
 

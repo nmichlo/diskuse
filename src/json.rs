@@ -8,7 +8,7 @@ use std::fmt::Write;
 /// The root and `depth` levels of subdirectories below it, each level
 /// ordered like [`crate::report`]. `reclaimable` adds `reclaimable` sizes,
 /// and `top` a `largest_files` list to the root. The root of a tree a
-/// stopped scan left unfinished has `incomplete`.
+/// stopped scan has `incomplete`.
 pub fn json(tree: &impl ReadTree, reclaimable: bool, depth: usize, top: Option<usize>) -> String {
     let totals = tree.totals();
     let index = tree.child_index();
@@ -49,7 +49,7 @@ pub fn json(tree: &impl ReadTree, reclaimable: bool, depth: usize, top: Option<u
 
     let mut out = String::new();
     node(&mut out, 0);
-    if tree.unfinished(&index).next().is_some() {
+    if tree.stopped() {
         out.push_str(",\"incomplete\":true");
     }
     // one iterator of unvisited children per open level: a loop, not

@@ -29,4 +29,3 @@ pub use scan::{Reader, ScanError, ScanOptions, Stop, scan, scan_live};
 pub use store::{CacheDir, Saved, SavedFile, SavedTree};
 pub use tree::{ChildIndex, LARGEST, LargeFile, Progress, ReadTree, Record, Totals, Tree};
 pub use volumes::{Mount, mounts};
-pub use watch::update;

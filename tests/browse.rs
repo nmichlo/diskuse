@@ -21,7 +21,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 const WIDTH: usize = 100;
@@ -1213,10 +1213,11 @@ fn shows_within(b: &mut Browser, expected: &Buffer, within: Duration) {
     }
 }
 
-/// `root/a/` with `keep` (4096) and `gone` (8192), browsed from a saved
-/// scan brought up to date, or on Linux scanned again, then changed while
-/// shown. Each change shows `within`. `inotify` is for [`Env::inotify`].
-fn follows_changes(inotify: bool, within: Duration) {
+/// `root/a/` with `keep` (4096) and `gone` (8192), browsed over a saved
+/// scan, so scanned again, then changed while shown. Each change shows
+/// `within`. `inotify` is for [`Env::inotify`]. `at` gives the path the
+/// browser is given for the dir.
+fn follows_changes(inotify: bool, within: Duration, at: fn(&Path) -> PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir(root.join("a")).unwrap();
@@ -1244,7 +1245,7 @@ fn follows_changes(inotify: bool, within: Duration) {
         inotify,
         ..env(Desktop::None)
     };
-    let mut b = Browser::new(root, "/live", env, Some(saved), None, false);
+    let mut b = Browser::new(&at(root), "/live", env, Some(saved), None, false);
     b.scan();
     while b.poll(now()) {
         std::thread::sleep(Duration::from_millis(1));
@@ -1274,14 +1275,26 @@ fn follows_changes(inotify: bool, within: Duration) {
 /// a second.
 #[test]
 fn follows_changes_on_disk() {
-    follows_changes(true, Duration::from_secs(3));
+    follows_changes(true, Duration::from_secs(3), Path::to_path_buf);
+}
+
+/// Below `/System/Volumes/Data`, where FSEvents reports changes at their
+/// firmlinked path, such as `/private/var/...` for a temp dir.
+#[cfg(target_os = "macos")]
+#[test]
+fn follows_changes_below_the_data_volume() {
+    let data = |root: &Path| {
+        let real = fs::canonicalize(root).unwrap();
+        Path::new("/System/Volumes/Data").join(real.strip_prefix("/").unwrap())
+    };
+    follows_changes(true, Duration::from_secs(3), data);
 }
 
 /// Without inotify, as on NFS, the dirs shown are listed again every 2 s.
 #[cfg(target_os = "linux")]
 #[test]
 fn follows_changes_on_a_timer_without_inotify() {
-    follows_changes(false, Duration::from_secs(3));
+    follows_changes(false, Duration::from_secs(3), Path::to_path_buf);
 }
 
 /// The dirs below `root`, of `dirs`, that an inotify watch of this process
@@ -1338,9 +1351,10 @@ fn watches_only_the_dirs_shown() {
 /// ```
 ///
 /// scanned with a stop at once, so the saved scan has the root alone. The
-/// browser finishes it, saying how many dirs are left meanwhile.
+/// browser shows it, saying it is incomplete and being scanned again, then
+/// the fresh scan.
 #[test]
-fn finishes_a_stopped_scan() {
+fn rescans_over_a_stopped_saved_scan() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let names = ["x0", "x1", "x2", "x3", "x4"];
@@ -1367,7 +1381,10 @@ fn finishes_a_stopped_scan() {
     );
     b.scan();
     let d = common::own_bytes(root);
-    let title = format!("/stopped  resuming: 5 dirs left, at least {}", kib(d));
+    let title = format!(
+        "/stopped  {}  saved 0 s ago (incomplete), rescanning...",
+        kib(d)
+    );
     assert_eq!(
         draw(&mut b, now()),
         screen(&title, [&[], &[], &[]], None, 0, HELP)

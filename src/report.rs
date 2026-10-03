@@ -8,7 +8,7 @@ use std::fmt::Write;
 /// The root's total, then its direct children and its own files, largest
 /// first, ties by name bytes. `reclaimable` adds a second size column, the
 /// bytes not shared with a clone. `top` appends that many of the largest
-/// files. The first line says so if the tree is partial or unfinished.
+/// files. The first line says so if the tree is partial or stopped.
 pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> String {
     let totals = tree.totals();
     let index = tree.child_index();
@@ -26,7 +26,7 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> St
     if denied > 0 {
         write!(out, "  (partial: {denied} denied)").unwrap();
     }
-    if tree.unfinished(&index).next().is_some() {
+    if tree.stopped() {
         out.push_str(INCOMPLETE);
     }
     out.push('\n');
@@ -65,8 +65,8 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> St
     out
 }
 
-/// After the root's line of a tree a stopped scan left unfinished.
-const INCOMPLETE: &str = "  (incomplete: run scan to finish)";
+/// After the root's line of a stopped scan.
+const INCOMPLETE: &str = "  (incomplete: scan stopped)";
 
 /// The output order of `(size, name)` pairs: largest first, ties by name
 /// bytes, so output never depends on scan order.

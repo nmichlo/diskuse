@@ -117,14 +117,8 @@ impl DirStat {
 }
 
 /// One change the OS recorded, from [`watch`].
-pub struct Event {
-    /// Increases with every change on the system.
-    pub id: u64,
-    pub what: What,
-}
-
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub enum What {
+pub enum Event {
     /// Something at this absolute path was created, removed, renamed or
     /// written to.
     Changed(Box<[u8]>),
@@ -153,8 +147,8 @@ impl Stream {
 }
 
 /// Sends the changes below `path`, an absolute path with no symlinks, with
-/// event ids after `since`, first the recorded ones, then live ones, in
-/// batches to `tx`. `None` where the OS keeps no record of changes, so on
+/// event ids after `since` ([`event_id`]), first the recorded ones, then
+/// live ones, in batches to `tx`. `None` where the OS keeps no record of changes, so on
 /// Linux always.
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 pub fn watch(path: &CStr, since: u64, tx: Sender<Vec<Event>>) -> Option<Stream> {
@@ -210,15 +204,29 @@ pub fn event_id() -> u64 {
     0
 }
 
-/// An id of the record of changes of device `dev`, or 0 if it keeps none.
-/// When it differs from an earlier one, the record was purged, erased or
-/// wrapped, so earlier event ids mean nothing in it.
+/// Whether device `dev` keeps a record of its changes, which [`watch`]
+/// needs: a network share or a read-only volume does not, so FSEvents sees
+/// only the changes this Mac makes there. Never off macOS.
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-pub fn event_store(dev: u64) -> u128 {
+pub fn records_changes(dev: u64) -> bool {
     #[cfg(target_os = "macos")]
-    return fsevents::store_uuid(dev);
+    return fsevents::records_changes(dev);
     #[cfg(not(target_os = "macos"))]
-    0
+    false
+}
+
+/// A firmlink and its target, as absolute paths.
+pub type Firmlink = (Box<[u8]>, Box<[u8]>);
+
+/// The macOS firmlinks: each joins a dir on the
+/// Data volume, at `/System/Volumes/Data/<target>`, to the system volume,
+/// at the firmlink's path. Read from `/usr/share/firmlinks`. Empty
+/// elsewhere, or if it cannot be read.
+pub fn firmlinks() -> Vec<Firmlink> {
+    #[cfg(target_os = "macos")]
+    return macos::firmlinks();
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
 }
 
 /// All of `file`, mapped read-only, so a saved scan is read in place

@@ -4,10 +4,10 @@
 //!
 //! [`Tree::apply`] lists changed dirs again with the same reader, and scans
 //! the subdirectories new in them with the same walk, appending to the
-//! tree. So does it for the subdirectories a stopped scan left out.
+//! tree.
 
 use crate::sys::{self, DirStat, Kind};
-use crate::tree::{Builder, ChildIndex, LargeFile, Links, Progress, ReadTree, Record, Since, Tree};
+use crate::tree::{Builder, ChildIndex, LargeFile, Links, Progress, ReadTree, Record, Tree};
 use crate::watch::Changes;
 use rayon::ThreadPool;
 use rustix::fd::{AsFd, OwnedFd};
@@ -18,7 +18,7 @@ use std::ffi::{CString, OsStr};
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::{fmt, io};
@@ -38,9 +38,7 @@ pub struct ScanOptions {
 
 /// Asked before each directory below the root a scan lists, from any scan
 /// thread: `true` leaves it out, with everything below it, as when the user
-/// quits. The tree then lacks those directories
-/// ([`ReadTree::unfinished`]) until [`crate::update`] finishes it. Never
-/// stops by default.
+/// quits. The tree is then [`ReadTree::stopped`]. Never stops by default.
 #[derive(Clone, Default)]
 pub struct Stop(Option<Arc<dyn Fn() -> bool + Send + Sync>>);
 
@@ -111,19 +109,16 @@ pub fn scan_live(
     let fd = sys::open_root(root).map_err(|e| ScanError::Root(e.into()))?;
     let st = sys::dir_stat(fd.as_fd()).map_err(|e| ScanError::Root(e.into()))?;
     let lister = lister(&fd, opts).map_err(|e| ScanError::Root(e.into()))?;
-    // taken first, so an update from here also sees the changes made while
+    // taken first, so a watch from here also sees the changes made while
     // the walk runs
-    let since = Since {
-        id: sys::event_id(),
-        store: sys::event_store(st.dev),
-    };
+    let since = sys::event_id();
     let (pool, gate) = pool(opts).map_err(ScanError::ThreadPool)?;
     let tree = Builder::new(root.as_os_str().as_bytes());
     let walk = Walk::new(tree, Links::new(), st.dev, lister, opts.stop.clone(), gate);
     let own = Own::of(&st, opts.reclaimable);
     progress(walk.tree.progress());
     walk.run(&pool, |s| walk.list(s, fd, Record::NO_PARENT, 0, own));
-    Ok(walk.finish(since))
+    Ok(walk.finish(since, false))
 }
 
 /// The [`sys::Lister`] `opts` ask for, of the filesystem of `fd`.
@@ -271,6 +266,8 @@ struct Walk {
     /// Of the root's filesystem, so of every dir the walk lists.
     lister: sys::Lister,
     stop: Stop,
+    /// Some dir was left out for [`Walk::stop`].
+    stopped: AtomicBool,
     gate: Gate,
 }
 
@@ -329,6 +326,7 @@ impl Walk {
             root_dev,
             lister,
             stop,
+            stopped: AtomicBool::new(false),
             gate,
         }
     }
@@ -362,9 +360,10 @@ impl Walk {
         }
     }
 
-    fn finish(self, since: Since) -> Tree {
+    fn finish(self, since: u64, stopped: bool) -> Tree {
         let links = self.links.into_inner().unwrap();
-        self.tree.finish(links, since)
+        let stopped = stopped || self.stopped.into_inner();
+        self.tree.finish(links, since, stopped)
     }
 
     fn visit<'s>(
@@ -381,8 +380,9 @@ impl Walk {
             self.gate.wait();
             return;
         }
-        // left out, and missing from its parent's `subdirs`
-        if !self.stop.now() {
+        if self.stop.now() {
+            self.stopped.store(true, Relaxed);
+        } else {
             let opened = sys::open_child(parent_fd.as_fd(), &child.name);
             // release the parent's fd as soon as possible to bound open fds
             drop(parent_fd);
@@ -403,7 +403,6 @@ impl Walk {
             name,
             flags: Record::DENIED,
             errno: e.raw_os_error() as u16,
-            subdirs: 0,
             own: own.bytes,
             own_private: own.private,
         })
@@ -481,7 +480,6 @@ impl Walk {
                 name,
                 flags: 0,
                 errno: 0,
-                subdirs: listing.kids.len() as u32,
                 own: listing.own.bytes,
                 own_private: listing.own.private,
             }),
@@ -504,7 +502,6 @@ impl Walk {
                     name,
                     flags: Record::OTHER_DEVICE,
                     errno: 0,
-                    subdirs: 0,
                     own: 0,
                     own_private: 0,
                 });
@@ -525,8 +522,8 @@ impl Walk {
         d: u32,
         kids: Vec<Child>,
     ) {
-        // gone since it was listed: `d` stays unfinished, and the next
-        // update lists it again
+        // gone since it was listed: the change that removed it lists its
+        // parent again
         let Ok(fd) = open_path(root, names) else {
             return;
         };
@@ -536,33 +533,22 @@ impl Walk {
 }
 
 impl Tree {
-    /// Brings the tree up to date with `changes`, and finishes it if a
-    /// stopped scan left it unfinished: lists each dir the changes touched,
-    /// or that lacks subdirectories, again, one bulk read each, then scans
-    /// the subdirectories new or missing in them in one walk, first handing
-    /// `progress` a [`Progress`] of it. `None`, with the tree left as it
-    /// was, if only a full scan can bring it up to date.
-    pub(crate) fn apply(
-        &mut self,
-        changes: &Changes,
-        opts: &ScanOptions,
-        progress: impl FnOnce(Progress),
-    ) -> Option<()> {
-        let index = self.child_index();
-        let unfinished: Vec<u32> = self.unfinished(&index).map(|(d, _)| d).collect();
-        if changes.is_empty() && unfinished.is_empty() {
-            self.since.id = self.since.id.max(changes.id);
+    /// Brings the tree up to date with `changes`: lists each dir the
+    /// changes touched again, one bulk read each, then scans the
+    /// subdirectories new in them in one walk. `None`, with the tree left
+    /// as it was, if only a full scan can bring it up to date.
+    pub(crate) fn apply(&mut self, changes: &Changes, opts: &ScanOptions) -> Option<()> {
+        if changes.is_empty() {
             return Some(());
         }
-        let (mut dirty, fresh) = self.touched(&index, changes)?;
-        dirty.extend(unfinished);
+        let index = self.child_index();
+        let (dirty, fresh) = self.touched(&index, changes)?;
         let root = sys::open_root(Path::new(OsStr::from_bytes(self.name(0)))).ok()?;
         let dev = sys::dir_stat(root.as_fd()).ok()?.dev;
         let lister = lister(&root, opts).ok()?;
         let (pool, gate) = pool(opts).ok()?;
         sys::raise_fd_limit();
         sys::keep_placeholders_remote();
-        self.since.id = self.since.id.max(changes.id);
         // listed afresh: everything below them goes, and comes back as new
         for &d in &fresh {
             for &k in index.children(d) {
@@ -598,7 +584,6 @@ impl Tree {
             opts.stop.clone(),
             gate,
         );
-        progress(walk.tree.progress());
         // each parent is opened again from the root, rather than kept open
         // since its listing, so no more dirs are open at once than in a scan
         walk.run(&pool, |s| {
@@ -607,7 +592,7 @@ impl Tree {
                 s.spawn(move |s| walk.adopt(s, root, &names, d, kids));
             }
         });
-        *self = walk.finish(self.since);
+        *self = walk.finish(self.since, self.stopped);
         Some(())
     }
 
@@ -711,7 +696,7 @@ impl Tree {
             return Vec::new();
         }
         let r = &mut self.records[d as usize];
-        (r.flags, r.errno, r.subdirs) = (0, 0, listing.kids.len() as u32);
+        (r.flags, r.errno) = (0, 0);
         (r.own, r.own_private) = (listing.own.bytes, listing.own.private);
 
         // the subdirectories before, by name
@@ -745,7 +730,6 @@ impl Tree {
                 name,
                 flags: Record::OTHER_DEVICE,
                 errno: 0,
-                subdirs: 0,
                 own: 0,
                 own_private: 0,
             });
@@ -762,7 +746,7 @@ impl Tree {
         }
         let errno = e.raw_os_error() as u16;
         let r = &mut self.records[d as usize];
-        (r.flags, r.errno, r.subdirs) = (Record::DENIED, errno, 0);
+        (r.flags, r.errno) = (Record::DENIED, errno);
         (r.own, r.own_private) = (own.bytes, own.private);
     }
 

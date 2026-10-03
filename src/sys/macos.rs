@@ -349,6 +349,21 @@ fn c_str(chars: &[c_char]) -> Vec<u8> {
         .collect()
 }
 
+pub fn firmlinks() -> Vec<super::Firmlink> {
+    const DATA: &[u8] = b"/System/Volumes/Data/";
+    let Ok(file) = std::fs::read("/usr/share/firmlinks") else {
+        return Vec::new();
+    };
+    // one `<firmlink>\t<target relative to the Data volume>` per line
+    let lines = file.split(|&b| b == b'\n');
+    let pairs = lines.filter_map(|line| {
+        let tab = line.iter().position(|&b| b == b'\t')?;
+        let (link, target) = (&line[..tab], &line[tab + 1..]);
+        Some((link.into(), [DATA, target].concat().into()))
+    });
+    pairs.collect()
+}
+
 pub fn keep_placeholders_remote() {
     const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: c_int = 3;
     const IOPOL_SCOPE_PROCESS: c_int = 0;

@@ -105,8 +105,7 @@ TOOLS = [
         "disksweep",
         str(REPO / "target" / "release" / "disksweep"),
         "tree",
-        # --full: a saved scan from an earlier run would make it incremental
-        lambda p, t: ["scan", p, "--full", *opt("--threads", t)],
+        lambda p, t: ["scan", p, *opt("--threads", t)],
         lambda out: json.loads(out)["size"],
         # times the plain text output, reads the exact total from the JSON
         check_args=["--json", "--depth", "0"],

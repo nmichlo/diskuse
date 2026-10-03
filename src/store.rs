@@ -1,10 +1,7 @@
 //! Saved scans, one file per scanned root, so `show` can print a result
-//! without scanning, and the next `scan` can start from it. The only module
-//! that writes files, and only inside [`CacheDir`].
-//!
-//! A stopped scan is saved like any other. What it lacks needs no flag:
-//! each record counts its subdirectories ([`Record::subdirs`]), so the
-//! dirs it did not finish are those with fewer children in the file.
+//! without scanning, and the browser can show one while it scans afresh.
+//! A saved scan is never brought up to date ([`crate::watch`] says why).
+//! The only module that writes files, and only inside [`CacheDir`].
 //!
 //! A file is a fixed header, then an [rkyv] archive of [`Body`], which
 //! `show` reads in place ([`SavedTree`]), then a CRC-32 of all the bytes
@@ -16,12 +13,9 @@
 //!
 //! ```text
 //! magic     b"DSWP"
-//! version   u8 = 4
-//! flags     u8: bit 0 = scanned with reclaimable sizes
-//! event_id  u64: the tree has every change up to this event, 0 if the OS
-//!           keeps no record of changes
-//! store     u128: the id of that record, 0 if none
-//! 0         u16, so the archive starts aligned, at byte 32
+//! version   u8 = 5
+//! flags     u8: bit 0 = scanned with reclaimable sizes, bit 1 = stopped
+//! 0         u16, so the archive starts aligned, at byte 8
 //! archive   rkyv, of `Body`
 //! crc       u32: CRC-32 of every byte before it
 //! ```
@@ -31,7 +25,7 @@
 //! [rkyv]: https://rkyv.org
 
 use crate::sys;
-use crate::tree::{LargeFile, ReadTree, Record, Since, Tree};
+use crate::tree::{LargeFile, Links, ReadTree, Record, Tree};
 use rkyv::rancor::Failure;
 use rkyv::util::AlignedVec;
 use rkyv::with::AsVec;
@@ -44,9 +38,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"DSWP";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 const RECLAIMABLE: u8 = 1 << 0;
-const HEADER_LEN: usize = 32;
+const STOPPED: u8 = 1 << 1;
+const HEADER_LEN: usize = 8;
 
 /// The directory saved scans live in. Only built from the environment, so
 /// the store cannot write anywhere else.
@@ -177,15 +172,11 @@ impl SavedFile {
         if body.root[..] != *self.canonical.as_os_str().as_bytes() || !valid(body) {
             return None;
         }
-        let since = Since {
-            id: u64::from_le_bytes(header[6..14].try_into().unwrap()),
-            store: u128::from_le_bytes(header[14..30].try_into().unwrap()),
-        };
         Some(Saved {
             tree: SavedTree {
                 body,
                 root: self.root.as_os_str().as_bytes(),
-                since,
+                stopped: header[5] & STOPPED != 0,
             },
             reclaimable: header[5] & RECLAIMABLE != 0,
             modified: self.modified,
@@ -197,7 +188,7 @@ impl SavedFile {
 pub struct SavedTree<'a> {
     body: &'a ArchivedBody<'a>,
     root: &'a [u8],
-    since: Since,
+    stopped: bool,
 }
 
 impl SavedTree<'_> {
@@ -219,10 +210,9 @@ impl SavedTree<'_> {
                     name: name.into(),
                 })
                 .collect(),
-            links: (body.links.iter())
-                .map(|l| ((l.dev.to_native(), l.ino.to_native()), l.dir.to_native()))
-                .collect(),
-            since: self.since,
+            links: Links::new(),
+            since: 0,
+            stopped: self.stopped,
         }
     }
 }
@@ -239,7 +229,6 @@ impl ReadTree for SavedTree<'_> {
             name: r.name.to_native(),
             flags: r.flags.to_native(),
             errno: r.errno.to_native(),
-            subdirs: r.subdirs.to_native(),
             own: r.own.to_native(),
             own_private: r.own_private.to_native(),
         }
@@ -259,6 +248,10 @@ impl ReadTree for SavedTree<'_> {
         let files = self.body.largest.iter();
         files.map(|f| (f.bytes.to_native(), f.dir.to_native(), &f.name[..]))
     }
+
+    fn stopped(&self) -> bool {
+        self.stopped
+    }
 }
 
 /// The archived part of a saved file.
@@ -277,15 +270,6 @@ struct Body<'a> {
     /// In no particular order.
     #[rkyv(with = AsVec)]
     largest: &'a [LargeFile],
-    links: Vec<Link>,
-}
-
-/// The dir that counts a multiply-linked file: see [`Links`].
-#[derive(rkyv::Archive, rkyv::Serialize)]
-struct Link {
-    dev: u64,
-    ino: u64,
-    dir: u32,
 }
 
 /// The canonical root, as the scan follows a symlinked root, and its file
@@ -321,9 +305,6 @@ fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> AlignedVec {
         names,
         ends,
         largest: &tree.largest,
-        links: (tree.links.iter())
-            .map(|(&(dev, ino), &dir)| Link { dev, ino, dir })
-            .collect(),
     };
     // a little over the file's length, so it never grows, which would copy
     // it all
@@ -334,14 +315,12 @@ fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> AlignedVec {
         + size_of_val(&body.names[..])
         + size_of_val(&body.ends[..])
         + largest
-        + size_of_val(&body.links[..])
         + 256;
     let mut out = AlignedVec::with_capacity(len);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
-    out.push(if reclaimable { RECLAIMABLE } else { 0 });
-    out.extend_from_slice(&tree.since.id.to_le_bytes());
-    out.extend_from_slice(&tree.since.store.to_le_bytes());
+    let flags = [(reclaimable, RECLAIMABLE), (tree.stopped, STOPPED)];
+    out.push(flags.iter().filter(|f| f.0).map(|f| f.1).sum());
     out.extend_from_slice(&[0; 2]);
     // the archive's positions count from the file's start, which is
     // aligned, and serializing to memory cannot fail
@@ -373,5 +352,4 @@ fn valid(body: &ArchivedBody<'_>) -> bool {
             .last()
             .is_some_and(|&e| e.to_native() as usize == body.names.len())
         && (body.largest.iter()).all(|f| below(f.dir.to_native(), records.len()))
-        && (body.links.iter()).all(|l| below(l.dir.to_native(), records.len()))
 }

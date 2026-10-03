@@ -3,11 +3,8 @@
 //! their bytes are folded into their directory's `own`. Only the
 //! [`LARGEST`] largest files are kept, by name.
 //!
-//! An update ([`crate::update`]) appends the dirs new since, so the order
-//! holds, and flags the ones gone [`Record::REMOVED`] rather than moving
-//! any record. A full scan starts afresh. A stopped scan leaves a tree
-//! that lacks some subdirectories ([`ReadTree::unfinished`]), which an
-//! update appends the same way.
+//! A live update appends the dirs new since, so the order holds, and flags
+//! the ones gone [`Record::REMOVED`] rather than moving any record.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -29,10 +26,6 @@ pub struct Record {
     pub flags: u16,
     /// The errno of a [`Record::DENIED`] directory, else 0.
     pub errno: u16,
-    /// How many subdirectories its listing found, mount points and those
-    /// that cannot be read too. Each gets a record once the scan reaches
-    /// it, so a stopped scan leaves fewer records than this.
-    pub subdirs: u32,
     /// Allocated bytes of the directory itself plus all its non-directory
     /// entries. Hard links count once per scan.
     pub own: u64,
@@ -49,8 +42,7 @@ impl Record {
     pub const OTHER_DEVICE: u16 = 1 << 1;
     /// Only in [`Totals::flags`]: some descendant is [`Record::DENIED`].
     pub const PARTIAL: u16 = 1 << 2;
-    /// Gone since the scan, like everything below it. Its `own` and
-    /// `subdirs` are 0, and [`Tree::child_index`] leaves it out. No other
+    /// Gone since the scan, like everything below it. Its `own` is 0, and [`Tree::child_index`] leaves it out. No other
     /// bit is set.
     pub const REMOVED: u16 = 1 << 3;
 }
@@ -99,15 +91,6 @@ pub(crate) type Names = Arc<boxcar::Vec<Box<[u8]>>>;
 /// listed again.
 pub(crate) type Links = HashMap<(u64, u64), u32>;
 
-/// Where a tree stands in the OS's record of changes: it has every change
-/// up to event `id` of the record `store` ([`crate::sys::event_store`]).
-/// Zeros where the OS keeps no record, which no update can start from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Since {
-    pub id: u64,
-    pub store: u128,
-}
-
 #[derive(Clone, Debug)]
 pub struct Tree {
     pub(crate) records: Vec<Record>,
@@ -116,7 +99,12 @@ pub struct Tree {
     /// In no particular order.
     pub(crate) largest: Vec<LargeFile>,
     pub(crate) links: Links,
-    pub(crate) since: Since,
+    /// The id of the OS's latest change when the scan started, so a live
+    /// watch from it sees the changes made while the scan ran. 0 where the
+    /// OS keeps no record of changes, and in a saved scan.
+    pub(crate) since: u64,
+    /// The scan was stopped before it listed every dir.
+    pub(crate) stopped: bool,
 }
 
 /// Read access to a tree: an owned [`Tree`], or a saved one read in place
@@ -138,6 +126,10 @@ pub trait ReadTree {
     /// The [`LARGEST`] largest files, or all if fewer, in no particular
     /// order, as `(bytes, dir, name)`: see [`LargeFile`].
     fn largest(&self) -> impl Iterator<Item = (u64, u32, &[u8])>;
+
+    /// The scan was stopped before it listed every dir, so sizes are lower
+    /// bounds.
+    fn stopped(&self) -> bool;
 
     /// The path of directory `id`: the root's name, then `/` and each name
     /// below it.
@@ -216,17 +208,6 @@ pub trait ReadTree {
         }
         ChildIndex { start, kids }
     }
-
-    /// The dirs a stopped scan listed but did not finish, each with how
-    /// many of its subdirectories have no record yet. `index` is
-    /// [`ReadTree::child_index`].
-    fn unfinished(&self, index: &ChildIndex) -> impl Iterator<Item = (u32, u32)> {
-        (0..self.len() as u32).filter_map(move |id| {
-            let have = index.children(id).len() as u32;
-            let missing = self.record(id).subdirs.saturating_sub(have);
-            (missing > 0).then_some((id, missing))
-        })
-    }
 }
 
 impl ReadTree for Tree {
@@ -244,6 +225,10 @@ impl ReadTree for Tree {
 
     fn largest(&self) -> impl Iterator<Item = (u64, u32, &[u8])> {
         (self.largest.iter()).map(|f| (f.bytes, f.dir, &f.name[..]))
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped
     }
 }
 
@@ -269,7 +254,6 @@ impl Tree {
         self.records[id as usize] = Record {
             flags: Record::REMOVED,
             errno: 0,
-            subdirs: 0,
             own: 0,
             own_private: 0,
             ..self.records[id as usize]
@@ -363,7 +347,8 @@ impl Progress {
             names: Arc::clone(&self.names),
             largest,
             links: Links::new(),
-            since: Since::default(),
+            since: 0,
+            stopped: false,
         })
     }
 }
@@ -476,7 +461,7 @@ impl Builder {
         }
     }
 
-    pub fn finish(self, links: Links, since: Since) -> Tree {
+    pub fn finish(self, links: Links, since: u64, stopped: bool) -> Tree {
         // copies, as a `Progress` may still share them
         let mut records = Arc::unwrap_or_clone(self.base);
         records.reserve_exact(self.records.count());
@@ -491,6 +476,7 @@ impl Builder {
                 .collect(),
             links,
             since,
+            stopped,
         }
     }
 }

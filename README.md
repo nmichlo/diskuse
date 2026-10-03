@@ -29,7 +29,7 @@ Pre-release. The commands so far:
 ```sh
 disksweep [-r]
 disksweep [-r] <path>
-disksweep scan <path> [--full] [--threads N] [-r] [--json [--depth N]] [--top N]
+disksweep scan <path> [--threads N] [-r] [--json [--depth N]] [--top N]
 disksweep show <path> [-r] [--json [--depth N]] [--top N]
 ```
 
@@ -67,72 +67,29 @@ largest files:
 as `scan` printed it with the same flags. `show -r` needs a scan made with
 `-r`.
 
-## Incremental scans
+## Every scan is a full scan
 
-On macOS, `scan` starts from the saved scan of `<path>`, if there is one. macOS
-records every change to a volume (FSEvents), so disksweep asks for the changes
-below `<path>` since the saved scan, lists only the directories they touched
-again, and scans any new subdirectories. A file that grows in place counts as
-a change too. The output is the same as a full scan's, and the result is saved
-again.
+A saved scan is never brought up to date from a record of changes. macOS
+records every change to a volume (FSEvents), but Apple calls that record
+"advisory rather than a definitive list of all changes to the volume": a disk
+changed by another OS, from Recovery or by another Mac can miss changes with
+no sign. So `scan`, and every launch of the browser, scans afresh. Changes
+seen while disksweep is open are applied live (see [Browse](#browse)), as
+the kernel reports them and says when it drops any.
 
-```text
-disksweep scan ~/src          # the first time: a full scan
-disksweep scan ~/src          # later: only what changed since
-disksweep scan ~/src --full   # always a full scan
-```
-
-It falls back to a full scan when:
-
-- there is no saved scan, or it is damaged or from another disksweep version;
-- the saved scan was made with `-r` and this one is not, or the other way;
-- macOS no longer has the changes since then, lost some, or its record was
-  reset, as after erasing the disk;
-- `<path>` itself was moved or deleted, or macOS says to scan all of it again.
-
-If macOS says to rescan only a directory below `<path>`, only that directory
-is scanned again. Changes inside the cache directory are ignored.
-
-The largest files list (`--top`, `t`) keeps the 1000 largest files from the
-full scan, plus those of the directories listed again. A full scan finds the
-others again.
-
-On Linux every `scan` is a full scan, unless it finishes a stopped one.
-
-## Stop and resume
+## Stop
 
 Ctrl-C stops a `scan`, and so does SIGTERM. In the browser, `q`, Esc and
 Ctrl-C stop the scan when quitting. Either way disksweep lists no more
 directories, saves what it found, and marks the result incomplete:
 
 ```text
- 182.4 GiB  /  (incomplete: run scan to finish)
+ 182.4 GiB  /  (incomplete: scan stopped)
 ```
 
 `scan` prints that and exits with 130 after Ctrl-C, 143 after SIGTERM.
 `show` prints it the same way. With `--json`, the root has
-`"incomplete": true`.
-
-The next `scan` or browse of `<path>` finishes the stopped scan rather than
-starting over. Each saved directory records how many subdirectories it has,
-so disksweep lists again only the directories the scan did not finish, and
-scans only the subdirectories missing from them:
-
-```text
-disksweep scan /              # Ctrl-C after a minute: saved, incomplete
-disksweep scan /              # scans only what the first one missed
-disksweep scan / --full       # starts over
-```
-
-On macOS it first applies the changes made since the stopped scan started,
-like an [incremental scan](#incremental-scans), so the result is the same as
-a full scan's. On Linux the directories already scanned stay as they were,
-so changes in them since then only show after a full scan. In the browser
-the title says `resuming: 120 dirs left, at least 182.4 GiB` until it is
-done; the number is of the subdirectories known to be missing so far.
-
-A scan that is killed outright, by SIGKILL, a crash or a power cut, saves
-nothing. The next scan starts from the last saved scan, if any.
+`"incomplete": true`. The next scan starts over.
 
 ## Browse
 
@@ -174,14 +131,11 @@ reversed instead.
 It scans while you browse. The title says `scanning... at least <size>` and
 the sizes grow, about once a second, until the scan is done and saved. If
 `<path>` was scanned before, the saved scan shows at once, marked
-`saved 5 min ago`, until the fresh scan is done. On macOS that saved scan is
-brought up to date like an [incremental scan](#incremental-scans), usually in
-under a second, instead of scanning again. A saved scan that was stopped is
-finished instead, as in [Stop and resume](#stop-and-resume). Then, while disksweep is open,
-sizes follow changes on disk, about once a second.
+`saved 5 min ago, rescanning...`, until the fresh scan is done. Then, while
+disksweep is open, sizes follow changes on disk, about once a second: on
+macOS every change below `<path>`, including those made while it scanned.
 
-Linux keeps no record of changes, so there the saved scan shows until a full
-scan is done, and then only the directories on screen follow changes: those
+On Linux only the directories on screen follow changes: those
 of the three columns. inotify reports their changes, so they show within
 about a second. Changes anywhere else show after a rescan (`R`), so the title
 says how old the scan is:

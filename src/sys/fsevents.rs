@@ -6,7 +6,7 @@
 
 #![allow(unsafe_code)]
 
-use super::{Event, What};
+use super::Event;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 use std::sync::mpsc::Sender;
@@ -25,10 +25,6 @@ struct Context {
     release: *const c_void,
     copy_description: *const c_void,
 }
-
-/// `CFUUIDBytes`.
-#[repr(C)]
-struct UuidBytes([u8; 16]);
 
 /// `CFArrayCallBacks`.
 #[repr(C)]
@@ -75,7 +71,6 @@ unsafe extern "C" {
         count: CFIndex,
         callbacks: *const ArrayCallBacks,
     ) -> CFRef;
-    fn CFUUIDGetUUIDBytes(uuid: CFRef) -> UuidBytes;
     fn CFRelease(cf: CFRef);
 }
 
@@ -197,43 +192,39 @@ extern "C" fn callback(
     n: usize,
     paths: *mut c_void,
     flags: *const u32,
-    ids: *const u64,
+    _: *const u64,
 ) {
     if n == 0 {
         return;
     }
-    // SAFETY: FSEvents passes `n` paths, flags and ids, valid for this call,
+    // SAFETY: FSEvents passes `n` paths and flags, valid for this call,
     // and `info` is the sender `start` gave it, freed only after the queue
     // has run this.
-    let (tx, paths, flags, ids) = unsafe {
+    let (tx, paths, flags) = unsafe {
         (
             &*info.cast::<Sender<Vec<Event>>>(),
             std::slice::from_raw_parts(paths.cast::<*const c_char>(), n),
             std::slice::from_raw_parts(flags, n),
-            std::slice::from_raw_parts(ids, n),
         )
     };
     let events = (0..n).map(|i| {
         // SAFETY: each path is a NUL-terminated C string.
         let path = unsafe { CStr::from_ptr(paths[i]) }.to_bytes();
-        Event {
-            id: ids[i],
-            what: what(flags[i], path),
-        }
+        event(flags[i], path)
     });
     // the receiver goes away only with the stream
     let _ = tx.send(events.collect());
 }
 
-fn what(flags: u32, path: &[u8]) -> What {
+fn event(flags: u32, path: &[u8]) -> Event {
     if flags & (USER_DROPPED | KERNEL_DROPPED | EVENT_IDS_WRAPPED | ROOT_CHANGED) != 0 {
-        What::Lost
+        Event::Lost
     } else if flags & HISTORY_DONE != 0 {
-        What::HistoryDone
+        Event::HistoryDone
     } else if flags & MUST_SCAN_SUB_DIRS != 0 {
-        What::Rescan(path.into())
+        Event::Rescan(path.into())
     } else {
-        What::Changed(path.into())
+        Event::Changed(path.into())
     }
 }
 
@@ -243,20 +234,17 @@ pub fn current_event_id() -> u64 {
     unsafe { FSEventsGetCurrentEventId() }
 }
 
-/// The UUID of the event record of device `dev`, or 0 if it keeps none,
-/// like a read-only volume.
-pub fn store_uuid(dev: u64) -> u128 {
+/// Whether device `dev` keeps a record of changes. A network share or a
+/// read-only volume does not, so FSEvents only sees the changes this Mac
+/// makes there.
+pub fn records_changes(dev: u64) -> bool {
     // `st_dev` is an `i32` on macOS, widened by `DirStat`
     // SAFETY: returns a new reference or null.
     let uuid = unsafe { FSEventsCopyUUIDForDevice(dev as libc::dev_t) };
     if uuid.is_null() {
-        return 0;
+        return false;
     }
-    // SAFETY: `uuid` is a live CFUUID, released once read.
-    let bytes = unsafe {
-        let bytes = CFUUIDGetUUIDBytes(uuid);
-        CFRelease(uuid);
-        bytes
-    };
-    u128::from_be_bytes(bytes.0)
+    // SAFETY: a live reference of ours.
+    unsafe { CFRelease(uuid) };
+    true
 }
