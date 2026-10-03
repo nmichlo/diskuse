@@ -5,9 +5,9 @@
 
 Each round runs every build once on every dir, in a shuffled order, so
 drift in load or caches hits all builds alike. The first round only warms
-the caches. Reports medians of wall time, CPU (user + sys), instructions
-retired and peak memory from `/usr/bin/time -l` (macOS), as a change
-against the first build, and fails if any build's output differs.
+the caches. Reports medians and quartiles of wall time and CPU (user + sys), and
+median instructions retired and peak memory from `/usr/bin/time -l`
+(macOS), as a change against the first build, and fails if any build's output differs.
 """
 
 import argparse
@@ -15,14 +15,14 @@ import hashlib
 import os
 import random
 import re
+import resource
 import statistics
 import subprocess
 import sys
+import time
 
+# from `/usr/bin/time -l`; wall and CPU are measured here, finer
 FIELDS = {
-    "wall": r"([\d.]+) real",
-    "user": r"([\d.]+) user",
-    "sys": r"([\d.]+) sys",
     "instr": r"(\d+)\s+instructions retired",
     "mem": r"(\d+)\s+peak memory footprint",
 }
@@ -32,9 +32,14 @@ def run(binary: str, path: str, args: list[str]) -> tuple[dict, str]:
     cmd = ["/usr/bin/time", "-l", binary, "scan", path, *args]
     # a decimal comma would not parse
     env = {**os.environ, "LC_ALL": "C"}
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    start = time.perf_counter()
     p = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
+    wall = time.perf_counter() - start
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
     stats = {k: float(re.search(v, p.stderr).group(1)) for k, v in FIELDS.items()}
-    stats["cpu"] = stats.pop("user") + stats.pop("sys")
+    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+    stats |= {"wall": wall, "cpu": cpu}
     return stats, hashlib.sha256(p.stdout.encode()).hexdigest()
 
 
@@ -61,20 +66,30 @@ def main() -> int:
     for d in a.dirs:
         print(f"\n{d}")
         print(
-            f"  {'build':<12}{'wall s':>10}{'cpu s':>10}{'instr G':>10}{'mem MiB':>10}"
+            f"  {'build':<10}{'wall ms':>18}{'cpu ms':>18}{'instr G':>9}{'mem MiB':>9}"
         )
         base = None
         for name, _ in bins:
-            m = {
-                k: statistics.median(s[k] for s in runs[d, name])
-                for k in runs[d, name][0]
-            }
-            row = [m["wall"], m["cpu"], m["instr"] / 1e9, m["mem"] / 2**20]
-            line = f"  {name:<12}" + "".join(f"{v:>10.3f}" for v in row)
+            rs = runs[d, name]
+
+            def q(k: str, rs: list[dict] = rs) -> tuple[float, float, float]:
+                return tuple(
+                    statistics.quantiles([r[k] for r in rs], n=4, method="inclusive")
+                )
+
+            w, c = q("wall"), q("cpu")
+            instr = statistics.median(r["instr"] for r in rs) / 1e9
+            mem = statistics.median(r["mem"] for r in rs) / 2**20
+            line = (
+                f"  {name:<10}{w[1] * 1e3:>8.1f} [{w[0] * 1e3:.0f}-{w[2] * 1e3:.0f}]"
+                f"{c[1] * 1e3:>8.1f} [{c[0] * 1e3:.0f}-{c[2] * 1e3:.0f}]"
+                f"{instr:>9.3f}{mem:>9.2f}"
+            )
+            row = [w[1], c[1], instr, mem]
             if base is None:
                 base = row
             else:
-                line += "   " + " ".join(
+                line += "  " + " ".join(
                     f"{(v / max(b, 1e-9) - 1) * 100:+.1f}%" for v, b in zip(row, base)
                 )
             print(line)
