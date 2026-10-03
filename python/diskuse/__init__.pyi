@@ -1,6 +1,7 @@
+from collections.abc import AsyncIterator, Iterator
 from os import PathLike
 from pathlib import Path
-from typing import TypeAlias
+from typing import Self, TypeAlias
 
 import pyarrow
 
@@ -62,14 +63,14 @@ class Live:
         self,
         path: str | PathLike,
         interval: float = 0.5,
-        threads: Optional[int] = None,
+        threads: int | None = None,
     ) -> None: ...
     def __iter__(self) -> Iterator[Event]: ...
     def __aiter__(self) -> AsyncIterator[Event]: ...
     def close(self) -> None: ...
-    def __enter__(self) -> Live: ...
+    def __enter__(self) -> Self: ...
     def __exit__(self, *exc: object) -> None: ...
 
 def live(
-    path: str | PathLike, interval: float = 0.5, threads: Optional[int] = None
+    path: str | PathLike, interval: float = 0.5, threads: int | None = None
 ) -> Live: ...
