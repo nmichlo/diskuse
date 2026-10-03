@@ -39,83 +39,245 @@ pub(crate) struct Label {
 /// What a cache rule needs besides the directory's name.
 enum Needs {
     Nothing,
-    /// A file of this name next to it, in the same listing.
-    Sibling(&'static str),
+    /// A file of one of these names next to it, in the same listing.
+    Sibling(&'static [&'static str]),
     /// The directory it is in has this name.
     Parent(&'static str),
     /// A file of this name inside it: one `lstat`.
     Inside(&'static str),
 }
 
-/// `(name, what else it needs, label, why)`. The README lists the same
-/// table.
-const CACHES: [(&str, Needs, &str, &str); 9] = [
+use Needs::{Inside, Nothing, Parent, Sibling};
+
+/// `(name, what else it needs, label, why)`: build output and downloads
+/// that a tool makes again on demand. Names other tools use for other
+/// things (`target`, `build`, `Pods`) need the tool's project file beside
+/// them. The README lists the same table.
+const CACHES: [(&str, Needs, &str, &str); 34] = [
     (
         "node_modules",
-        Needs::Nothing,
+        Nothing,
         "cache: npm",
-        "npm packages: npm install rebuilds them",
+        "npm install rebuilds it",
+    ),
+    (
+        "bower_components",
+        Nothing,
+        "cache: bower",
+        "bower install rebuilds it",
+    ),
+    (
+        ".next",
+        Nothing,
+        "cache: next.js",
+        "Next.js build output: next build rebuilds it",
+    ),
+    (
+        ".nuxt",
+        Nothing,
+        "cache: nuxt",
+        "Nuxt build output: nuxt build rebuilds it",
+    ),
+    (
+        ".svelte-kit",
+        Nothing,
+        "cache: sveltekit",
+        "SvelteKit build output: rebuilt on the next build",
+    ),
+    (
+        ".turbo",
+        Nothing,
+        "cache: turborepo",
+        "Turborepo cache: rebuilt on the next build",
+    ),
+    (
+        ".parcel-cache",
+        Nothing,
+        "cache: parcel",
+        "Parcel cache: rebuilt on the next build",
+    ),
+    (
+        ".angular",
+        Nothing,
+        "cache: angular",
+        "Angular CLI cache: rebuilt on the next build",
+    ),
+    (
+        ".docusaurus",
+        Nothing,
+        "cache: docusaurus",
+        "Docusaurus build cache: rebuilt on the next build",
+    ),
+    (
+        ".expo",
+        Nothing,
+        "cache: expo",
+        "Expo cache: rebuilt on the next start",
     ),
     (
         "target",
-        Needs::Sibling("Cargo.toml"),
+        Sibling(&["Cargo.toml"]),
         "cache: cargo",
         "Rust build output: cargo build rebuilds it",
     ),
     (
+        "target",
+        Sibling(&["pom.xml"]),
+        "cache: maven",
+        "Maven build output: mvn package rebuilds it",
+    ),
+    (
         ".gradle",
-        Needs::Nothing,
+        Nothing,
         "cache: gradle",
         "Gradle caches: rebuilt on the next build",
     ),
     (
+        "build",
+        Sibling(&["build.gradle", "build.gradle.kts"]),
+        "cache: gradle",
+        "Gradle build output: rebuilt on the next build",
+    ),
+    (
         "__pycache__",
-        Needs::Nothing,
+        Nothing,
         "cache: python",
         "Python bytecode: rebuilt on import",
     ),
     (
+        ".pytest_cache",
+        Nothing,
+        "cache: pytest",
+        "pytest cache: rebuilt on the next run",
+    ),
+    (
+        ".mypy_cache",
+        Nothing,
+        "cache: mypy",
+        "mypy cache: rebuilt on the next run",
+    ),
+    (
+        ".ruff_cache",
+        Nothing,
+        "cache: ruff",
+        "ruff cache: rebuilt on the next run",
+    ),
+    (
+        ".tox",
+        Nothing,
+        "cache: tox",
+        "tox environments: rebuilt on the next run",
+    ),
+    (
+        ".nox",
+        Nothing,
+        "cache: nox",
+        "nox environments: rebuilt on the next run",
+    ),
+    (
+        ".ipynb_checkpoints",
+        Nothing,
+        "cache: jupyter",
+        "Jupyter autosaves of notebooks you have saved since",
+    ),
+    (
         ".venv",
-        Needs::Inside("pyvenv.cfg"),
+        Inside("pyvenv.cfg"),
         "cache: venv",
         "a Python virtualenv: recreate it from the project's requirements",
     ),
     (
         "venv",
-        Needs::Inside("pyvenv.cfg"),
+        Inside("pyvenv.cfg"),
         "cache: venv",
         "a Python virtualenv: recreate it from the project's requirements",
     ),
     (
         "DerivedData",
-        Needs::Nothing,
+        Nothing,
         "cache: xcode",
         "Xcode build output: rebuilt on the next build",
     ),
     (
+        "Pods",
+        Sibling(&["Podfile"]),
+        "cache: cocoapods",
+        "CocoaPods dependencies: pod install restores them",
+    ),
+    (
+        ".build",
+        Sibling(&["Package.swift"]),
+        "cache: swiftpm",
+        "Swift package build output: swift build rebuilds it",
+    ),
+    (
+        ".dart_tool",
+        Nothing,
+        "cache: dart",
+        "Dart tool cache: rebuilt by dart pub get",
+    ),
+    (
+        "_build",
+        Sibling(&["mix.exs"]),
+        "cache: elixir",
+        "Elixir build output: mix compile rebuilds it",
+    ),
+    (
+        "deps",
+        Sibling(&["mix.exs"]),
+        "cache: elixir",
+        "Elixir dependencies: mix deps.get restores them",
+    ),
+    (
+        ".stack-work",
+        Nothing,
+        "cache: stack",
+        "Haskell Stack build output: stack build rebuilds it",
+    ),
+    (
+        "dist-newstyle",
+        Nothing,
+        "cache: cabal",
+        "Cabal build output: cabal build rebuilds it",
+    ),
+    (
+        ".terraform",
+        Nothing,
+        "cache: terraform",
+        "Terraform providers and modules: terraform init restores them",
+    ),
+    (
+        ".zig-cache",
+        Nothing,
+        "cache: zig",
+        "Zig build cache: rebuilt on the next build",
+    ),
+    (
         ".cache",
-        Needs::Nothing,
+        Nothing,
         "cache",
         "caches of command-line tools: rebuilt on demand",
     ),
-    (
-        "Caches",
-        Needs::Parent("Library"),
-        "cache",
-        "app caches: apps rebuild them, though some start slower once",
-    ),
 ];
+
+/// Last, so a tool's own rule wins.
+const LIBRARY_CACHES: (&str, Needs, &str, &str) = (
+    "Caches",
+    Parent("Library"),
+    "cache",
+    "app caches: apps rebuild them, though some start slower once",
+);
 
 const CACHEDIR_TAG: Label = Label {
     tier: Tier::Cache,
     text: "cache",
-    why: "marked a cache by the tool that made it (CACHEDIR.TAG): rebuilt on demand",
+    why: "the tool that made it marked it a cache (CACHEDIR.TAG): rebuilt on demand",
 };
 
 const SYSTEM: Label = Label {
     tier: Tier::System,
     text: "system",
-    why: "protected by macOS (System Integrity Protection): it cannot be deleted",
+    why: "macOS protects it (System Integrity Protection), so it cannot be deleted",
 };
 
 /// `(path, label, why)`: a path below the home dir if it starts with `~/`,
@@ -233,21 +395,20 @@ pub(crate) fn label(
     if system() {
         return Some(SYSTEM);
     }
-    let cache = CACHES.iter().find(|(n, ..)| n.as_bytes() == dir.name);
-    if let Some((_, needs, text, why)) = cache {
-        let matched = match *needs {
-            Needs::Nothing => true,
-            Needs::Sibling(file) => sibling(file),
-            Needs::Parent(name) => dir.parent == name.as_bytes(),
-            Needs::Inside(file) => inside(file),
-        };
-        if matched {
-            return Some(Label {
-                tier: Tier::Cache,
-                text,
-                why,
-            });
-        }
+    let rules = CACHES.iter().chain([&LIBRARY_CACHES]);
+    let mut named = rules.filter(|(n, ..)| n.as_bytes() == dir.name);
+    let cache = named.find(|(_, needs, ..)| match *needs {
+        Nothing => true,
+        Sibling(files) => files.iter().any(|f| sibling(f)),
+        Parent(name) => dir.parent == name.as_bytes(),
+        Inside(file) => inside(file),
+    });
+    if let Some(&(_, _, text, why)) = cache {
+        return Some(Label {
+            tier: Tier::Cache,
+            text,
+            why,
+        });
     }
     if tagged() {
         return Some(CACHEDIR_TAG);

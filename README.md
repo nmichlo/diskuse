@@ -144,13 +144,18 @@ says how old the scan is:
 /home/me  41.2 GiB  scanned 4 min ago
 ```
 
-Each directory shows how much it grew or shrank since the first scan of the
-session finished, and the title shows the same for `<path>`, with since when.
-Rescans keep counting from that first scan:
+A column after the size shows how much each item grew (red) or shrank
+(green) since the first scan of the session finished, and the title shows
+the same for `<path>`, with since when. The column appears once something
+in it changed. Rescans keep counting from that first scan. A file's change
+is known once its directory has been shown; a directory's always is. `c`
+sorts by change, to find what grew, and again by size:
 
 ```text
 /Users/me  412.0 GiB  (+2.1 GiB in 12 min)
-  41.2 GiB  ####...... Library/  +1.3 GiB
+  41.2 GiB   +1.3 GiB ####...... Library/
+  12.0 GiB            #......... Movies/
+   3.4 GiB   -200 MiB #......... Downloads/
 ```
 
 On network filesystems inotify misses the changes other machines make, and
@@ -175,6 +180,7 @@ macOS records no changes for, like a network share, is followed the same way.
 | `o`                  | Open the selected item                                     |
 | Space                | Pick or unpick the selected item, marked `*`               |
 | `p`                  | List the picks, with their sizes now and a total           |
+| `c`                  | Sort by change this session, or by size again              |
 | `s`                  | Rescan the selected directory (at a file, the current one) |
 | `S`                  | Rescan all of `<path>`                                     |
 | `/`                  | Filter the current column by text; Enter keeps, Esc clears |
@@ -250,16 +256,23 @@ is, and the footer explains the label of the selected one:
 | cache  | green  | a rule below matches, or it holds a `CACHEDIR.TAG` (cargo, pip, ...) |
 | known  | yellow | a big folder macOS or a common app keeps, listed in `src/labels.rs`  |
 
-| Directory            | Label           | Only when                               |
-| -------------------- | --------------- | --------------------------------------- |
-| `node_modules`       | `cache: npm`    |                                         |
-| `target`             | `cache: cargo`  | a `Cargo.toml` is next to it            |
-| `.gradle`            | `cache: gradle` |                                         |
-| `__pycache__`        | `cache: python` |                                         |
-| `.venv`, `venv`      | `cache: venv`   | it holds a `pyvenv.cfg`                 |
-| `DerivedData`        | `cache: xcode`  |                                         |
-| `.cache`             | `cache`         |                                         |
-| `Caches`             | `cache`         | it is in a directory named `Library`    |
+| Directory                                   | Label                       | Only when                                  |
+| ------------------------------------------- | --------------------------- | ------------------------------------------ |
+| `node_modules`, `bower_components`          | `cache: npm`, `cache: bower` |                                           |
+| `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.angular`, `.docusaurus`, `.expo` | `cache: <tool>` |      |
+| `target`                                    | `cache: cargo` or `maven`   | a `Cargo.toml` or `pom.xml` is next to it  |
+| `.gradle`; `build`                          | `cache: gradle`             | `build`: a `build.gradle(.kts)` beside it  |
+| `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.nox`, `.ipynb_checkpoints` | `cache: <tool>` | |
+| `.venv`, `venv`                             | `cache: venv`               | it holds a `pyvenv.cfg`                    |
+| `DerivedData`                               | `cache: xcode`              |                                            |
+| `Pods`; `.build`                            | `cache: cocoapods`, `swiftpm` | a `Podfile` or `Package.swift` beside it |
+| `.dart_tool`, `.stack-work`, `dist-newstyle`, `.terraform`, `.zig-cache` | `cache: <tool>` |               |
+| `_build`, `deps`                            | `cache: elixir`             | a `mix.exs` is next to it                  |
+| `.cache`                                    | `cache`                     |                                            |
+| `Caches`                                    | `cache`                     | it is in a directory named `Library`       |
+
+The footer explains the selected directory's label and says what to do:
+`[cache: npm] npm install rebuilds it.  r reveal to delete  space pick`.
 
 Known folders include the Trash, Downloads, Xcode archives and device
 support, iOS simulators, iPhone backups, Docker Desktop's disk image, Mail,

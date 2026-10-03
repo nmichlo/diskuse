@@ -198,7 +198,9 @@ impl Row {
 
     /// `size  ##........ name`, the size coloured, and the `#`s the same,
     /// the bar only if `bar`.
-    fn line(&self, look: Look, bar: bool) -> Line<'static> {
+    /// `changes`: the column shows each row's change, as one of its rows
+    /// changed.
+    fn line(&self, look: Look, bar: bool, changes: bool) -> Line<'static> {
         let plus = match self.kind {
             Kind::Dir { partial: true } => "+",
             _ => " ",
@@ -210,6 +212,15 @@ impl Row {
         let mut spans = vec![size(self.size), Span::styled(plus, look.dim())];
         if let Some(private) = self.private {
             spans.extend([size(private), Span::styled(plus, look.dim())]);
+        }
+        if changes {
+            spans.push(match self.delta {
+                0 => Span::raw(" ".repeat(11)),
+                d => {
+                    let color = if d > 0 { Color::Red } else { Color::Green };
+                    Span::styled(format!("{:>11}", signed(d)), look.fg(color))
+                }
+            });
         }
         spans.push(Span::raw(" "));
         if bar {
@@ -243,16 +254,6 @@ impl Row {
                 false => bold(),
             };
             spans.push(Span::styled(" *", style));
-        }
-        if self.delta != 0 {
-            let color = match self.delta > 0 {
-                true => Color::Magenta,
-                false => Color::Cyan,
-            };
-            spans.push(Span::styled(
-                format!("  {}", signed(self.delta)),
-                look.fg(color),
-            ));
         }
         Line::from(spans)
     }
@@ -306,9 +307,10 @@ fn screen_in(
             continue;
         };
         let (x, width) = (x as u16, width as u16);
+        let changes = rows.iter().any(|r| r.delta != 0);
         for (y, row) in (1..HEIGHT as u16 - 1).zip(rows.iter()) {
             // narrower columns have no bars
-            buf.set_line(x, y, &row.line(look, width >= 40), width);
+            buf.set_line(x, y, &row.line(look, width >= 40, changes), width);
         }
         if let Some((i, style)) = mark.filter(|&(i, _)| i < rows.len()) {
             buf.set_style(Rect::new(x, 1 + i as u16, width, 1), style);
@@ -814,6 +816,7 @@ fn shows_every_key_on_question_mark() {
         "o                 open",
         "space             pick or unpick the selected item, to delete by hand later",
         "p                 list the picks, with their sizes now; space unpicks",
+        "c                 sort by how much each item changed this session; again for size",
         "s                 rescan the selected directory",
         "S                 rescan everything",
         "/                 filter the column by text; Enter keeps the filter, Esc clears it",
@@ -1089,13 +1092,14 @@ fn labels_dirs_by_how_safe_deleting_them_is() {
     );
     press(&mut b, &[KeyCode::Down]);
     let npm = [Row::file(12288, 12288 + d, "m")];
-    let footer = "[cache: npm] npm packages: npm install rebuilds them";
+    let footer = "[cache: npm] npm install rebuilds it.  r reveal to delete  space pick";
     assert_eq!(
         render_in(WIDE, |f| b.draw(f, now())),
         screen(1, &npm, footer)
     );
     press(&mut b, &[KeyCode::End, KeyCode::Up]);
-    let footer = "[downloads] downloaded files, often old installers and archives";
+    let footer =
+        "[downloads] downloaded files, often old installers and archives.  r reveal  space pick";
     assert_eq!(
         render_in(WIDE, |f| b.draw(f, now())),
         screen(6, &[], footer)
@@ -1328,9 +1332,15 @@ fn follows_changes(inotify: bool, within: Duration, at: fn(&Path) -> PathBuf) {
         };
         let scanned = SCANNED.replace("0 s", age);
         let title = format!("/live  {}{change}{scanned}", kib(a + d));
+        // each file's change since it was first shown, at the scan
+        let was = |name| match name {
+            "keep" => 4096,
+            "gone" => 8192,
+            _ => 0,
+        };
         let files: Vec<Row> = files
             .iter()
-            .map(|&(size, name)| Row::file(size, a, name))
+            .map(|&(size, name)| Row::file(size, a, name).changed(size as i64 - was(name)))
             .collect();
         let root = [Row::dir(a, a + d, "a").changed(delta)];
         screen(&title, [&[], &root, &files], None, 0, HELP)
@@ -1629,4 +1639,52 @@ fn picks_items_and_lists_them() {
     press(&mut b, &[KeyCode::Char(' ')]);
     let head = format!("1 picked, {} in all:", kib(a));
     assert_eq!(draw(&mut b, now()), listed(&title, &head, &gone[..1], 0));
+}
+
+/// ```text
+/// root/
+///   big/f      16384
+///   small/f     4096
+/// ```
+///
+/// then `small/new` (8192) created and `small/` rescanned. `c` sorts by
+/// change, so `small/` goes above the larger `big/`, and again by size.
+#[test]
+fn sorts_by_change_on_c() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("big")).unwrap();
+    fs::create_dir(root.join("small")).unwrap();
+    file(&root.join("big/f"), 16384);
+    file(&root.join("small/f"), 4096);
+    let mut b = scanned(root, Desktop::None);
+    file(&root.join("small/new"), 8192);
+    press(&mut b, &[KeyCode::Down, KeyCode::Char('s')]);
+    while b.poll(now()) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let d = common::own_bytes(root);
+    let (big, small) = (16384 + d, 12288 + d);
+    let total = big + small + d;
+    let title = format!("/fixture  {}  (+8.0 KiB in 0 s){SCANNED}", kib(total));
+    let bigs = Row::dir(big, total, "big");
+    let smalls = Row::dir(small, total, "small").changed(8192);
+    // `small/` was not shown before it changed, so its files' sizes then
+    // are not known; its own change is
+    let files = [Row::file(8192, small, "new"), Row::file(4096, small, "f")];
+    // the cursor stays on `small/`
+    let by_size = screen(
+        &title,
+        [&[], &[bigs.clone(), smalls.clone()], &files],
+        None,
+        1,
+        HELP,
+    );
+    assert_eq!(draw(&mut b, now()), by_size);
+    press(&mut b, &[KeyCode::Char('c')]);
+    let title = format!("{title}  [by change]");
+    let by_change = screen(&title, [&[], &[smalls, bigs], &files], None, 0, HELP);
+    assert_eq!(draw(&mut b, now()), by_change);
+    press(&mut b, &[KeyCode::Char('c')]);
+    assert_eq!(draw(&mut b, now()), by_size);
 }

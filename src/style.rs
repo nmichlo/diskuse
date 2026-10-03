@@ -53,8 +53,8 @@ const COLOR: Styles = Styles {
     cache: Style::new().fg(Color::Green),
     known: Style::new().fg(Color::Yellow),
     picked: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-    grew: Style::new().fg(Color::Magenta),
-    shrank: Style::new().fg(Color::Cyan),
+    grew: Style::new().fg(Color::Red),
+    shrank: Style::new().fg(Color::Green),
 };
 
 const PLAIN: Styles = Styles {

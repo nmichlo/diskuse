@@ -160,6 +160,12 @@ pub struct Browser {
     picks: Vec<Vec<u8>>,
     /// The list of picks, while it is shown.
     picking: Option<Picks>,
+    /// The sizes of the files of each dir shown since the session started,
+    /// by the dir's path below the root, as when first shown.
+    seen: HashMap<Vec<u8>, HashMap<Box<[u8]>, u64>>,
+    /// Rows sort by how much they grew since the session started, not by
+    /// size.
+    by_change: bool,
 }
 
 /// The cursor and first row drawn of the list of picks.
@@ -376,6 +382,8 @@ impl Browser {
             baseline: None,
             picks: Vec::new(),
             picking: None,
+            seen: HashMap::new(),
+            by_change: false,
         };
         if let Some(cache) = &b.env.cache {
             match cache.load_picks(root) {
@@ -647,6 +655,10 @@ impl Browser {
                 }
             }
             KeyCode::Char('p') => self.picking = Some(Picks::default()),
+            KeyCode::Char('c') => {
+                self.by_change = !self.by_change;
+                self.rows.clear();
+            }
             KeyCode::Char('q') | KeyCode::Esc => return ControlFlow::Break(()),
             _ => {}
         }
@@ -869,16 +881,19 @@ impl Browser {
         let styles = Styles::new(self.env.color);
         let total = view.totals.size[d as usize];
         let dir = below(&view.tree, d);
+        let look = Look {
+            bar: area.width >= BAR_COLUMN,
+            changes: rows.iter().any(|r| r.delta != 0),
+        };
         let lines = (area.y..area.bottom()).zip(rows.iter().enumerate().skip(offset));
         for (y, (i, row)) in lines {
-            let bar = area.width >= BAR_COLUMN;
             let files = &self.files[&d];
             let picked = !self.picks.is_empty() && {
                 let mut path = dir.clone();
                 join_below(&mut path, name(view, files, row.item));
                 self.picks.contains(&path)
             };
-            let line = line(view, files, row, total, bar, picked, styles);
+            let line = line(view, files, row, total, look, picked, styles);
             buf.set_line(area.x, y, &line, area.width);
             if let Some((_, style)) = mark.filter(|&(at, _)| at == i) {
                 buf.set_style(
@@ -1087,21 +1102,43 @@ impl Browser {
                 delta,
             }
         });
+        // a file's size when its dir was first shown since the session
+        // started; one new since in a dir shown before grew from nothing
+        let dir = below(&view.tree, d);
+        let counting = self.baseline.is_some() && view.status == Status::Done;
+        let known = self.seen.get(&dir);
+        let file_delta = |name: &[u8], size: u64| match (counting, known) {
+            (true, Some(sizes)) => size as i64 - sizes.get(name).copied().unwrap_or(0) as i64,
+            _ => 0,
+        };
         let mut rows: Vec<Row> = (files.iter().enumerate())
-            .map(|(i, &(_, size, private))| Row {
-                size,
-                private,
+            .map(|(i, (name, size, private))| Row {
+                size: *size,
+                private: *private,
                 item: Item::File(i as u32),
                 label: None,
-                delta: 0,
+                delta: file_delta(name, *size),
             })
             .chain(dirs)
             .collect();
-        // names are unique in a dir, so this order is total
-        rows.sort_unstable_by(|a, b| {
-            let key = |r: &Row| (r.size, name(view, files, r.item));
-            largest_first(key(a), key(b))
-        });
+        // names are unique in a dir, so these orders are total
+        match self.by_change {
+            true => rows.sort_unstable_by(|a, b| {
+                let key = |r: &Row| (r.size, name(view, files, r.item));
+                b.delta.cmp(&a.delta).then(largest_first(key(a), key(b)))
+            }),
+            false => rows.sort_unstable_by(|a, b| {
+                let key = |r: &Row| (r.size, name(view, files, r.item));
+                largest_first(key(a), key(b))
+            }),
+        }
+        if counting && known.is_none() {
+            let sizes = files
+                .iter()
+                .map(|(n, size, _)| (n.clone(), *size))
+                .collect();
+            self.seen.insert(dir, sizes);
+        }
         self.rows.insert(d, rows);
     }
 
@@ -1237,6 +1274,10 @@ impl Browser {
             }
             _ => String::new(),
         };
+        let sorted = match self.by_change {
+            true => "  [by change]",
+            false => "",
+        };
         let rescanning = match self.scan.as_ref().and_then(|s| s.dir.as_deref()) {
             Some(dir) => format!("  rescanning {}/...", String::from_utf8_lossy(dir)),
             None => String::new(),
@@ -1247,9 +1288,11 @@ impl Browser {
                 // changes in the dirs not shown are not seen since
                 Some(dirs) => {
                     let age = age(now.duration_since(dirs.scanned).unwrap_or_default());
-                    format!("{root}  {total}{change}{partial}  scanned {age} ago{rescanning}")
+                    format!(
+                        "{root}  {total}{change}{partial}  scanned {age} ago{sorted}{rescanning}"
+                    )
                 }
-                None => format!("{root}  {total}{change}{partial}{rescanning}"),
+                None => format!("{root}  {total}{change}{partial}{sorted}{rescanning}"),
             },
             Status::Saved { at } => {
                 let age = age(now.duration_since(at).unwrap_or_default());
@@ -1275,7 +1318,12 @@ impl Browser {
             None if self.typing => format!("/{}  enter keep  esc clear", self.filter),
             None if self.filter.is_empty() && self.label_at_cursor().is_some() => {
                 let label = self.label_at_cursor().unwrap();
-                format!("[{}] {}", label.text, label.why)
+                let act = match label.tier {
+                    Tier::Cache => "  r reveal to delete  space pick",
+                    Tier::Known => "  r reveal  space pick",
+                    Tier::System => "",
+                };
+                format!("[{}] {}.{act}", label.text, label.why)
             }
             None if !self.filter.is_empty() => format!("/{}  esc clear", self.filter),
             None => HELP.into(),
@@ -1333,12 +1381,22 @@ fn list(tree: &Tree, d: u32, private: bool) -> Files {
 
 /// Row `row` of a dir of `total` bytes listed as `files`: its sizes, a bar
 /// of its share of `total` if `bar`, and its name.
+/// How a column draws its rows.
+#[derive(Clone, Copy)]
+struct Look {
+    /// The share bar, in columns wide enough.
+    bar: bool,
+    /// The change since the session started, when some row of the column
+    /// changed.
+    changes: bool,
+}
+
 fn line(
     view: &View,
     files: &Files,
     row: &Row,
     total: u64,
-    bar: bool,
+    look: Look,
     picked: bool,
     styles: &Styles,
 ) -> Line<'static> {
@@ -1357,8 +1415,15 @@ fn line(
     if view.reclaimable {
         spans.extend([size(row.private), Span::styled(plus, styles.dim)]);
     }
+    if look.changes {
+        spans.push(match row.delta {
+            0 => Span::raw(format!("{:11}", "")),
+            d @ 1.. => Span::styled(format!("{:>11}", signed(d)), styles.grew),
+            d => Span::styled(format!("{:>11}", signed(d)), styles.shrank),
+        });
+    }
     spans.push(Span::raw(" "));
-    if bar {
+    if look.bar {
         spans.extend(self::bar(row.size, total, styles.size(row.size), styles));
         spans.push(Span::raw(" "));
     }
@@ -1377,11 +1442,6 @@ fn line(
                     Tier::Known => styles.known,
                 };
                 spans.push(Span::styled(format!("  [{}]", l.text), style));
-            }
-            match row.delta {
-                0 => {}
-                d @ 1.. => spans.push(Span::styled(format!("  {}", signed(d)), styles.grew)),
-                d => spans.push(Span::styled(format!("  {}", signed(d)), styles.shrank)),
             }
         }
         Item::File(_) => spans.push(Span::raw(label)),
