@@ -40,38 +40,82 @@ struct ArrayCallBacks {
 /// the paths are a C array of C strings.
 type Callback = extern "C" fn(StreamRef, *mut c_void, usize, *mut c_void, *const u32, *const u64);
 
-#[link(name = "CoreServices", kind = "framework")]
-unsafe extern "C" {
-    fn FSEventStreamCreate(
-        allocator: CFRef,
-        callback: Callback,
-        context: *const Context,
-        paths: CFRef,
-        since_when: u64,
-        latency: f64,
-        flags: u32,
-    ) -> StreamRef;
-    fn FSEventStreamSetDispatchQueue(stream: StreamRef, queue: Queue);
-    fn FSEventStreamStart(stream: StreamRef) -> u8;
-    fn FSEventStreamStop(stream: StreamRef);
-    fn FSEventStreamFlushSync(stream: StreamRef);
-    fn FSEventStreamInvalidate(stream: StreamRef);
-    fn FSEventStreamRelease(stream: StreamRef);
-    fn FSEventsGetCurrentEventId() -> u64;
-    fn FSEventsCopyUUIDForDevice(dev: libc::dev_t) -> CFRef;
+/// The CoreServices and CoreFoundation functions used here, loaded on
+/// first use rather than linked, so a run that never watches (`scan`,
+/// `show`) skips loading both frameworks: about 1.1 ms of the 4 ms a run
+/// takes to start.
+struct Api {
+    stream_create:
+        unsafe extern "C" fn(CFRef, Callback, *const Context, CFRef, u64, f64, u32) -> StreamRef,
+    set_dispatch_queue: unsafe extern "C" fn(StreamRef, Queue),
+    start: unsafe extern "C" fn(StreamRef) -> u8,
+    stop: unsafe extern "C" fn(StreamRef),
+    flush_sync: unsafe extern "C" fn(StreamRef),
+    invalidate: unsafe extern "C" fn(StreamRef),
+    release: unsafe extern "C" fn(StreamRef),
+    current_event_id: unsafe extern "C" fn() -> u64,
+    copy_uuid_for_device: unsafe extern "C" fn(libc::dev_t) -> CFRef,
+    array_callbacks: *const ArrayCallBacks,
+    string_create: unsafe extern "C" fn(CFRef, *const c_char) -> CFRef,
+    array_create:
+        unsafe extern "C" fn(CFRef, *const CFRef, CFIndex, *const ArrayCallBacks) -> CFRef,
+    cf_release: unsafe extern "C" fn(CFRef),
 }
 
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    static kCFTypeArrayCallBacks: ArrayCallBacks;
-    fn CFStringCreateWithFileSystemRepresentation(alloc: CFRef, path: *const c_char) -> CFRef;
-    fn CFArrayCreate(
-        alloc: CFRef,
-        values: *const CFRef,
-        count: CFIndex,
-        callbacks: *const ArrayCallBacks,
-    ) -> CFRef;
-    fn CFRelease(cf: CFRef);
+// SAFETY: function pointers and a pointer to an immutable static of the
+// framework, which stays loaded.
+unsafe impl Send for Api {}
+unsafe impl Sync for Api {}
+
+/// `p` as a function pointer of type `F`.
+///
+/// # Safety
+/// `p` must point to a function of type `F`.
+unsafe fn cast<F: Copy>(p: *mut c_void) -> F {
+    const { assert!(size_of::<F>() == size_of::<*mut c_void>()) };
+    // SAFETY: same size, and the caller vouches for the type.
+    unsafe { std::mem::transmute_copy(&p) }
+}
+
+/// The functions, or `None` if a framework or symbol is missing, which no
+/// macOS since 10.5 lacks.
+fn api() -> Option<&'static Api> {
+    static API: std::sync::OnceLock<Option<Api>> = std::sync::OnceLock::new();
+    API.get_or_init(|| {
+        let open = |path: &CStr| {
+            // SAFETY: a NUL-terminated path; a system framework has no
+            // initializers that depend on us.
+            let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+            (!handle.is_null()).then_some(handle)
+        };
+        let cs = open(c"/System/Library/Frameworks/CoreServices.framework/CoreServices")?;
+        let cf = open(c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")?;
+        let sym = |handle, name: &CStr| {
+            // SAFETY: a live handle and a NUL-terminated name.
+            let p = unsafe { libc::dlsym(handle, name.as_ptr()) };
+            (!p.is_null()).then_some(p)
+        };
+        // SAFETY: each symbol is the framework function of that name, with
+        // the signature declared in `Api` (from the framework headers).
+        unsafe {
+            Some(Api {
+                stream_create: cast(sym(cs, c"FSEventStreamCreate")?),
+                set_dispatch_queue: cast(sym(cs, c"FSEventStreamSetDispatchQueue")?),
+                start: cast(sym(cs, c"FSEventStreamStart")?),
+                stop: cast(sym(cs, c"FSEventStreamStop")?),
+                flush_sync: cast(sym(cs, c"FSEventStreamFlushSync")?),
+                invalidate: cast(sym(cs, c"FSEventStreamInvalidate")?),
+                release: cast(sym(cs, c"FSEventStreamRelease")?),
+                current_event_id: cast(sym(cs, c"FSEventsGetCurrentEventId")?),
+                copy_uuid_for_device: cast(sym(cs, c"FSEventsCopyUUIDForDevice")?),
+                array_callbacks: sym(cf, c"kCFTypeArrayCallBacks")?.cast(),
+                string_create: cast(sym(cf, c"CFStringCreateWithFileSystemRepresentation")?),
+                array_create: cast(sym(cf, c"CFArrayCreate")?),
+                cf_release: cast(sym(cf, c"CFRelease")?),
+            })
+        }
+    })
+    .as_ref()
 }
 
 // libdispatch, part of libSystem
@@ -102,6 +146,7 @@ const LATENCY: f64 = 0.05;
 
 /// A running stream, stopped when dropped.
 pub struct Stream {
+    api: &'static Api,
     stream: StreamRef,
     queue: Queue,
     /// Owned by the stream's callback until the stream is drained.
@@ -115,12 +160,13 @@ impl Stream {
         // SAFETY: `stream` is started and stays valid until `Drop`; the
         // callback runs on our queue, not on this thread, so this cannot
         // wait on itself.
-        unsafe { FSEventStreamFlushSync(self.stream) }
+        unsafe { (self.api.flush_sync)(self.stream) }
     }
 
     /// Sends the changes below `path` with event ids after `since`, first
     /// the recorded ones, then live ones, in batches to `tx`.
     pub fn start(path: &CStr, since: u64, tx: Sender<Vec<Event>>) -> Option<Self> {
+        let api = api()?;
         let tx = Box::into_raw(Box::new(tx));
         let context = Context {
             version: 0,
@@ -133,15 +179,15 @@ impl Stream {
         // released once the stream holds its own copy. `context` is copied
         // by the call; its `info` stays valid until `Drop` frees it.
         let stream = unsafe {
-            let string = CFStringCreateWithFileSystemRepresentation(ptr::null(), path.as_ptr());
+            let string = (api.string_create)(ptr::null(), path.as_ptr());
             if string.is_null() {
                 drop(Box::from_raw(tx));
                 return None;
             }
-            let paths = CFArrayCreate(ptr::null(), &string, 1, &raw const kCFTypeArrayCallBacks);
-            CFRelease(string);
+            let paths = (api.array_create)(ptr::null(), &string, 1, api.array_callbacks);
+            (api.cf_release)(string);
             let flags = FILE_EVENTS | WATCH_ROOT | NO_DEFER;
-            let stream = FSEventStreamCreate(
+            let stream = (api.stream_create)(
                 ptr::null(),
                 callback,
                 &context,
@@ -150,7 +196,7 @@ impl Stream {
                 LATENCY,
                 flags,
             );
-            CFRelease(paths);
+            (api.cf_release)(paths);
             stream
         };
         if stream.is_null() {
@@ -160,11 +206,16 @@ impl Stream {
         }
         // SAFETY: a serial queue of our own, and the live `stream`.
         let queue = unsafe { dispatch_queue_create(c"disksweep.fsevents".as_ptr(), ptr::null()) };
-        let s = Self { stream, queue, tx };
+        let s = Self {
+            api,
+            stream,
+            queue,
+            tx,
+        };
         // SAFETY: as above. If it does not start, `Drop` cleans up.
         let started = unsafe {
-            FSEventStreamSetDispatchQueue(stream, queue);
-            FSEventStreamStart(stream)
+            (api.set_dispatch_queue)(stream, queue);
+            (api.start)(stream)
         };
         (started != 0).then_some(s)
     }
@@ -176,10 +227,10 @@ impl Drop for Stream {
         // SAFETY: stops the stream, then waits on its serial queue for any
         // callback already running, so none can use `tx` once it is freed.
         unsafe {
-            FSEventStreamStop(self.stream);
-            FSEventStreamInvalidate(self.stream);
+            (self.api.stop)(self.stream);
+            (self.api.invalidate)(self.stream);
             dispatch_sync_f(self.queue, ptr::null_mut(), nothing);
-            FSEventStreamRelease(self.stream);
+            (self.api.release)(self.stream);
             dispatch_release(self.queue);
             drop(Box::from_raw(self.tx));
         }
@@ -228,23 +279,26 @@ fn event(flags: u32, path: &[u8]) -> Event {
     }
 }
 
-/// The id of the latest event on the system.
+/// The id of the latest event on the system, or 0 without FSEvents.
 pub fn current_event_id() -> u64 {
     // SAFETY: takes nothing, touches no memory of ours.
-    unsafe { FSEventsGetCurrentEventId() }
+    api().map_or(0, |api| unsafe { (api.current_event_id)() })
 }
 
 /// Whether device `dev` keeps a record of changes. A network share or a
 /// read-only volume does not, so FSEvents only sees the changes this Mac
 /// makes there.
 pub fn records_changes(dev: u64) -> bool {
+    let Some(api) = api() else {
+        return false;
+    };
     // `st_dev` is an `i32` on macOS, widened by `DirStat`
     // SAFETY: returns a new reference or null.
-    let uuid = unsafe { FSEventsCopyUUIDForDevice(dev as libc::dev_t) };
+    let uuid = unsafe { (api.copy_uuid_for_device)(dev as libc::dev_t) };
     if uuid.is_null() {
         return false;
     }
     // SAFETY: a live reference of ours.
-    unsafe { CFRelease(uuid) };
+    unsafe { (api.cf_release)(uuid) };
     true
 }

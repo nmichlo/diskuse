@@ -94,14 +94,26 @@ impl std::error::Error for ScanError {}
 /// limit, since the walk holds many directory fds open at once, and on macOS
 /// it stops iCloud placeholder files from downloading.
 pub fn scan(root: &Path, opts: &ScanOptions) -> Result<Tree, ScanError> {
-    scan_live(root, opts, |_| {})
+    walk_root(root, opts, false, |_| {})
 }
 
 /// [`scan`], first handing `progress` a [`Progress`] that reads the tree
-/// while it is built, from any thread.
+/// while it is built, from any thread. The tree can be watched from when
+/// the scan started ([`Tree::since`]).
 pub fn scan_live(
     root: &Path,
     opts: &ScanOptions,
+    progress: impl FnOnce(Progress),
+) -> Result<Tree, ScanError> {
+    walk_root(root, opts, true, progress)
+}
+
+/// [`scan_live`], taking the OS's event id to watch from only if `watch`,
+/// as that loads the frameworks for it on macOS.
+fn walk_root(
+    root: &Path,
+    opts: &ScanOptions,
+    watch: bool,
     progress: impl FnOnce(Progress),
 ) -> Result<Tree, ScanError> {
     sys::raise_fd_limit();
@@ -111,7 +123,7 @@ pub fn scan_live(
     let lister = lister(&fd, opts).map_err(|e| ScanError::Root(e.into()))?;
     // taken first, so a watch from here also sees the changes made while
     // the walk runs
-    let since = sys::event_id();
+    let since = if watch { sys::event_id() } else { 0 };
     let (pool, gate) = pool(opts).map_err(ScanError::ThreadPool)?;
     let tree = Builder::new(root.as_os_str().as_bytes(), opts.reclaimable);
     let walk = Walk::new(tree, Links::new(), st.dev, lister, opts.stop.clone(), gate);
