@@ -16,7 +16,7 @@
 //! kept until another scan's tree is shown.
 
 use crate::access::{reason, terminal_app};
-use crate::labels;
+use crate::labels::{self, Label, Tier};
 use crate::report::{format_size, largest_files, largest_first, suffix};
 use crate::reveal::Desktop;
 use crate::scan::{ScanError, ScanOptions, Stop, scan_live};
@@ -50,6 +50,9 @@ const PANEL_HELP: &str = "arrows/jk scroll  d close  ? help  q quit";
 const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
 const PICKS_HELP: &str = "arrows/jk move  r reveal  o open  space unpick  p close  ? help  q quit";
 
+/// How a valid `CACHEDIR.TAG` starts (<https://bford.info/cachedir/>).
+const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
 /// The width of the bar of a row's share of its dir.
 const BAR: u64 = 10;
 
@@ -72,6 +75,8 @@ pub struct Env {
     pub inotify: bool,
     /// Draw in colour. Off when `NO_COLOR` is set and not empty.
     pub color: bool,
+    /// The home dir, for the labels of known folders in it.
+    pub home: Option<PathBuf>,
 }
 
 impl Env {
@@ -83,6 +88,7 @@ impl Env {
             cache: CacheDir::from_env().ok(),
             inotify: true,
             color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+            home: std::env::var_os("HOME").map(PathBuf::from),
         }
     }
 }
@@ -91,6 +97,8 @@ impl Env {
 /// [`Browser::poll`], drawn by [`Browser::draw`].
 pub struct Browser {
     root: PathBuf,
+    /// The real path of the root, for the labels of known folders.
+    real: Option<PathBuf>,
     /// The root as the title shows it.
     display: String,
     env: Env,
@@ -287,7 +295,7 @@ struct Row {
     private: u64,
     item: Item,
     /// From [`labels::label`], for a dir.
-    label: Option<&'static str>,
+    label: Option<Label>,
     /// Bytes a dir grew by since the session started, or shrank by if
     /// negative. 0 for a file.
     delta: i64,
@@ -338,6 +346,7 @@ impl Browser {
     ) -> Self {
         let mut b = Self {
             root: root.into(),
+            real: std::fs::canonicalize(root).ok(),
             display: display.into(),
             env,
             used,
@@ -1039,14 +1048,31 @@ impl Browser {
         let parent = Path::new(OsStr::from_bytes(view.tree.name(view.tree.record(d).name)));
         let parent = parent.file_name().unwrap_or_default().as_bytes();
         let sibling = |file: &str| files.iter().any(|f| *f.0 == *file.as_bytes());
+        let real = self.real.as_ref().map(|real| {
+            let mut real = real.as_os_str().as_bytes().to_vec();
+            join(&mut real, &below(&view.tree, d));
+            real
+        });
+        let home = self.env.home.as_ref().map(|h| h.as_os_str().as_bytes());
         let dirs = view.index.children(d).iter().map(|&k| {
             let name = view.tree.name(view.tree.record(k).name);
-            let inside = |file: &str| {
-                let mut path = path.clone();
-                join(&mut path, name);
-                join(&mut path, file.as_bytes());
-                sys::exists(Path::new(OsStr::from_bytes(&path)))
+            let mut at = path.clone();
+            join(&mut at, name);
+            let at = Path::new(OsStr::from_bytes(&at));
+            let real = real.as_ref().map(|real| {
+                let mut real = real.clone();
+                join(&mut real, name);
+                real
+            });
+            let dir = labels::Dir {
+                name,
+                parent,
+                path: real.as_deref(),
+                home,
             };
+            let inside = |file: &str| sys::exists(&at.join(file));
+            let system = || sys::restricted(at);
+            let tagged = || sys::starts_with(&at.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE);
             let size = view.totals.size[k as usize];
             // snapshots of a scan are of other ids
             let delta = match (&self.baseline, view.status) {
@@ -1057,7 +1083,7 @@ impl Browser {
                 size,
                 private: view.totals.private[k as usize],
                 item: Item::Dir(k),
-                label: labels::label(name, parent, sibling, inside),
+                label: labels::label(&dir, sibling, inside, system, tagged),
                 delta,
             }
         });
@@ -1138,6 +1164,11 @@ impl Browser {
         {
             self.message = Some(format!("warning: picks not saved: {e}"));
         }
+    }
+
+    /// The label of the row at the cursor, if any.
+    fn label_at_cursor(&self) -> Option<Label> {
+        self.current.get(self.cursor)?.label
     }
 
     /// The path of the row at the cursor, below the root.
@@ -1242,6 +1273,10 @@ impl Browser {
             None if self.top.is_some() => TOP_HELP.into(),
             None if self.picking.is_some() => PICKS_HELP.into(),
             None if self.typing => format!("/{}  enter keep  esc clear", self.filter),
+            None if self.filter.is_empty() && self.label_at_cursor().is_some() => {
+                let label = self.label_at_cursor().unwrap();
+                format!("[{}] {}", label.text, label.why)
+            }
             None if !self.filter.is_empty() => format!("/{}  esc clear", self.filter),
             None => HELP.into(),
         }
@@ -1336,7 +1371,12 @@ fn line(
                 _ => Span::styled(marker, styles.denied),
             });
             if let Some(l) = row.label {
-                spans.push(Span::styled(format!("  [{l}]"), styles.dim));
+                let style = match l.tier {
+                    Tier::System => styles.system,
+                    Tier::Cache => styles.cache,
+                    Tier::Known => styles.known,
+                };
+                spans.push(Span::styled(format!("  [{}]", l.text), style));
             }
             match row.delta {
                 0 => {}
@@ -1648,6 +1688,7 @@ mod tests {
             cache: None,
             inotify: true,
             color: true,
+            home: None,
         };
         let mut b = Browser::new(dir.path(), "/scan", env, None, None, false);
         assert!(tree.progress().snapshot().is_none());

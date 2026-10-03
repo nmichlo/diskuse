@@ -250,6 +250,26 @@ pub fn allocated(path: &Path) -> Option<u64> {
         .map(|st| st.st_blocks as u64 * 512)
 }
 
+/// Whether macOS protects `path` from changes (System Integrity
+/// Protection's `restricted` flag), by one `lstat`. Never elsewhere.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn restricted(path: &Path) -> bool {
+    // SF_RESTRICTED, from <sys/stat.h>
+    #[cfg(target_os = "macos")]
+    return rustix::fs::lstat(path).is_ok_and(|st| st.st_flags & 0x0008_0000 != 0);
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+/// Whether the file at `path` starts with `prefix`, by reading only that
+/// much. False if it cannot be read.
+pub fn starts_with(path: &Path, prefix: &[u8]) -> bool {
+    use std::io::Read;
+    let mut head = vec![0; prefix.len()];
+    let read = File::open(path).and_then(|mut f| f.read_exact(&mut head));
+    read.is_ok() && head == prefix
+}
+
 /// Whether `path` is still there, by one `lstat`, which never follows a
 /// final symlink. Only "no such file" counts as gone; any other error
 /// cannot tell, so counts as there.

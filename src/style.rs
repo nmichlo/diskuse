@@ -13,12 +13,16 @@ pub(crate) struct Styles {
     pub dir: Style,
     /// `(denied: EACCES)` and why a dir could not be read.
     pub denied: Style,
-    /// The `+` of a lower bound, `(other device)`, cache labels and hints.
+    /// The `+` of a lower bound, `(other device)` and hints.
     pub dim: Style,
     /// The row at the cursor.
     pub selected: Style,
     /// The current dir's row in the parent column.
     pub parent: Style,
+    /// The labels of dirs macOS protects, caches, and known big folders.
+    pub system: Style,
+    pub cache: Style,
+    pub known: Style,
     /// The `*` after a picked item's name.
     pub picked: Style,
     /// How much a dir grew or shrank since the session started.
@@ -45,6 +49,9 @@ const COLOR: Styles = Styles {
         .bg(Color::Blue)
         .add_modifier(Modifier::BOLD),
     parent: Style::new().fg(Color::White).bg(Color::DarkGray),
+    system: Style::new().fg(Color::Red),
+    cache: Style::new().fg(Color::Green),
+    known: Style::new().fg(Color::Yellow),
     picked: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     grew: Style::new().fg(Color::Magenta),
     shrank: Style::new().fg(Color::Cyan),
@@ -58,6 +65,9 @@ const PLAIN: Styles = Styles {
     selected: Style::new().add_modifier(Modifier::REVERSED),
     // dirs are bold already
     parent: Style::new().add_modifier(Modifier::UNDERLINED),
+    system: Style::new(),
+    cache: Style::new(),
+    known: Style::new(),
     picked: Style::new().add_modifier(Modifier::BOLD),
     grew: Style::new(),
     shrank: Style::new(),

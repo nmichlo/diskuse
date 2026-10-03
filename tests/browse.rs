@@ -144,6 +144,8 @@ enum Kind {
     Denied,
     /// A dir with a cache label.
     Label(&'static str),
+    /// A dir with the label of a known big folder.
+    Known(&'static str),
 }
 
 /// An expected row of a column: `size` bytes of a dir of `of` bytes.
@@ -228,7 +230,11 @@ impl Row {
             ]),
             Kind::Label(label) => spans.extend([
                 Span::styled(name + "/", bold()),
-                Span::styled(format!("  [{label}]"), look.dim()),
+                Span::styled(format!("  [{label}]"), look.fg(Color::Green)),
+            ]),
+            Kind::Known(label) => spans.extend([
+                Span::styled(name + "/", bold()),
+                Span::styled(format!("  [{label}]"), look.fg(Color::Yellow)),
             ]),
         }
         if self.picked {
@@ -341,6 +347,7 @@ fn env(desktop: Desktop) -> Env {
         cache: None,
         inotify: true,
         color: true,
+        home: None,
     }
 }
 
@@ -991,11 +998,15 @@ fn shows_reclaimable_sizes() {
 ///   node_modules/m          12288   [cache: npm]
 ///   target/t                 8192   no label, no Cargo.toml beside it
 ///   __pycache__/p            4096   [cache: python]
+///   tagged/CACHEDIR.TAG             [cache], from the tag
 ///   .venv/pyvenv.cfg            0   [cache: venv]
+///   Downloads/                      [downloads], the root being home
 ///   venv/                           no label, no pyvenv.cfg
 /// ```
+///
+/// The footer explains the label of the row at the cursor.
 #[test]
-fn labels_dirs_tools_rebuild() {
+fn labels_dirs_by_how_safe_deleting_them_is() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     for d in [
@@ -1003,7 +1014,9 @@ fn labels_dirs_tools_rebuild() {
         "node_modules",
         "target",
         "__pycache__",
+        "tagged",
         ".venv",
+        "Downloads",
         "venv",
     ] {
         fs::create_dir_all(root.join(d)).unwrap();
@@ -1019,16 +1032,33 @@ fn labels_dirs_tools_rebuild() {
     for (path, len) in files {
         file(&root.join(path), len);
     }
+    let tag = root.join("tagged/CACHEDIR.TAG");
+    #[allow(clippy::disallowed_methods)]
+    fs::write(&tag, "Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
+    let tag = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(&tag).unwrap().blocks() * 512
+    };
     let d = common::own_bytes(root);
-    let mut b = scanned_as(root, "/labels", Desktop::None, false);
-    let of = 45056 + 8 * d;
+    let env = Env {
+        home: Some(fs::canonicalize(root).unwrap()),
+        ..env(Desktop::None)
+    };
+    let mut b = Browser::new(root, "/labels", env, None, None, false);
+    b.scan();
+    while b.poll(now()) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let of = 45056 + tag + 10 * d;
     let label = |size, name, label| Row::new(size, of, name, Kind::Label(label));
     let rows = [
         Row::dir(20480 + 2 * d, of, "rust"),
         label(12288 + d, "node_modules", "cache: npm"),
         Row::dir(8192 + d, of, "target"),
         label(4096 + d, "__pycache__", "cache: python"),
+        label(tag + d, "tagged", "cache"),
         label(d, ".venv", "cache: venv"),
+        Row::new(d, of, "Downloads", Kind::Known("downloads")),
         Row::dir(d, of, "venv"),
     ];
     let rust = [
@@ -1041,17 +1071,35 @@ fn labels_dirs_tools_rebuild() {
         Row::file(4096, 20480 + 2 * d, "Cargo.toml"),
     ];
     let title = format!("/labels  {}{SCANNED}", kib(of));
-    let expected = screen_in(
-        COLOR,
-        WIDE,
-        WIDE_COLUMNS,
-        &title,
-        [&[], &rows, &rust],
-        None,
-        0,
-        HELP,
+    let screen = |at: usize, preview: &[Row], footer: &str| {
+        screen_in(
+            COLOR,
+            WIDE,
+            WIDE_COLUMNS,
+            &title,
+            [&[], &rows, preview],
+            None,
+            at,
+            footer,
+        )
+    };
+    assert_eq!(
+        render_in(WIDE, |f| b.draw(f, now())),
+        screen(0, &rust, HELP)
     );
-    assert_eq!(render_in(WIDE, |f| b.draw(f, now())), expected);
+    press(&mut b, &[KeyCode::Down]);
+    let npm = [Row::file(12288, 12288 + d, "m")];
+    let footer = "[cache: npm] npm packages: npm install rebuilds them";
+    assert_eq!(
+        render_in(WIDE, |f| b.draw(f, now())),
+        screen(1, &npm, footer)
+    );
+    press(&mut b, &[KeyCode::End, KeyCode::Up]);
+    let footer = "[downloads] downloaded files, often old installers and archives";
+    assert_eq!(
+        render_in(WIDE, |f| b.draw(f, now())),
+        screen(6, &[], footer)
+    );
 }
 
 /// `NO_COLOR`: no colours, but the selection is reversed, the parent

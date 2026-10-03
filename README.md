@@ -235,11 +235,20 @@ shows them in a second column after each size. A saved scan made without
    1.0 MiB    1.0 MiB  solo/
 ```
 
-Directories that tools rebuild on demand get a label after the name:
+Directories get a label after the name, coloured by how safe deleting them
+is, and the footer explains the label of the selected one:
 
 ```text
- 412.3 MiB  node_modules/  [cache: npm]
+ 412.3 MiB  node_modules/  [cache: npm]       green: a tool rebuilds it
+  38.2 GiB  CoreSimulator/  [simulators]      yellow: clean up from its app
+  12.1 GiB  System/  [system]                 red: macOS protects it
 ```
+
+| Tier   | Colour | When                                                                 |
+| ------ | ------ | -------------------------------------------------------------------- |
+| system | red    | macOS protects it (System Integrity Protection's `restricted` flag)  |
+| cache  | green  | a rule below matches, or it holds a `CACHEDIR.TAG` (cargo, pip, ...) |
+| known  | yellow | a big folder macOS or a common app keeps, listed in `src/labels.rs`  |
 
 | Directory            | Label           | Only when                               |
 | -------------------- | --------------- | --------------------------------------- |
@@ -252,10 +261,16 @@ Directories that tools rebuild on demand get a label after the name:
 | `.cache`             | `cache`         |                                         |
 | `Caches`             | `cache`         | it is in a directory named `Library`    |
 
+Known folders include the Trash, Downloads, Xcode archives and device
+support, iOS simulators, iPhone backups, Docker Desktop's disk image, Mail,
+Messages, the Photos library, the Android SDK, Rust toolchains, the cargo,
+npm and Go module caches, Ollama models, swap and per-user temporary files.
+
 A label never deletes anything. To delete a labelled directory, reveal it
-with `r` and delete it by hand. Labels come from the listing a directory is
-in, so they cost no extra reads, except the venv rule: one `lstat` of
-`pyvenv.cfg` per venv shown.
+with `r` and delete it by hand. Labels are worked out only for the
+directories on screen, so they cost the scan nothing: one `lstat` for the
+system flag, and one more for the venv rule or one small read for
+`CACHEDIR.TAG`.
 
 Once a scan of a volume's root is done, a line under the columns says how
 many of the volume's used bytes the scan did not find, if any:
