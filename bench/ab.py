@@ -60,16 +60,23 @@ def main() -> int:
     ok = True
     for d in a.dirs:
         print(f"\n{d}")
-        print(f"  {'build':<12}{'wall s':>10}{'cpu s':>10}{'instr G':>10}{'mem MiB':>10}")
+        print(
+            f"  {'build':<12}{'wall s':>10}{'cpu s':>10}{'instr G':>10}{'mem MiB':>10}"
+        )
         base = None
         for name, _ in bins:
-            m = {k: statistics.median(s[k] for s in runs[d, name]) for k in runs[d, name][0]}
+            m = {
+                k: statistics.median(s[k] for s in runs[d, name])
+                for k in runs[d, name][0]
+            }
             row = [m["wall"], m["cpu"], m["instr"] / 1e9, m["mem"] / 2**20]
             line = f"  {name:<12}" + "".join(f"{v:>10.3f}" for v in row)
             if base is None:
                 base = row
             else:
-                line += "   " + " ".join(f"{(v / max(b, 1e-9) - 1) * 100:+.1f}%" for v, b in zip(row, base))
+                line += "   " + " ".join(
+                    f"{(v / max(b, 1e-9) - 1) * 100:+.1f}%" for v, b in zip(row, base)
+                )
             print(line)
         if len(set(outs[d].values())) > 1:
             print("  OUTPUT DIFFERS")
