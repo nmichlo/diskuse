@@ -32,8 +32,7 @@ const COLUMNS: [(usize, usize); 3] = [(0, 33), (34, 32), (67, 33)];
 /// A wider terminal, for rows too long for 100 columns.
 const WIDE: usize = 130;
 const WIDE_COLUMNS: [(usize, usize); 3] = [(0, 43), (44, 42), (87, 43)];
-const HELP: &str =
-    "arrows/hjkl move  r reveal  o open  R rescan  / filter  d denied  t top files  ? help  q quit";
+const HELP: &str = "arrows/hjkl move  r reveal  o open  s/S rescan  / filter  d denied  t top files  ? help  q quit";
 const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
 const VOLUMES_HELP: &str = "arrows/jk move  enter scan  ? help  q quit";
 const GIB: u64 = 1 << 30;
@@ -787,7 +786,8 @@ fn shows_every_key_on_question_mark() {
         "Left Backspace h  go to the parent directory",
         "r                 reveal in Finder or the file manager",
         "o                 open",
-        "R                 rescan",
+        "s                 rescan the selected directory",
+        "S                 rescan everything",
         "/                 filter the column by text; Enter keeps the filter, Esc clears it",
         "d                 list the directories that could not be read, and why",
         "t                 list the largest files",
@@ -1430,4 +1430,58 @@ fn rescans_over_a_stopped_saved_scan() {
     let f = [Row::file(4096, x, "f")];
     let expected = screen(&title, [&[], &rows, &f], None, 0, HELP);
     assert_eq!(draw(&mut b, now()), expected);
+}
+
+/// ```text
+/// root/
+///   a/x/f    4096
+///   b/g      4096
+/// ```
+///
+/// then `a/x/new` (8192) created. `s` on `a/` scans it again while the
+/// tree shown stays, and `S` scans all again, keeping what the session's
+/// changes are counted against.
+#[test]
+fn rescans_the_selected_dir_or_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("a/x")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    file(&root.join("a/x/f"), 4096);
+    file(&root.join("b/g"), 4096);
+    let mut b = scanned(root, Desktop::None);
+    let d = common::own_bytes(root);
+    let shown = |new: u64, title_end: &str| {
+        let (x, bb) = (4096 + d + new, 4096 + d);
+        let (a, total) = (x + d, x + bb + 2 * d);
+        let change = match new {
+            0 => String::new(),
+            _ => format!("  (+{} in 0 s)", kib(new)),
+        };
+        let title = format!("/fixture  {}{change}{SCANNED}{title_end}", kib(total));
+        let root = [
+            Row::dir(a, total, "a").changed(new as i64),
+            Row::dir(bb, total, "b"),
+        ];
+        let preview = [Row::dir(x, a, "x").changed(new as i64)];
+        screen(&title, [&[], &root, &preview], None, 0, HELP)
+    };
+    file(&root.join("a/x/new"), 8192);
+
+    press(&mut b, &[KeyCode::Char('s')]);
+    assert_eq!(draw(&mut b, now()), shown(0, "  rescanning a/..."));
+    while b.poll(now()) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(draw(&mut b, now()), shown(8192, ""));
+
+    press(&mut b, &[KeyCode::Char('S')]);
+    assert_eq!(
+        draw(&mut b, now()),
+        screen("/fixture  scanning...", [&[], &[], &[]], None, 0, HELP)
+    );
+    while b.poll(now()) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(draw(&mut b, now()), shown(8192, ""));
 }

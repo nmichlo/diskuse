@@ -137,11 +137,20 @@ macOS every change below `<path>`, including those made while it scanned.
 
 On Linux only the directories on screen follow changes: those
 of the three columns. inotify reports their changes, so they show within
-about a second. Changes anywhere else show after a rescan (`R`), so the title
+about a second. Changes anywhere else show after a rescan (`s` or `S`), so the title
 says how old the scan is:
 
 ```text
 /home/me  41.2 GiB  scanned 4 min ago
+```
+
+Each directory shows how much it grew or shrank since the first scan of the
+session finished, and the title shows the same for `<path>`, with since when.
+Rescans keep counting from that first scan:
+
+```text
+/Users/me  412.0 GiB  (+2.1 GiB in 12 min)
+  41.2 GiB  ####...... Library/  +1.3 GiB
 ```
 
 On network filesystems inotify misses the changes other machines make, and
@@ -164,7 +173,8 @@ macOS records no changes for, like a network share, is followed the same way.
 | Left, Backspace, `h` | Go to the parent directory, not above `<path>`             |
 | `r`                  | Reveal the selected item in Finder or the file manager     |
 | `o`                  | Open the selected item                                     |
-| `R`                  | Rescan all of `<path>`                                     |
+| `s`                  | Rescan the selected directory (at a file, the current one) |
+| `S`                  | Rescan all of `<path>`                                     |
 | `/`                  | Filter the current column by text; Enter keeps, Esc clears |
 | `d`                  | List the directories that could not be read, and why       |
 | `t`                  | Show or hide the largest files under `<path>`              |
@@ -180,8 +190,7 @@ hold Shift (Option in Terminal and iTerm) while dragging.
 
 Reveal and open run `open -R` and `open` on macOS, and `xdg-open` on Linux,
 which opens the folder of the item for reveal. Over SSH, or on Linux without
-a display, they run nothing and show the full path instead. Only all of
-`<path>` can be rescanned for now, not a single directory.
+a display, they run nothing and show the full path instead.
 
 A directory that could not be read is marked `(denied: EACCES)`, and every
 directory above it has a `+` after its size, since the size is then a lower
