@@ -75,7 +75,7 @@ pub(crate) fn largest_first(a: (u64, &[u8]), b: (u64, &[u8])) -> Ordering {
 }
 
 /// The `n` largest files as `(bytes, path)`, ties by path bytes.
-pub(crate) fn largest_files(tree: &impl ReadTree, n: usize) -> Vec<(u64, Vec<u8>)> {
+pub fn largest_files(tree: &impl ReadTree, n: usize) -> Vec<(u64, Vec<u8>)> {
     let mut files: Vec<_> = (tree.largest())
         .map(|(bytes, dir, name)| (bytes, tree.path(dir, name)))
         .collect();
@@ -108,7 +108,7 @@ pub(crate) fn suffix(r: &Record, flags: u16) -> String {
 
 /// Why a [`Record::DENIED`] dir could not be read: `EACCES`, `EPERM` or
 /// `errno N`.
-pub(crate) fn denied(r: &Record) -> String {
+pub fn denied(r: &Record) -> String {
     match sys::errno_name(r.errno) {
         Some(name) => name.into(),
         None => format!("errno {}", r.errno),

@@ -2,6 +2,7 @@
 check:
     uvx --from pre-commit pre-commit run --all-files
     cargo test
+    uv run --quiet --with pytest --with pyarrow pytest python/tests -q
     cargo deny check
     cargo about generate --locked about.hbs | diff -u THIRD_PARTY_LICENSES.txt -
 

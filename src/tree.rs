@@ -244,6 +244,11 @@ impl ReadTree for Tree {
 }
 
 impl Tree {
+    /// How many names there are; name ids count from 0.
+    pub fn name_count(&self) -> u32 {
+        self.names.count() as u32
+    }
+
     /// Whether `id` or a dir above it is [`Record::REMOVED`].
     pub(crate) fn gone(&self, id: u32) -> bool {
         let mut i = id;

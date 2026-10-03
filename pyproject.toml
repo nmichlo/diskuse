@@ -1,5 +1,5 @@
-# The PyPI package: a wheel holding only the diskuse binary, for
-# `uvx diskuse` and `pipx install diskuse`. No Python code.
+# The PyPI package: the Python API (`import diskuse`) and the `diskuse`
+# command, a console script calling the same CLI as the binary.
 
 [build-system]
 # 1.9.3: the first to put `license-files` in the sdist too
@@ -11,8 +11,8 @@ name = "diskuse"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-*", "THIRD_PARTY_LICENSES.txt"]
-# a bin wheel is `py3-none-<platform>`: no Python code runs
-requires-python = ">=3.8"
+# abi3-py39: one wheel per platform for every Python from 3.9
+requires-python = ">=3.9"
 classifiers = [
     "Environment :: Console",
     "Operating System :: MacOS",
@@ -20,15 +20,25 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: System :: Filesystems",
 ]
-# from Cargo.toml. CI stamps its version from the release tag
-dynamic = ["version", "description"]
+description = "A fast, read-only disk usage browser for macOS and Linux"
+# from python/Cargo.toml. CI stamps its version from the release tag
+dynamic = ["version"]
+
+[project.scripts]
+diskuse = "diskuse:_cli"
+
+[project.optional-dependencies]
+# Tree.to_arrow()
+arrow = ["pyarrow>=14"]
 
 [project.urls]
 Repository = "https://github.com/nmichlo/diskuse"
 Issues = "https://github.com/nmichlo/diskuse/issues"
 
 [tool.maturin]
-bindings = "bin"
+manifest-path = "python/Cargo.toml"
+python-source = "python"
+module-name = "diskuse._diskuse"
 # here, not in Cargo's release profile, so local release builds keep symbols
 # for profiling
 strip = true
@@ -37,3 +47,13 @@ strip = true
 # the only Python here, a dev script that needs 3.10
 [tool.ruff]
 target-version = "py310"
+
+# rebuild the extension when the Rust changes, not only pyproject.toml
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "python/Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "python/src/**/*.rs" },
+]
