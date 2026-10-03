@@ -8,6 +8,7 @@
 mod access;
 mod app;
 mod browse;
+mod cli;
 mod json;
 mod labels;
 mod report;
@@ -23,8 +24,9 @@ mod watch;
 pub use access::FullDiskAccess;
 pub use app::{App, Preflight, browse};
 pub use browse::{Browser, Env};
+pub use cli::cli;
 pub use json::json;
-pub use report::report;
+pub use report::{denied, largest_files, report};
 pub use scan::{Reader, ScanError, ScanOptions, Stop, scan, scan_live};
 pub use store::{CacheDir, Saved, SavedFile, SavedTree};
 pub use tree::{ChildIndex, LARGEST, LargeFile, Progress, ReadTree, Record, Totals, Tree};

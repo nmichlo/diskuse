@@ -22,6 +22,11 @@ include = [
 ]
 
 
+[workspace]
+# the Python bindings: their own crate, so `cargo install diskuse` never
+# builds Python code
+members = ["python"]
+
 [dependencies]
 boxcar = "0.2.14"
 clap = { version = "4.6.7", features = ["derive"] }
