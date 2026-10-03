@@ -47,9 +47,11 @@ const COLOR: Styles = Styles {
     dir: Style::new().add_modifier(Modifier::BOLD),
     denied: Style::new().fg(Color::Red),
     dim: Style::new().fg(Color::DarkGray),
+    // fixed palette entries, not the theme's white and blue, which some
+    // themes make too close to read
     selected: Style::new()
-        .fg(Color::White)
-        .bg(Color::Blue)
+        .fg(Color::Indexed(231))
+        .bg(Color::Indexed(25))
         .add_modifier(Modifier::BOLD),
     parent: Style::new().fg(Color::White).bg(Color::DarkGray),
     key: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),

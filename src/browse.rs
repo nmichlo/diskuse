@@ -99,6 +99,8 @@ pub struct Browser {
     root: PathBuf,
     /// The real path of the root, for the labels of known folders.
     real: Option<PathBuf>,
+    /// The real path of the home dir, as `real` is compared with it.
+    real_home: Option<PathBuf>,
     /// The root as the title shows it.
     display: String,
     env: Env,
@@ -355,6 +357,7 @@ impl Browser {
         let mut b = Self {
             root: root.into(),
             real: std::fs::canonicalize(root).ok(),
+            real_home: (env.home.as_ref()).and_then(|h| std::fs::canonicalize(h).ok()),
             display: display.into(),
             env,
             used,
@@ -1079,7 +1082,7 @@ impl Browser {
             join(&mut real, &below(&view.tree, d));
             real
         });
-        let home = self.env.home.as_ref().map(|h| h.as_os_str().as_bytes());
+        let home = self.real_home.as_ref().map(|h| h.as_os_str().as_bytes());
         let dirs = view.index.children(d).iter().map(|&k| {
             let name = view.tree.name(view.tree.record(k).name);
             let mut at = path.clone();
@@ -1801,7 +1804,7 @@ mod tests {
         // the root's column starts at x 0, the preview at 34
         let mut expected = screen("/scan  scanning... at least 12.0 KiB");
         expected.set_line(0, 1, &dir_row("12.0 KiB", "a"), 33);
-        let selected = Style::new().fg(Color::White).bg(Color::Blue);
+        let selected = Style::new().fg(Color::Indexed(231)).bg(Color::Indexed(25));
         expected.set_style(
             Rect::new(0, 1, 33, 1),
             selected.add_modifier(Modifier::BOLD),

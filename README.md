@@ -13,15 +13,9 @@
     <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-lightgrey?style=flat-square"/></a>
 </p>
 
-```text
-/Users/me  412.0 GiB  (+2.1 GiB in 12 min)
-  41.2 GiB   +1.3 GiB ####...... Library/           38.2 GiB ########.. Developer/
-  12.0 GiB            #......... Movies/             1.9 GiB #......... Caches/  [cache]
-   8.4 GiB            #......... node_modules/  [cache: npm]
-   3.4 GiB   -200 MiB #......... Downloads/  [downloads]
-[cache: npm] npm install rebuilds it.  r reveal to delete  space pick
-hjkl move  r reveal  o open  space pick  p picks  s/S rescan  / filter  t top  ? help  q quit
-```
+<p align="center">
+    <img src="https://raw.githubusercontent.com/nmichlo/diskuse/main/demo/demo.gif" alt="diskuse browsing a home folder" width="900"/>
+</p>
 
 <br/>
 
@@ -119,7 +113,7 @@ Versions: dua 2.45.1, gdu 5.37.0, dust 1.2.6, pdu 0.24.0, ncdu 2.9.2, DiskScour 
 
 ## 🛠 &nbsp;Development
 
-Run `just check` to format, lint and test. Benchmarks are run with `just bench`, see [bench/README.md](bench/README.md).
+Run `just check` to format, lint and test, and `just demo` to re-record the demo above. Benchmarks are run with `just bench`, see [bench/README.md](bench/README.md).
 
 Scans are cached in `~/Library/Caches/diskuse` (or `~/.cache/diskuse` on Linux), which can be changed with `DISKUSE_CACHE_DIR`.
 This is the only place diskuse ever writes to.

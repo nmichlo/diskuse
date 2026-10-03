@@ -382,7 +382,7 @@ impl App {
         }
         let cache = self.env.cache.as_ref();
         let saved = cache.and_then(|c| c.load(&target.root).ok().flatten());
-        let display = target.root.display().to_string();
+        let display = tilde(&target.root, self.env.home.as_deref());
         let env = self.env.clone();
         let reclaimable = self.reclaimable;
         let mut b = Browser::new(&target.root, &display, env, saved, target.used, reclaimable);
@@ -406,4 +406,14 @@ fn draw_help(frame: &mut Frame, styles: &Styles) {
     }
     let bottom = area.height.saturating_sub(1);
     buf.set_line(0, bottom, &styles.keys(KEYS_HELP), area.width);
+}
+
+/// `path` as the title shows it: below the home dir `home` as `~`, which
+/// is shorter and keeps the user name out of screenshots.
+fn tilde(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(below) if below.as_os_str().is_empty() => "~".into(),
+        Some(below) => format!("~/{}", below.display()),
+        None => path.display().to_string(),
+    }
 }

@@ -89,8 +89,8 @@ impl Look {
     fn selected(self) -> Style {
         match self.color {
             true => Style::new()
-                .fg(Color::White)
-                .bg(Color::Blue)
+                .fg(Color::Indexed(231))
+                .bg(Color::Indexed(25))
                 .add_modifier(Modifier::BOLD),
             false => Style::new().add_modifier(Modifier::REVERSED),
         }
@@ -1086,8 +1086,9 @@ fn labels_dirs_by_how_safe_deleting_them_is() {
         fs::metadata(&tag).unwrap().blocks() * 512
     };
     let d = common::own_bytes(root);
+    // not the real path on macOS, where temp dirs are below a symlink
     let env = Env {
-        home: Some(fs::canonicalize(root).unwrap()),
+        home: Some(root.into()),
         ..env(Desktop::None)
     };
     let mut b = Browser::new(root, "/labels", env, None, None, false);
@@ -1756,4 +1757,21 @@ fn sorts_by_change_on_c() {
     assert_eq!(draw(&mut b, now()), by_change);
     press(&mut b, &[KeyCode::Char('c')]);
     assert_eq!(draw(&mut b, now()), by_size);
+}
+
+/// Below the home dir, the title shows the root from `~`.
+#[test]
+fn titles_a_path_below_home_with_a_tilde() {
+    let f = fixture();
+    let e = expected(&f);
+    let path = f.dir.path();
+    let env = Env {
+        home: Some(path.parent().unwrap().into()),
+        ..env(Desktop::Mac)
+    };
+    let mut app = App::new(Some(path), vec![], env, None, false);
+    finish(&mut app);
+    let name = path.file_name().unwrap().to_str().unwrap();
+    let title = e.title.replacen("/fixture", &format!("~/{name}"), 1);
+    assert_eq!(draw_app(&mut app), first_view(&e, &title, HELP));
 }

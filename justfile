@@ -37,3 +37,9 @@ bench-check:
 # warm runs on Linux in an OrbStack machine
 bench-orb *ARGS:
     bench/orb.sh {{ARGS}}
+
+# re-record the README demo GIF (needs `brew install vhs`)
+demo:
+    cargo build --release
+    demo/home.sh
+    PATH="$PWD/target/release:$PATH" vhs demo/demo.tape
