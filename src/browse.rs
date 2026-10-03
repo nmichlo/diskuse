@@ -144,6 +144,50 @@ pub struct Browser {
     panel: Option<usize>,
     /// The largest files list, while it is shown.
     top: Option<Top>,
+    /// Sizes when the first scan of the session was done.
+    baseline: Option<Baseline>,
+}
+
+/// The sizes of every dir when the first scan of the session was done, so
+/// each dir shows how much it grew or shrank since.
+struct Baseline {
+    /// Total bytes by record id of the tree shown. Dirs new since have no
+    /// entry, as their records come after.
+    sizes: Vec<u64>,
+    at: SystemTime,
+    /// The tree `sizes` are of, while a full scan, whose ids differ, runs.
+    of: Option<Tree>,
+}
+
+impl Baseline {
+    /// The total bytes of dir `id` at the start, 0 if it is new since.
+    fn size(&self, id: u32) -> u64 {
+        self.sizes.get(id as usize).copied().unwrap_or(0)
+    }
+
+    /// `sizes` moved to the ids of `tree`, a fresh scan of the tree they
+    /// were of, matching dirs by name from the root down.
+    fn rebase(&mut self, tree: &Tree, index: &ChildIndex) {
+        let Some(old) = self.of.take() else {
+            return;
+        };
+        let old_index = old.child_index();
+        let mut sizes = vec![0; tree.len()];
+        sizes[0] = self.size(0);
+        let mut stack = vec![(0, 0)];
+        while let Some((o, n)) = stack.pop() {
+            let kids: HashMap<&[u8], u32> = (old_index.children(o).iter())
+                .map(|&k| (old.name(old.record(k).name), k))
+                .collect();
+            for &k in index.children(n) {
+                if let Some(&was) = kids.get(tree.name(tree.record(k).name)) {
+                    sizes[k as usize] = self.size(was);
+                    stack.push((was, k));
+                }
+            }
+        }
+        self.sizes = sizes;
+    }
 }
 
 /// A tree as shown, with what drawing it needs.
@@ -213,6 +257,9 @@ struct Row {
     item: Item,
     /// From [`labels::label`], for a dir.
     label: Option<&'static str>,
+    /// Bytes a dir grew by since the session started, or shrank by if
+    /// negative. 0 for a file.
+    delta: i64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -286,6 +333,7 @@ impl Browser {
             message: None,
             panel: None,
             top: None,
+            baseline: None,
         };
         if let Some(saved) = saved.filter(|s| s.reclaimable || !reclaimable) {
             b.show(saved.tree, Status::Saved { at: saved.modified });
@@ -295,6 +343,14 @@ impl Browser {
 
     /// Scans the root on another thread.
     pub fn scan(&mut self) {
+        // what the session's changes are counted against, until the scan
+        // is done
+        if let (Some(base), Some(view)) = (&mut self.baseline, &self.view)
+            && view.status == Status::Done
+            && base.of.is_none()
+        {
+            base.of = Some(view.tree.clone());
+        }
         self.watch = None;
         self.dir_watch = None;
         let (tx, started) = mpsc::channel();
@@ -353,6 +409,17 @@ impl Browser {
                     self.watch = Watch::start(&self.root, &tree, self.env.cache.as_ref());
                     self.dir_watch =
                         (self.watch.is_none()).then(|| DirWatch::new(self.env.inotify, now));
+                    let index = tree.child_index();
+                    match &mut self.baseline {
+                        Some(base) => base.rebase(&tree, &index),
+                        None => {
+                            self.baseline = Some(Baseline {
+                                sizes: tree.totals().size,
+                                at: now,
+                                of: None,
+                            });
+                        }
+                    }
                     self.show_done(tree, Instant::now());
                 }
                 Err(e) => self.message = Some(format!("cannot scan: {e}")),
@@ -824,11 +891,18 @@ impl Browser {
                 join(&mut path, file.as_bytes());
                 sys::exists(Path::new(OsStr::from_bytes(&path)))
             };
+            let size = view.totals.size[k as usize];
+            // snapshots of a scan are of other ids
+            let delta = match (&self.baseline, view.status) {
+                (Some(base), Status::Done) => size as i64 - base.size(k) as i64,
+                _ => 0,
+            };
             Row {
-                size: view.totals.size[k as usize],
+                size,
                 private: view.totals.private[k as usize],
                 item: Item::Dir(k),
                 label: labels::label(name, parent, sibling, inside),
+                delta,
             }
         });
         let mut rows: Vec<Row> = (files.iter().enumerate())
@@ -837,6 +911,7 @@ impl Browser {
                 private,
                 item: Item::File(i as u32),
                 label: None,
+                delta: 0,
             })
             .chain(dirs)
             .collect();
@@ -928,15 +1003,28 @@ impl Browser {
             0 => String::new(),
             n => format!("  (partial: {n} denied)"),
         };
+        // how much the root grew or shrank since the session started
+        let change = match &self.baseline {
+            Some(base) if view.status == Status::Done => {
+                match view.totals.size[0] as i64 - base.size(0) as i64 {
+                    0 => String::new(),
+                    d => {
+                        let age = age(now.duration_since(base.at).unwrap_or_default());
+                        format!("  ({} in {age})", signed(d))
+                    }
+                }
+            }
+            _ => String::new(),
+        };
         match view.status {
             Status::Scanning => format!("{root}  scanning... at least {total}"),
             Status::Done => match &self.dir_watch {
                 // changes in the dirs not shown are not seen since
                 Some(dirs) => {
                     let age = age(now.duration_since(dirs.scanned).unwrap_or_default());
-                    format!("{root}  {total}{partial}  scanned {age} ago")
+                    format!("{root}  {total}{change}{partial}  scanned {age} ago")
                 }
-                None => format!("{root}  {total}{partial}"),
+                None => format!("{root}  {total}{change}{partial}"),
             },
             Status::Saved { at } => {
                 let age = age(now.duration_since(at).unwrap_or_default());
@@ -1053,6 +1141,11 @@ fn line(
             });
             if let Some(l) = row.label {
                 spans.push(Span::styled(format!("  [{l}]"), styles.dim));
+            }
+            match row.delta {
+                0 => {}
+                d @ 1.. => spans.push(Span::styled(format!("  {}", signed(d)), styles.grew)),
+                d => spans.push(Span::styled(format!("  {}", signed(d)), styles.shrank)),
             }
         }
         Item::File(_) => spans.push(Span::raw(label)),
@@ -1205,6 +1298,12 @@ impl Clicks {
 /// that row `at` is among the `height` drawn.
 fn scroll(offset: usize, at: usize, height: usize) -> usize {
     offset.min(at).max((at + 1).saturating_sub(height))
+}
+
+/// `+1.5 GiB` or `-4.0 KiB`.
+fn signed(bytes: i64) -> String {
+    let sign = if bytes < 0 { '-' } else { '+' };
+    format!("{sign}{}", format_size(bytes.unsigned_abs()))
 }
 
 /// `5 min`: whole seconds, minutes, hours or days.

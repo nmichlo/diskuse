@@ -115,6 +115,12 @@ fn size(bytes: u64) -> String {
     }
 }
 
+/// `+4.0 KiB` or `-4.0 KiB`.
+fn signed(bytes: i64) -> String {
+    let sign = if bytes < 0 { '-' } else { '+' };
+    format!("{sign}{}", size(bytes.unsigned_abs()))
+}
+
 /// The `#`s and `.`s of a bar of `size`'s share of `of`: tenths, to the
 /// nearest, at least one from 1%.
 fn bar(size: u64, of: u64) -> (String, String) {
@@ -148,6 +154,9 @@ struct Row {
     of: u64,
     name: String,
     kind: Kind,
+    /// Bytes a dir grew by since the session started, shrank by if
+    /// negative.
+    delta: i64,
 }
 
 impl Row {
@@ -158,7 +167,12 @@ impl Row {
             of,
             name: name.into(),
             kind,
+            delta: 0,
         }
+    }
+
+    fn changed(self, delta: i64) -> Self {
+        Row { delta, ..self }
     }
 
     fn file(size: u64, of: u64, name: &str) -> Self {
@@ -205,6 +219,16 @@ impl Row {
                 Span::styled(name + "/", bold()),
                 Span::styled(format!("  [{label}]"), look.dim()),
             ]),
+        }
+        if self.delta != 0 {
+            let color = match self.delta > 0 {
+                true => Color::Magenta,
+                false => Color::Cyan,
+            };
+            spans.push(Span::styled(
+                format!("  {}", signed(self.delta)),
+                look.fg(color),
+            ));
         }
         Line::from(spans)
     }
@@ -1224,18 +1248,25 @@ fn follows_changes(inotify: bool, within: Duration, at: fn(&Path) -> PathBuf) {
     file(&root.join("a/keep"), 4096);
     file(&root.join("a/gone"), 8192);
     let d = common::own_bytes(root);
-    // the root lists only `a/`, previewed
-    let shown_at = |scanned: &str, files: &[(u64, &str)]| {
+    // the root lists only `a/`, previewed, with how much it changed since
+    // the scan, `age` ago
+    let shown_at = |age: &str, files: &[(u64, &str)]| {
         let a = d + files.iter().map(|&(size, _)| size).sum::<u64>();
-        let title = format!("/live  {}{scanned}", kib(a + d));
+        let delta = a as i64 - (d + 8192 + 4096) as i64;
+        let change = match delta {
+            0 => String::new(),
+            _ => format!("  ({} in {age})", signed(delta)),
+        };
+        let scanned = SCANNED.replace("0 s", age);
+        let title = format!("/live  {}{change}{scanned}", kib(a + d));
         let files: Vec<Row> = files
             .iter()
             .map(|&(size, name)| Row::file(size, a, name))
             .collect();
-        let root = [Row::dir(a, a + d, "a")];
+        let root = [Row::dir(a, a + d, "a").changed(delta)];
         screen(&title, [&[], &root, &files], None, 0, HELP)
     };
-    let shown = |files: &[(u64, &str)]| shown_at(SCANNED, files);
+    let shown = |files: &[(u64, &str)]| shown_at("0 s", files);
     let saved = Saved {
         tree: disksweep::scan(root, &ScanOptions::default()).unwrap(),
         reclaimable: false,
@@ -1264,10 +1295,9 @@ fn follows_changes(inotify: bool, within: Duration, at: fn(&Path) -> PathBuf) {
     let keep = common::append(&root.join("a/keep"), 4096);
     let files = [(keep, "keep"), (4096, "new")];
     shows_within(&mut b, &shown(&files), within);
-    // on Linux the title says how old the scan is
+    // the title says since when, and on Linux how old the scan is
     let later = now() + Duration::from_secs(4 * 60);
-    let scanned = SCANNED.replace("0 s", "4 min");
-    assert_eq!(draw(&mut b, later), shown_at(&scanned, &files));
+    assert_eq!(draw(&mut b, later), shown_at("4 min", &files));
 }
 
 /// FSEvents on macOS, inotify on Linux. The deadline is generous so a
