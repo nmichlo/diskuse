@@ -28,10 +28,8 @@ jobs:
     uses: nmichlo/.github/.github/workflows/release-rust.yaml@main
     with:
       package-name: diskuse
-      # a binary-only wheel (pyproject.toml), and per-target tarballs of the
-      # same binary on the GitHub release, for `cargo binstall`
-      bindings: bin
-      bin-archives: true
+      # the wheel is the Python module plus a `diskuse` console script
+      # (pyproject.toml); the binary archives are built below
       # no Windows: diskuse is macOS and Linux only
       targets: >-
         [
@@ -68,3 +66,48 @@ jobs:
           merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The binary on the GitHub release, one archive per target, for `cargo
+  # binstall` and Homebrew. Built with cargo, not taken from the wheel, which
+  # holds the Python module, not a binary. Linux builds are static (musl), so
+  # they run on any distro.
+  archives:
+    needs: [release]
+    if: needs.release.outputs.version != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runs-on: macos-15, target: aarch64-apple-darwin}
+          - {runs-on: macos-15-intel, target: x86_64-apple-darwin}
+          - {runs-on: ubuntu-latest, target: x86_64-unknown-linux-musl}
+          - {runs-on: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl}
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: write  # to upload to the release
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.version }}
+          persist-credentials: false
+      - uses: nmichlo/.github/actions/stamp-cargo-version@main
+        with:
+          version: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo build --release --locked --bin diskuse --target "${TARGET}" --config profile.release.strip=true
+      - name: Archive and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="diskuse-${VERSION#v}-${TARGET}"
+          mkdir stage
+          cp "target/${TARGET}/release/diskuse" LICENSE-* THIRD_PARTY_LICENSES.txt README.md stage/
+          (cd stage && tar -czf "../${name}.tar.gz" -- *)
+          gh release upload "${VERSION}" "${name}.tar.gz" --repo "${GITHUB_REPOSITORY}"

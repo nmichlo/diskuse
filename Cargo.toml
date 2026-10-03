@@ -27,6 +27,11 @@ include = [
 # builds Python code
 members = ["python"]
 
+# inherited by python/Cargo.toml, so the release stamps the wheel's version
+# with the crate's (nmichlo/.github actions/stamp-cargo-version)
+[workspace.package]
+version = "0.0.0"
+
 [dependencies]
 boxcar = "0.2.14"
 clap = { version = "4.6.7", features = ["derive"] }

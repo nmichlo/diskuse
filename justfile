@@ -4,12 +4,12 @@ check:
     cargo test
     uv run --quiet --with pytest --with pyarrow pytest python/tests -q
     cargo deny check
-    cargo about generate --locked about.hbs | diff -u THIRD_PARTY_LICENSES.txt -
+    cargo about generate --locked --workspace about.hbs | diff -u THIRD_PARTY_LICENSES.txt -
 
 # rewrite THIRD_PARTY_LICENSES.txt, after a dependency change. needs
 # cargo-about, see about.toml
 licenses:
-    cargo about generate --locked about.hbs > THIRD_PARTY_LICENSES.txt
+    cargo about generate --locked --workspace about.hbs > THIRD_PARTY_LICENSES.txt
 
 # benchmarks, see bench/README.md
 
