@@ -268,8 +268,12 @@ extern "C" fn callback(
 }
 
 fn event(flags: u32, path: &[u8]) -> Event {
-    if flags & (USER_DROPPED | KERNEL_DROPPED | EVENT_IDS_WRAPPED | ROOT_CHANGED) != 0 {
-        Event::Lost
+    if flags & (USER_DROPPED | KERNEL_DROPPED) != 0 {
+        Event::Lost("macOS dropped change events")
+    } else if flags & EVENT_IDS_WRAPPED != 0 {
+        Event::Lost("macOS event ids wrapped")
+    } else if flags & ROOT_CHANGED != 0 {
+        Event::Lost("the scanned dir moved")
     } else if flags & HISTORY_DONE != 0 {
         Event::HistoryDone
     } else if flags & MUST_SCAN_SUB_DIRS != 0 {

@@ -3,6 +3,7 @@
 //! still shows.
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 /// How the parts of a screen are drawn.
 pub(crate) struct Styles {
@@ -23,6 +24,8 @@ pub(crate) struct Styles {
     pub system: Style,
     pub cache: Style,
     pub known: Style,
+    /// A key in a line of keys and what they do.
+    pub key: Style,
     /// The `*` after a picked item's name.
     pub picked: Style,
     /// How much a dir grew or shrank since the session started.
@@ -49,6 +52,7 @@ const COLOR: Styles = Styles {
         .bg(Color::Blue)
         .add_modifier(Modifier::BOLD),
     parent: Style::new().fg(Color::White).bg(Color::DarkGray),
+    key: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     system: Style::new().fg(Color::Red),
     cache: Style::new().fg(Color::Green),
     known: Style::new().fg(Color::Yellow),
@@ -65,6 +69,7 @@ const PLAIN: Styles = Styles {
     selected: Style::new().add_modifier(Modifier::REVERSED),
     // dirs are bold already
     parent: Style::new().add_modifier(Modifier::UNDERLINED),
+    key: Style::new().add_modifier(Modifier::BOLD),
     system: Style::new(),
     cache: Style::new(),
     known: Style::new(),
@@ -90,5 +95,21 @@ impl Styles {
             KIB.. => self.sizes[2],
             _ => self.sizes[3],
         }
+    }
+
+    /// A line of `key what` pairs, two spaces apart, each key highlighted.
+    pub fn keys(&self, keys: &str) -> Line<'static> {
+        let mut spans = Vec::new();
+        for (i, pair) in keys.split("  ").enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            let (key, what) = pair.split_once(' ').unwrap_or((pair, ""));
+            spans.push(Span::styled(key.to_owned(), self.key));
+            if !what.is_empty() {
+                spans.push(Span::raw(format!(" {what}")));
+            }
+        }
+        Line::from(spans)
     }
 }

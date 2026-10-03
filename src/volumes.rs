@@ -104,5 +104,5 @@ pub(crate) fn draw(frame: &mut Frame, volumes: &[Mount], cursor: usize, styles: 
         }
     }
     let bottom = area.height.saturating_sub(1);
-    buf.set_stringn(0, bottom, HELP, width, Style::new());
+    buf.set_line(0, bottom, &styles.keys(HELP), area.width);
 }

@@ -16,6 +16,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use std::ffi::OsString;
 use std::io;
 use std::ops::ControlFlow;
@@ -338,7 +339,7 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame, now: SystemTime) {
         self.area = frame.area();
         if self.help {
-            draw_help(frame);
+            draw_help(frame, Styles::new(self.env.color));
             return;
         }
         let styles = Styles::new(self.env.color);
@@ -391,14 +392,18 @@ impl App {
 }
 
 /// Draws [`KEYS`] over the whole screen.
-fn draw_help(frame: &mut Frame) {
+fn draw_help(frame: &mut Frame, styles: &Styles) {
     let area = frame.area();
     let width = area.width.into();
     let buf = frame.buffer_mut();
     buf.set_stringn(0, 0, "keys", width, Style::new());
     for (y, (keys, action)) in (1..area.height.saturating_sub(1)).zip(KEYS) {
-        buf.set_stringn(0, y, format!("{keys:<18}{action}"), width, Style::new());
+        let line = Line::from_iter([
+            Span::styled(format!("{keys:<18}"), styles.key),
+            Span::raw(action),
+        ]);
+        buf.set_line(0, y, &line, area.width);
     }
     let bottom = area.height.saturating_sub(1);
-    buf.set_stringn(0, bottom, KEYS_HELP, width, Style::new());
+    buf.set_line(0, bottom, &styles.keys(KEYS_HELP), area.width);
 }

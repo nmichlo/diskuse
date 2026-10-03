@@ -128,8 +128,8 @@ pub enum Event {
     /// are live.
     HistoryDone,
     /// Changes were lost, or the watched path itself moved: only a full
-    /// scan is right.
-    Lost,
+    /// scan is right. Why, for the user.
+    Lost(&'static str),
 }
 
 /// Watches a path until dropped.

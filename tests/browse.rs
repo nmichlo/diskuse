@@ -35,6 +35,7 @@ const WIDE_COLUMNS: [(usize, usize); 3] = [(0, 43), (44, 42), (87, 43)];
 const HELP: &str =
     "hjkl move  r reveal  o open  space pick  p picks  s/S rescan  / filter  t top  ? help  q quit";
 const PICKS_HELP: &str = "arrows/jk move  r reveal  o open  space unpick  p close  ? help  q quit";
+const PANEL_HELP: &str = "arrows/jk scroll  d close  ? help  q quit";
 const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
 const VOLUMES_HELP: &str = "arrows/jk move  enter scan  ? help  q quit";
 const GIB: u64 = 1 << 30;
@@ -290,7 +291,7 @@ fn screen_in(
 ) -> Buffer {
     let mut buf = Buffer::empty(Rect::new(0, 0, width as u16, HEIGHT as u16));
     buf.set_stringn(0, 0, title, width, Style::new());
-    buf.set_stringn(0, HEIGHT as u16 - 1, footer, width, Style::new());
+    buf.set_line(0, HEIGHT as u16 - 1, &bottom(look, footer), width as u16);
     // at the root, the columns move left
     let places = match parent {
         None => [None, Some(layout[0]), Some(layout[1])],
@@ -337,8 +338,37 @@ fn plain(lines: &[Line<'static>], selected: Option<usize>) -> Buffer {
 fn text(lines: &[&str], bottom: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = lines.iter().map(|l| Line::raw(l.to_string())).collect();
     lines.resize(HEIGHT - 1, Line::default());
-    lines.push(Line::raw(bottom.to_string()));
+    lines.push(self::bottom(COLOR, bottom));
     lines
+}
+
+/// The bottom line: a line of keys, each highlighted, or a message.
+fn bottom(look: Look, footer: &str) -> Line<'static> {
+    let help = [HELP, TOP_HELP, PICKS_HELP, PANEL_HELP, VOLUMES_HELP];
+    match help.contains(&footer) || footer.starts_with('/') {
+        true => key_line(look, footer),
+        false => Line::raw(footer.to_string()),
+    }
+}
+
+/// `key what` pairs, two spaces apart, each key in bold cyan.
+fn key_line(look: Look, text: &str) -> Line<'static> {
+    let key = match look.color {
+        true => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        false => bold(),
+    };
+    let mut spans = Vec::new();
+    for (i, pair) in text.split("  ").enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let (k, what) = pair.split_once(' ').unwrap_or((pair, ""));
+        spans.push(Span::styled(k.to_string(), key));
+        if !what.is_empty() {
+            spans.push(Span::raw(format!(" {what}")));
+        }
+    }
+    Line::from(spans)
 }
 
 /// An environment with no cache, so tests never touch the user's.
@@ -707,7 +737,7 @@ fn says_one_directory_could_not_be_read() {
 
     let title = format!("/one  {}  (partial: 1 denied){SCANNED}", kib(2 * d));
     let head = "1 directory could not be read, so its contents are not counted:";
-    let mut lines = text(&[&title, head], "arrows/jk scroll  d close  ? help  q quit");
+    let mut lines = text(&[&title, head], PANEL_HELP);
     lines[2] = Line::from_iter([
         Span::raw(format!("{}  ", locked.display())),
         Span::styled("permission denied (try sudo)", Style::new().fg(Color::Red)),
@@ -828,7 +858,20 @@ fn shows_every_key_on_question_mark() {
         "double click      go into the directory, or scan the volume",
         "wheel             scroll the column under the pointer",
     ];
-    let help = plain(&text(&keys, "? or esc close"), None);
+    let mut lines = vec![Line::raw("keys")];
+    lines.extend(keys[1..].iter().map(|k| {
+        let (key, what) = k.split_at(18);
+        Line::from_iter([
+            Span::styled(
+                key.to_string(),
+                COLOR.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(what.to_string()),
+        ])
+    }));
+    lines.resize(HEIGHT - 1, Line::default());
+    lines.push(key_line(COLOR, "? or esc close"));
+    let help = plain(&lines, None);
     // other keys do nothing while it is shown
     press_app(&mut app, &[KeyCode::Char('?'), KeyCode::Char('q')]);
     assert_eq!(draw_app(&mut app), help);
@@ -1090,19 +1133,45 @@ fn labels_dirs_by_how_safe_deleting_them_is() {
         render_in(WIDE, |f| b.draw(f, now())),
         screen(0, &rust, HELP)
     );
+    // the row above the keys explains the label at the cursor
+    let explained = |at, preview: &[Row], tag: &str, color, why: &str, keys: &str| {
+        let mut buf = screen(at, preview, HELP);
+        let y = HEIGHT as u16 - 2;
+        buf.set_string(0, y, " ".repeat(WIDE), Style::new());
+        let mut line = Line::from_iter([
+            Span::styled(format!("[{tag}]"), COLOR.fg(color)),
+            Span::raw(format!(" {why}.  ")),
+        ]);
+        line.spans.extend(key_line(COLOR, keys).spans);
+        buf.set_line(0, y, &line, WIDE as u16);
+        buf
+    };
     press(&mut b, &[KeyCode::Down]);
     let npm = [Row::file(12288, 12288 + d, "m")];
-    let footer = "[cache: npm] npm install rebuilds it.  r reveal to delete  space pick";
+    let why = "npm install rebuilds it";
     assert_eq!(
         render_in(WIDE, |f| b.draw(f, now())),
-        screen(1, &npm, footer)
+        explained(
+            1,
+            &npm,
+            "cache: npm",
+            Color::Green,
+            why,
+            "r reveal to delete  space pick"
+        )
     );
     press(&mut b, &[KeyCode::End, KeyCode::Up]);
-    let footer =
-        "[downloads] downloaded files, often old installers and archives.  r reveal  space pick";
+    let why = "downloaded files, often old installers and archives";
     assert_eq!(
         render_in(WIDE, |f| b.draw(f, now())),
-        screen(6, &[], footer)
+        explained(
+            6,
+            &[],
+            "downloads",
+            Color::Yellow,
+            why,
+            "r reveal  space pick"
+        )
     );
 }
 

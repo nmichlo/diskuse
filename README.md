@@ -271,8 +271,12 @@ is, and the footer explains the label of the selected one:
 | `.cache`                                    | `cache`                     |                                            |
 | `Caches`                                    | `cache`                     | it is in a directory named `Library`       |
 
-The footer explains the selected directory's label and says what to do:
-`[cache: npm] npm install rebuilds it.  r reveal to delete  space pick`.
+A row above the keys explains the selected directory's label and says what
+to do: `[cache: npm] npm install rebuilds it.  r reveal to delete  space pick`.
+Keys are highlighted in every line of keys.
+
+If the browser starts a full rescan by itself, the title says why, for
+example `scanning... (macOS dropped change events)`.
 
 Known folders include the Trash, Downloads, Xcode archives and device
 support, iOS simulators, iPhone backups, Docker Desktop's disk image, Mail,

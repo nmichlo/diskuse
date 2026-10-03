@@ -62,8 +62,8 @@ pub(crate) enum Poll {
     /// The replay has not ended, or the stream has not gone quiet after it.
     /// Or no dir shown is due to be listed again.
     Wait,
-    /// Changes were lost: only a full scan is right.
-    Lost,
+    /// Changes were lost: only a full scan is right. Why, for the user.
+    Lost(&'static str),
     Changes(Changes),
 }
 
@@ -76,7 +76,8 @@ pub(crate) struct Watch {
     cache: Option<Vec<u8>>,
     firmlinks: Firmlinks,
     pending: Changes,
-    lost: bool,
+    /// Why changes were lost, if they were.
+    lost: Option<&'static str>,
     started: Instant,
     /// When the replay ended, if it has.
     replayed: Option<Instant>,
@@ -119,7 +120,7 @@ impl Watch {
             cache: cache.as_deref().map(trim),
             firmlinks: Firmlinks(sys::firmlinks()),
             pending: Changes::default(),
-            lost: false,
+            lost: None,
             started: now,
             replayed: None,
             last: now,
@@ -135,8 +136,8 @@ impl Watch {
             self.add(batch);
         }
         let now = Instant::now();
-        if self.lost {
-            return Poll::Lost;
+        if let Some(why) = self.lost {
+            return Poll::Lost(why);
         }
         if !self.settled && self.replayed.is_some() && !self.flushed {
             // the replay ends with what the service has seen, so changes made
@@ -151,7 +152,9 @@ impl Watch {
         if !self.settled {
             let Some(replayed) = self.replayed else {
                 return match now - self.started > REPLAY_MAX {
-                    true => Poll::Lost,
+                    true => Poll::Lost(
+                        "macOS did not replay the changes made while scanning within 30 s",
+                    ),
                     false => Poll::Wait,
                 };
             };
@@ -167,7 +170,7 @@ impl Watch {
         self.last = Instant::now();
         for e in batch {
             match e {
-                Event::Lost => self.lost = true,
+                Event::Lost(why) => self.lost = self.lost.or(Some(why)),
                 Event::HistoryDone => self.replayed = self.replayed.or(Some(self.last)),
                 Event::Changed(path) => {
                     if let Some(path) = self.below(&path) {

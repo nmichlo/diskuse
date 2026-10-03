@@ -286,6 +286,8 @@ struct Scan {
     /// The dir scanned again, by its path below the root, while the tree
     /// shown stays. `None` for a full scan.
     dir: Option<Vec<u8>>,
+    /// Why a full scan started without being asked for, for the title.
+    why: Option<&'static str>,
 }
 
 /// The files of a dir, `(name, allocated bytes, reclaimable bytes)`:
@@ -423,7 +425,16 @@ impl Browser {
             progress: None,
             thread,
             dir: None,
+            why: None,
         });
+    }
+
+    /// [`Browser::scan`], started without being asked for, for `why`.
+    fn rescan_because(&mut self, why: &'static str) {
+        self.scan();
+        if let Some(scan) = &mut self.scan {
+            scan.why = Some(why);
+        }
     }
 
     /// Scans the dir at the cursor again, or at a file the current dir, on
@@ -459,6 +470,7 @@ impl Browser {
             progress: None,
             thread,
             dir: Some(dir),
+            why: None,
         });
     }
 
@@ -768,10 +780,10 @@ impl Browser {
     /// Draws the title, the three columns, the denied list or the largest
     /// files, and the footer. `now` dates a saved scan.
     pub fn draw(&mut self, frame: &mut Frame, now: SystemTime) {
-        let footer: Vec<String> = self
-            .unaccounted()
-            .into_iter()
-            .chain([self.footer()])
+        let styles = Styles::new(self.env.color);
+        let footer: Vec<Line> = (self.unaccounted().map(Line::raw).into_iter())
+            .chain(self.info(styles))
+            .chain([self.footer(styles)])
             .collect();
         let [top, body, bottom] = Layout::vertical([
             Constraint::Length(1),
@@ -780,12 +792,11 @@ impl Browser {
         ])
         .areas(frame.area());
         self.body = body;
-        let styles = Styles::new(self.env.color);
         let title = self.title(now);
         let buf = frame.buffer_mut();
         buf.set_stringn(top.x, top.y, title, top.width.into(), Style::new());
         for (y, line) in (bottom.y..).zip(footer) {
-            buf.set_stringn(bottom.x, y, line, bottom.width.into(), Style::new());
+            buf.set_line(bottom.x, y, &line, bottom.width);
         }
         let Some(view) = &self.view else {
             return;
@@ -919,8 +930,8 @@ impl Browser {
         };
         let changes = match poll {
             Poll::Wait => return false,
-            Poll::Lost => {
-                self.scan();
+            Poll::Lost(why) => {
+                self.rescan_because(why);
                 return true;
             }
             Poll::Changes(changes) => changes,
@@ -939,7 +950,7 @@ impl Browser {
         let old = (self.baseline.is_some() && !changes.rescan.is_empty()).then(|| tree.clone());
         if tree.apply(&changes, &self.options()).is_none() {
             self.show(tree, status);
-            self.scan();
+            self.rescan_because("macOS asked to scan all of it again");
             return true;
         }
         if let (Some(base), Some(old)) = (&mut self.baseline, old) {
@@ -1253,8 +1264,13 @@ impl Browser {
 
     fn title(&self, now: SystemTime) -> String {
         let root = &self.display;
+        // why a scan started by itself
+        let why = match self.scan.as_ref().and_then(|s| s.why) {
+            Some(why) => format!("  ({why})"),
+            None => String::new(),
+        };
         let Some(view) = &self.view else {
-            return format!("{root}  scanning...");
+            return format!("{root}  scanning...{why}");
         };
         let total = format_size(view.totals.size[0]);
         let partial = match view.denied.len() {
@@ -1283,7 +1299,7 @@ impl Browser {
             None => String::new(),
         };
         match view.status {
-            Status::Scanning => format!("{root}  scanning... at least {total}"),
+            Status::Scanning => format!("{root}  scanning... at least {total}{why}"),
             Status::Done => match &self.dir_watch {
                 // changes in the dirs not shown are not seen since
                 Some(dirs) => {
@@ -1309,25 +1325,39 @@ impl Browser {
         }
     }
 
-    fn footer(&self) -> String {
-        match &self.message {
-            Some(message) => message.clone(),
+    /// The bottom line: the message, else the keys of what is shown.
+    fn footer(&self, styles: &Styles) -> Line<'static> {
+        let keys = match &self.message {
+            Some(message) => return Line::raw(message.clone()),
             None if self.panel.is_some() => PANEL_HELP.into(),
             None if self.top.is_some() => TOP_HELP.into(),
             None if self.picking.is_some() => PICKS_HELP.into(),
             None if self.typing => format!("/{}  enter keep  esc clear", self.filter),
-            None if self.filter.is_empty() && self.label_at_cursor().is_some() => {
-                let label = self.label_at_cursor().unwrap();
-                let act = match label.tier {
-                    Tier::Cache => "  r reveal to delete  space pick",
-                    Tier::Known => "  r reveal  space pick",
-                    Tier::System => "",
-                };
-                format!("[{}] {}.{act}", label.text, label.why)
-            }
             None if !self.filter.is_empty() => format!("/{}  esc clear", self.filter),
             None => HELP.into(),
+        };
+        styles.keys(&keys)
+    }
+
+    /// The line above the footer explaining the label of the row at the
+    /// cursor, and what to do about it, if it has one.
+    fn info(&self, styles: &Styles) -> Option<Line<'static>> {
+        let shown = self.panel.is_none() && self.top.is_none() && self.picking.is_none();
+        let label = self.label_at_cursor().filter(|_| shown)?;
+        let (style, keys) = match label.tier {
+            Tier::Cache => (styles.cache, "r reveal to delete  space pick"),
+            Tier::Known => (styles.known, "r reveal  space pick"),
+            Tier::System => (styles.system, ""),
+        };
+        let mut spans = vec![
+            Span::styled(format!("[{}]", label.text), style),
+            Span::raw(format!(" {}.", label.why)),
+        ];
+        if !keys.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.extend(styles.keys(keys).spans);
         }
+        Some(Line::from(spans))
     }
 
     /// The bytes the volume uses beyond those a finished scan of its root
@@ -1712,8 +1742,10 @@ mod tests {
     fn screen(title: &str) -> Buffer {
         let mut lines = vec![format!("{title:<100}")];
         lines.extend((0..18).map(|_| format!("{:100}", "")));
-        lines.push(format!("{HELP:<100}"));
-        Buffer::with_lines(lines)
+        lines.push(String::new());
+        let mut buf = Buffer::with_lines(lines);
+        buf.set_line(0, 19, &Styles::new(true).keys(HELP), 100);
+        buf
     }
 
     /// A dir's row of `size` KiB, green, with no bar: the columns are
