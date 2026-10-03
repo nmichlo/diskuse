@@ -153,6 +153,11 @@ pub struct Stream {
     tx: *mut Sender<Vec<Event>>,
 }
 
+// SAFETY: the stream and queue are thread-safe CoreFoundation and
+// libdispatch objects, and `tx` is only used by the stream's callback on
+// its own queue and freed in `Drop`, after that queue is drained.
+unsafe impl Send for Stream {}
+
 impl Stream {
     /// Delivers every event that happened before the call, held back by the
     /// latency or still with the FSEvents service, before returning.

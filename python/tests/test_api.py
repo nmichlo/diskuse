@@ -128,3 +128,48 @@ def test_the_console_script_is_the_cli(root):
         check=True,
     )
     assert got.stdout == want.stdout
+
+
+def until_ready(events):
+    """The events up to and including `Ready`, by kind."""
+    kinds = []
+    for e in events:
+        kinds.append(type(e).__name__)
+        if isinstance(e, diskuse.Ready):
+            return kinds, e.tree
+    raise AssertionError("no Ready")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="only macOS reports changes")
+def test_live_reports_ready_then_each_change(root):
+    with diskuse.live(root, interval=0.2) as live:
+        events = iter(live)
+        kinds, tree = until_ready(events)
+        assert (kinds[-1], tree.root.size) == ("Ready", diskuse.scan(root).root.size)
+        (root / "a/new").write_bytes(b"x" * 4096)
+        change = next(e for e in events if isinstance(e, diskuse.Changed))
+        assert change.changes == [(root / "a", blocks(root / "a/new"))]
+        assert change.tree.find("a").size == tree.find("a").size + blocks(
+            root / "a/new"
+        )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="only macOS reports changes")
+def test_live_async(root):
+    async def run():
+        async for e in diskuse.live(root, interval=0.2):
+            if isinstance(e, diskuse.Ready):
+                (root / "c/new").write_bytes(b"x" * 8192)
+            if isinstance(e, diskuse.Changed):
+                return e.changes
+
+    import asyncio
+
+    assert asyncio.run(run()) == [(root / "c", blocks(root / "c/new"))]
+
+
+def test_live_ends_once_closed(root):
+    live = diskuse.live(root, interval=0.1)
+    kinds, _ = until_ready(live)
+    live.close()
+    assert (kinds[-1], list(live)) == ("Ready", [])

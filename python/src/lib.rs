@@ -245,8 +245,66 @@ impl PyDir {
     }
 }
 
+/// A live scan, wrapped by `diskuse.Live`: `next` returns one event as a
+/// tuple, `("closed",)` once closed, or `None` if nothing happened within
+/// `interval` seconds, waiting with the GIL released. `close` stops it.
+#[pyclass(name = "_Live", module = "diskuse")]
+struct PyLive {
+    live: std::sync::Mutex<Option<diskuse::Live>>,
+    /// Set by `close`, which may come while `next` has the scan out.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+#[pymethods]
+impl PyLive {
+    #[new]
+    #[pyo3(signature = (path, threads = None))]
+    fn new(path: PathBuf, threads: Option<usize>) -> Self {
+        let live = diskuse::Live::start(&path, threads.and_then(NonZeroUsize::new));
+        Self {
+            live: std::sync::Mutex::new(Some(live)),
+            closed: Default::default(),
+        }
+    }
+
+    fn next<'py>(&self, py: Python<'py>, interval: f64) -> PyResult<Option<Bound<'py, PyAny>>> {
+        // taken out while it waits, so the lock is not held without the GIL
+        let closed = || ("closed",).into_pyobject(py).map(|t| Some(t.into_any()));
+        let Some(mut live) = self.live.lock().unwrap().take() else {
+            return closed();
+        };
+        let interval = std::time::Duration::from_secs_f64(interval);
+        let event = py.detach(|| live.next(interval));
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            py.detach(|| drop(live));
+            return closed();
+        }
+        *self.live.lock().unwrap() = Some(live);
+        let event = event.map_err(|e| PyOSError::new_err(e.to_string()))?;
+        let tree = |t: Tree| PyTree(Data::new(t));
+        let event = match event {
+            None => return Ok(None),
+            Some(diskuse::Event::Scanning(t)) => ("scanning", tree(t)).into_pyobject(py)?,
+            Some(diskuse::Event::Ready(t)) => ("ready", tree(t)).into_pyobject(py)?,
+            Some(diskuse::Event::Changed(t, c)) => ("changed", tree(t), c).into_pyobject(py)?,
+            Some(diskuse::Event::Rescanning(why)) => ("rescanning", why).into_pyobject(py)?,
+        };
+        Ok(Some(event.into_any()))
+    }
+
+    /// Stops the scan and the watch.
+    fn close(&self, py: Python<'_>) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(live) = self.live.lock().unwrap().take() {
+            py.detach(|| drop(live));
+        }
+    }
+}
+
 #[pymodule]
 fn _diskuse(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyLive>()?;
     m.add_function(wrap_pyfunction!(scan, m)?)?;
     m.add_function(wrap_pyfunction!(main, m)?)?;
     m.add_class::<PyTree>()?;
