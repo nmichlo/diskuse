@@ -6,8 +6,10 @@
 //! A live update appends the dirs new since, so the order holds, and flags
 //! the ones gone [`Record::REMOVED`] rather than moving any record.
 
+use hashbrown::HashTable;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -307,8 +309,11 @@ pub(crate) struct Builder {
     base: Arc<Vec<Record>>,
     records: Arc<boxcar::Vec<Record>>,
     names: Names,
-    /// Name ids by name. Only interning takes the lock, never reading.
-    ids: Mutex<HashMap<Box<[u8]>, u32>>,
+    /// The id of each name interned, found by the name's hash and the name
+    /// in `names`, so no name is stored twice. Only interning takes the
+    /// lock, never reading.
+    ids: Mutex<HashTable<u32>>,
+    hasher: RandomState,
     pub largest: Arc<Largest>,
 }
 
@@ -411,6 +416,7 @@ impl Builder {
             records: Arc::default(),
             names: Arc::new(names),
             ids: Mutex::default(),
+            hasher: RandomState::new(),
             largest: Arc::default(),
         }
     }
@@ -426,6 +432,7 @@ impl Builder {
             records: Arc::default(),
             names: Arc::clone(&tree.names),
             ids: Mutex::default(),
+            hasher: RandomState::new(),
             largest: Arc::new(largest),
         }
     }
@@ -438,15 +445,17 @@ impl Builder {
     /// The name id of each name, under one lock.
     pub fn intern<'a>(&self, names: impl Iterator<Item = &'a [u8]>) -> Vec<u32> {
         let mut ids = self.ids.lock().unwrap();
+        let named = |id: u32| &self.names[id as usize][..];
         names
             .map(|name| {
-                if let Some(&id) = ids.get(name) {
+                let hash = self.hasher.hash_one(name);
+                if let Some(&id) = ids.find(hash, |&id| named(id) == name) {
                     return id;
                 }
                 // pushed under the lock, so a name is never stored twice
                 let id =
                     u32::try_from(self.names.push(name.into())).expect("over 2^32 distinct names");
-                ids.insert(name.into(), id);
+                ids.insert_unique(hash, id, |&id| self.hasher.hash_one(named(id)));
                 id
             })
             .collect()
@@ -462,6 +471,8 @@ impl Builder {
     }
 
     pub fn finish(self, links: Links, since: u64, stopped: bool) -> Tree {
+        // first, so its memory is free for the copy
+        drop(self.ids);
         // copies, as a `Progress` may still share them
         let mut records = Arc::unwrap_or_clone(self.base);
         records.reserve_exact(self.records.count());

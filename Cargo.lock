@@ -340,6 +340,7 @@ dependencies = [
  "boxcar",
  "clap",
  "crc32fast",
+ "hashbrown 0.16.1",
  "libc",
  "memmap2",
  "ratatui",
