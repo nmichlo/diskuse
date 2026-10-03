@@ -3,8 +3,7 @@ name: test
 on:
   pull_request:
   push:
-    # stacked branches are pushed without PRs, so they are checked on push
-    branches: [main, "nathan/diskuse/**"]
+    branches: [main]
 
 # least privilege: jobs that need more declare it themselves, and a job-level
 # `permissions:` replaces this one rather than adding to it.
@@ -25,6 +24,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+
+  # the Python API: builds the extension with maturin through uv, then pytest
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - run: uv run --with pytest --with pyarrow pytest python/tests -q
 
   # advisories, licences, bans and sources, from `deny.toml`
   deny:
@@ -53,7 +68,7 @@ jobs:
   # exists. `always()` is required, or the gate is skipped when what it guards
   # fails -- and a skipped required check counts as success.
   test:
-    needs: [rust, deny, licenses]
+    needs: [rust, python, deny, licenses]
     if: always()
     runs-on: ubuntu-latest
     steps:
