@@ -55,12 +55,12 @@ class Changed:
 class Rescanning:
     reason: str
 
-Event: TypeAlias = Union[Scanning, Ready, Changed, Rescanning]
+Event: TypeAlias = Scanning | Ready | Changed | Rescanning
 
 class Live:
     def __init__(
         self,
-        path: Union[str, PathLike],
+        path: str | PathLike,
         interval: float = 0.5,
         threads: Optional[int] = None,
     ) -> None: ...
@@ -71,5 +71,5 @@ class Live:
     def __exit__(self, *exc: object) -> None: ...
 
 def live(
-    path: Union[str, PathLike], interval: float = 0.5, threads: Optional[int] = None
+    path: str | PathLike, interval: float = 0.5, threads: Optional[int] = None
 ) -> Live: ...
