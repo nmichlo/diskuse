@@ -28,7 +28,7 @@ pub struct ScanOptions {
     /// Worker threads. `None` starts with 4 and adds threads, up to the
     /// number of cores, while they wait on the disk.
     pub threads: Option<NonZeroUsize>,
-    /// Also measure [`Record::own_private`]. Only the macOS reader can see
+    /// Also measure [`ReadTree::own_private`]. Only the macOS reader can see
     /// clones; the portable reader leaves it 0.
     pub reclaimable: bool,
     pub reader: Reader,
@@ -113,7 +113,7 @@ pub fn scan_live(
     // the walk runs
     let since = sys::event_id();
     let (pool, gate) = pool(opts).map_err(ScanError::ThreadPool)?;
-    let tree = Builder::new(root.as_os_str().as_bytes());
+    let tree = Builder::new(root.as_os_str().as_bytes(), opts.reclaimable);
     let walk = Walk::new(tree, Links::new(), st.dev, lister, opts.stop.clone(), gate);
     let own = Own::of(&st, opts.reclaimable);
     progress(walk.tree.progress());
@@ -271,7 +271,7 @@ struct Walk {
     gate: Gate,
 }
 
-/// [`Record::own`] and [`Record::own_private`], summed together.
+/// [`Record::own`] and [`ReadTree::own_private`], summed together.
 #[derive(Clone, Copy)]
 struct Own {
     bytes: u64,
@@ -398,14 +398,14 @@ impl Walk {
     }
 
     fn deny(&self, parent: u32, name: u32, own: Own, e: Errno) -> u32 {
-        self.tree.push(Record {
+        let record = Record {
             parent,
             name,
             flags: Record::DENIED,
             errno: e.raw_os_error() as u16,
             own: own.bytes,
-            own_private: own.private,
-        })
+        };
+        self.tree.push(record, own.private)
     }
 
     /// Lists the open directory `fd`, whose own blocks are `own`.
@@ -475,14 +475,16 @@ impl Walk {
         let id = match listing.denied {
             // files listed before the error are counted, so they compete too
             Some(e) => self.deny(parent, name, listing.own, e),
-            None => self.tree.push(Record {
-                parent,
-                name,
-                flags: 0,
-                errno: 0,
-                own: listing.own.bytes,
-                own_private: listing.own.private,
-            }),
+            None => {
+                let record = Record {
+                    parent,
+                    name,
+                    flags: 0,
+                    errno: 0,
+                    own: listing.own.bytes,
+                };
+                self.tree.push(record, listing.own.private)
+            }
         };
         self.own(id, &listing.claimed);
         self.tree.largest.offer(id, listing.files);
@@ -497,14 +499,14 @@ impl Walk {
             // point is never opened. The mount flag catches the macOS Data
             // volume, which shares the root's dev.
             if kid.mount || kid.dev != self.root_dev {
-                self.tree.push(Record {
+                let record = Record {
                     parent: id,
                     name,
                     flags: Record::OTHER_DEVICE,
                     errno: 0,
                     own: 0,
-                    own_private: 0,
-                });
+                };
+                self.tree.push(record, 0);
             } else {
                 visit.push((kid, name));
             }
@@ -675,7 +677,7 @@ impl Tree {
         let links = std::mem::take(&mut self.links);
         let gate = Gate::fixed(1);
         let walk = Walk::new(
-            Builder::new(b""),
+            Builder::new(b"", false),
             links,
             st.dev,
             lister,
@@ -696,8 +698,8 @@ impl Tree {
             return Vec::new();
         }
         let r = &mut self.records[d as usize];
-        (r.flags, r.errno) = (0, 0);
-        (r.own, r.own_private) = (listing.own.bytes, listing.own.private);
+        (r.flags, r.errno, r.own) = (0, 0, listing.own.bytes);
+        self.set_private(d, listing.own.private);
 
         // the subdirectories before, by name
         let names = Arc::clone(&self.names);
@@ -725,14 +727,14 @@ impl Tree {
                 return true;
             }
             let name = self.push_name(kid.name.to_bytes());
-            self.records.push(Record {
+            let record = Record {
                 parent: d,
                 name,
                 flags: Record::OTHER_DEVICE,
                 errno: 0,
                 own: 0,
-                own_private: 0,
-            });
+            };
+            self.push(record, 0);
             false
         });
         new
@@ -746,8 +748,8 @@ impl Tree {
         }
         let errno = e.raw_os_error() as u16;
         let r = &mut self.records[d as usize];
-        (r.flags, r.errno) = (Record::DENIED, errno);
-        (r.own, r.own_private) = (own.bytes, own.private);
+        (r.flags, r.errno, r.own) = (Record::DENIED, errno, own.bytes);
+        self.set_private(d, own.private);
     }
 
     /// The own blocks of dir `d`, from its parent, or 0 if that cannot be

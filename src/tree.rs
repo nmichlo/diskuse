@@ -31,9 +31,6 @@ pub struct Record {
     /// Allocated bytes of the directory itself plus all its non-directory
     /// entries. Hard links count once per scan.
     pub own: u64,
-    /// Of `own`, the bytes not shared with a clone elsewhere, so freed by
-    /// deleting. 0 unless scanned with `reclaimable` on macOS.
-    pub own_private: u64,
 }
 
 impl Record {
@@ -54,7 +51,7 @@ impl Record {
 pub struct Totals {
     /// `own` of the record plus that of all its descendants.
     pub size: Vec<u64>,
-    /// The same sum of `own_private`.
+    /// The same sum of [`ReadTree::own_private`].
     pub private: Vec<u64>,
     /// The record's flags plus [`Record::PARTIAL`].
     pub flags: Vec<u16>,
@@ -101,6 +98,9 @@ pub struct Tree {
     /// In no particular order.
     pub(crate) largest: Vec<LargeFile>,
     pub(crate) links: Links,
+    /// [`ReadTree::own_private`] by record id, empty unless scanned with
+    /// reclaimable sizes, so other scans' records are 8 B smaller.
+    pub(crate) private: Vec<u64>,
     /// The id of the OS's latest change when the scan started, so a live
     /// watch from it sees the changes made while the scan ran. 0 where the
     /// OS keeps no record of changes, and in a saved scan.
@@ -121,6 +121,11 @@ pub trait ReadTree {
     }
 
     fn record(&self, id: u32) -> Record;
+
+    /// Of record `id`'s `own`, the bytes not shared with a clone elsewhere,
+    /// so freed by deleting. 0 unless scanned with reclaimable sizes on
+    /// macOS.
+    fn own_private(&self, id: u32) -> u64;
 
     /// Raw name bytes. The root's name is the scanned path as given.
     fn name(&self, name: u32) -> &[u8];
@@ -166,7 +171,7 @@ pub trait ReadTree {
         for i in (0..n).rev() {
             let r = self.record(i as u32);
             size[i] += r.own;
-            private[i] += r.own_private;
+            private[i] += self.own_private(i as u32);
             flags[i] |= r.flags;
             if i > 0 {
                 let p = r.parent as usize;
@@ -221,6 +226,10 @@ impl ReadTree for Tree {
         self.records[id as usize]
     }
 
+    fn own_private(&self, id: u32) -> u64 {
+        self.private.get(id as usize).copied().unwrap_or(0)
+    }
+
     fn name(&self, name: u32) -> &[u8] {
         &self.names[name as usize]
     }
@@ -257,9 +266,25 @@ impl Tree {
             flags: Record::REMOVED,
             errno: 0,
             own: 0,
-            own_private: 0,
             ..self.records[id as usize]
         };
+        self.set_private(id, 0);
+    }
+
+    /// Sets [`ReadTree::own_private`] of record `id`, if the tree has
+    /// reclaimable sizes.
+    pub(crate) fn set_private(&mut self, id: u32, bytes: u64) {
+        if let Some(p) = self.private.get_mut(id as usize) {
+            *p = bytes;
+        }
+    }
+
+    /// Appends `record`, of `private` reclaimable bytes.
+    pub(crate) fn push(&mut self, record: Record, private: u64) {
+        if !self.private.is_empty() {
+            self.private.push(private);
+        }
+        self.records.push(record);
     }
 
     /// Removes every record below a removed one, and the links and largest
@@ -293,6 +318,19 @@ impl Tree {
     }
 }
 
+/// `base`, then each `(id, bytes)` of `pairs` at its id, as a dense vector
+/// of `len`. Ids at or past `len` are left out.
+fn scatter(base: Vec<u64>, pairs: impl Iterator<Item = (u32, u64)>, len: usize) -> Vec<u64> {
+    let mut all = base;
+    all.resize(len, 0);
+    for (id, bytes) in pairs {
+        if let Some(p) = all.get_mut(id as usize) {
+            *p = bytes;
+        }
+    }
+    all
+}
+
 /// Appends `name` to `path` after a `/`.
 pub(crate) fn join(path: &mut Vec<u8>, name: &[u8]) {
     // `scan /` must not print `//usr`
@@ -308,6 +346,10 @@ pub(crate) struct Builder {
     /// records come after them, so their ids count from its length.
     base: Arc<Vec<Record>>,
     records: Arc<boxcar::Vec<Record>>,
+    /// `(id, bytes)` of [`ReadTree::own_private`], with reclaimable sizes.
+    private: Option<Arc<boxcar::Vec<(u32, u64)>>>,
+    /// Those of the records of `base`.
+    base_private: Vec<u64>,
     names: Names,
     /// The id of each name interned, found by the name's hash and the name
     /// in `names`, so no name is stored twice. Only interning takes the
@@ -323,6 +365,7 @@ pub(crate) struct Builder {
 pub struct Progress {
     base: Arc<Vec<Record>>,
     records: Arc<boxcar::Vec<Record>>,
+    private: Option<Arc<boxcar::Vec<(u32, u64)>>>,
     names: Names,
     largest: Arc<Largest>,
 }
@@ -347,11 +390,16 @@ impl Progress {
             .filter(|f| (f.0.dir as usize) < records.len())
             .map(|Reverse(f)| f.clone())
             .collect();
+        // only of the records in the prefix
+        let private = self.private.as_ref().map_or_else(Vec::new, |p| {
+            scatter(Vec::new(), p.iter().map(|(_, &pair)| pair), records.len())
+        });
         (!records.is_empty()).then(|| Tree {
             records,
             names: Arc::clone(&self.names),
             largest,
             links: Links::new(),
+            private,
             since: 0,
             stopped: false,
         })
@@ -407,13 +455,16 @@ impl Largest {
 
 impl Builder {
     /// `root` becomes name id 0, the root's, outside the dedup map so no
-    /// directory shares it and a saved scan can drop it.
-    pub fn new(root: &[u8]) -> Self {
+    /// directory shares it and a saved scan can drop it. `reclaimable`
+    /// keeps [`ReadTree::own_private`].
+    pub fn new(root: &[u8], reclaimable: bool) -> Self {
         let names = boxcar::Vec::new();
         names.push(root.into());
         Self {
             base: Arc::default(),
             records: Arc::default(),
+            private: reclaimable.then(Arc::default),
+            base_private: Vec::new(),
             names: Arc::new(names),
             ids: Mutex::default(),
             hasher: RandomState::new(),
@@ -430,6 +481,8 @@ impl Builder {
         Self {
             base: Arc::new(std::mem::take(&mut tree.records)),
             records: Arc::default(),
+            private: (!tree.private.is_empty()).then(Arc::default),
+            base_private: std::mem::take(&mut tree.private),
             names: Arc::clone(&tree.names),
             ids: Mutex::default(),
             hasher: RandomState::new(),
@@ -437,9 +490,15 @@ impl Builder {
         }
     }
 
-    pub fn push(&self, record: Record) -> u32 {
+    /// Appends `record`, of `private` reclaimable bytes, and returns its
+    /// id.
+    pub fn push(&self, record: Record, private: u64) -> u32 {
         let id = self.base.len() + self.records.push(record);
-        u32::try_from(id).expect("over 2^32 directories")
+        let id = u32::try_from(id).expect("over 2^32 directories");
+        if let Some(p) = &self.private {
+            p.push((id, private));
+        }
+        id
     }
 
     /// The name id of each name, under one lock.
@@ -465,6 +524,7 @@ impl Builder {
         Progress {
             base: Arc::clone(&self.base),
             records: Arc::clone(&self.records),
+            private: self.private.clone(),
             names: Arc::clone(&self.names),
             largest: Arc::clone(&self.largest),
         }
@@ -477,7 +537,15 @@ impl Builder {
         let mut records = Arc::unwrap_or_clone(self.base);
         records.reserve_exact(self.records.count());
         records.extend(self.records.iter().map(|(_, r)| *r));
+        let private = self.private.as_ref().map_or_else(Vec::new, |p| {
+            scatter(
+                self.base_private,
+                p.iter().map(|(_, &pair)| pair),
+                records.len(),
+            )
+        });
         Tree {
+            private,
             records,
             names: self.names,
             // taken, as a `Progress` may still share the heap

@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! magic     b"DSWP"
-//! version   u8 = 5
+//! version   u8 = 6
 //! flags     u8: bit 0 = scanned with reclaimable sizes, bit 1 = stopped
 //! 0         u16, so the archive starts aligned, at byte 8
 //! archive   rkyv, of `Body`
@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"DSWP";
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 const RECLAIMABLE: u8 = 1 << 0;
 const STOPPED: u8 = 1 << 1;
 const HEADER_LEN: usize = 8;
@@ -249,6 +249,7 @@ impl SavedTree<'_> {
                 })
                 .collect(),
             links: Links::new(),
+            private: (body.private.iter()).map(|p| p.to_native()).collect(),
             since: 0,
             stopped: self.stopped,
         }
@@ -268,8 +269,11 @@ impl ReadTree for SavedTree<'_> {
             flags: r.flags.to_native(),
             errno: r.errno.to_native(),
             own: r.own.to_native(),
-            own_private: r.own_private.to_native(),
         }
+    }
+
+    fn own_private(&self, id: u32) -> u64 {
+        (self.body.private.get(id as usize)).map_or(0, |p| p.to_native())
     }
 
     fn name(&self, name: u32) -> &[u8] {
@@ -308,6 +312,10 @@ struct Body<'a> {
     /// In no particular order.
     #[rkyv(with = AsVec)]
     largest: &'a [LargeFile],
+    /// [`ReadTree::own_private`] by record id, empty without reclaimable
+    /// sizes.
+    #[rkyv(with = AsVec)]
+    private: &'a [u64],
 }
 
 /// The canonical root, as the scan follows a symlinked root, and the stem
@@ -343,6 +351,7 @@ fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> AlignedVec {
         names,
         ends,
         largest: &tree.largest,
+        private: &tree.private,
     };
     // a little over the file's length, so it never grows, which would copy
     // it all
@@ -353,6 +362,7 @@ fn encode(canonical: &Path, tree: &Tree, reclaimable: bool) -> AlignedVec {
         + size_of_val(&body.names[..])
         + size_of_val(&body.ends[..])
         + largest
+        + size_of_val(body.private)
         + 256;
     let mut out = AlignedVec::with_capacity(len);
     out.extend_from_slice(MAGIC);
@@ -390,4 +400,5 @@ fn valid(body: &ArchivedBody<'_>) -> bool {
             .last()
             .is_some_and(|&e| e.to_native() as usize == body.names.len())
         && (body.largest.iter()).all(|f| below(f.dir.to_native(), records.len()))
+        && (body.private.is_empty() || body.private.len() == records.len())
 }

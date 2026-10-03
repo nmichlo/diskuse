@@ -1681,7 +1681,7 @@ mod tests {
     #[test]
     fn a_running_scan_shows_lower_bounds() {
         let dir = tempfile::tempdir().unwrap();
-        let tree = Builder::new(dir.path().as_os_str().as_bytes());
+        let tree = Builder::new(dir.path().as_os_str().as_bytes(), false);
         let env = Env {
             desktop: Desktop::None,
             terminal: "Terminal".into(),
@@ -1701,11 +1701,10 @@ mod tests {
             flags: 0,
             errno: 0,
             own,
-            own_private: 0,
         };
-        tree.push(dir(Record::NO_PARENT, 0, 0));
-        tree.push(dir(0, ids[0], 4096));
-        tree.push(dir(1, ids[1], 8192));
+        tree.push(dir(Record::NO_PARENT, 0, 0), 0);
+        tree.push(dir(0, ids[0], 4096), 0);
+        tree.push(dir(1, ids[1], 8192), 0);
         b.show(tree.progress().snapshot().unwrap(), Status::Scanning);
         // the root's column starts at x 0, the preview at 34
         let mut expected = screen("/scan  scanning... at least 12.0 KiB");

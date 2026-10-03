@@ -49,7 +49,7 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> St
         .collect();
     let root = tree.record(0);
     if root.own > 0 {
-        rows.push((root.own, root.own_private, b"[files]", "[files]".into()));
+        rows.push((root.own, tree.own_private(0), b"[files]", "[files]".into()));
     }
     rows.sort_by(|a, b| largest_first((a.0, a.2), (b.0, b.2)));
     for (size, private, _, label) in rows {
