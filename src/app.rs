@@ -4,6 +4,7 @@
 
 use crate::access::{self, FullDiskAccess, draw_guide, settings_command};
 use crate::browse::{Browser, Clicks, Env, nav};
+use crate::live::Waker;
 use crate::reveal;
 use crate::style::Styles;
 use crate::sys;
@@ -22,10 +23,12 @@ use std::ffi::OsString;
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
-/// How often the view catches up with a running scan or with changes on
-/// disk.
+/// How often the screen is drawn while nothing happens, for the ages it
+/// shows.
 const TICK: Duration = Duration::from_secs(1);
 
 /// Every key, and what it does, as the help lists them.
@@ -116,12 +119,35 @@ fn on_home_path(path: &Path, home: &Path) -> bool {
     std::fs::canonicalize(path).is_ok_and(|p| p.starts_with(home) || home.starts_with(&p))
 }
 
+/// Draws, then waits for a key, the mouse, or the scan shown, whichever
+/// comes first. Input comes from its own thread, which wakes the scan's
+/// wait.
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
-    let mut tick = Instant::now();
+    let (tx, input) = mpsc::channel();
+    let waker: Arc<Mutex<Option<Waker>>> = Arc::default();
+    let wake = Arc::clone(&waker);
+    thread::spawn(move || {
+        while let Ok(e) = event::read() {
+            if tx.send(e).is_err() {
+                break;
+            }
+            if let Some(w) = &*wake.lock().unwrap() {
+                w.wake();
+            }
+        }
+    });
+    let mut pending = Vec::new();
     loop {
         terminal.draw(|f| app.draw(f, SystemTime::now()))?;
-        if event::poll(TICK.saturating_sub(tick.elapsed()))? {
-            match event::read()? {
+        // all input first, so a key never waits on the scan
+        pending.extend(input.try_iter());
+        let timeout = if pending.is_empty() {
+            TICK
+        } else {
+            Duration::ZERO
+        };
+        for e in pending.drain(..) {
+            match e {
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press
                         && app.key(key, &mut reveal::spawn).is_break() =>
@@ -132,9 +158,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
                 _ => {}
             }
         }
-        if tick.elapsed() >= TICK {
-            app.poll(SystemTime::now());
-            tick = Instant::now();
+        // set before the wait, and input is taken after it, so no key is
+        // missed
+        *waker.lock().unwrap() = app.waker();
+        match app.waker() {
+            Some(_) => {
+                app.poll(SystemTime::now(), timeout);
+            }
+            None => {
+                app.poll(SystemTime::now(), Duration::ZERO);
+                pending.extend(input.recv_timeout(timeout));
+            }
         }
     }
 }
@@ -217,16 +251,25 @@ impl App {
         app
     }
 
-    /// Catches up with a running scan, or with changes on disk. Returns
+    /// Catches up with a running scan, or with changes on disk, waiting up
+    /// to `timeout` for the browser shown ([`Browser::poll`]). Returns
     /// whether a scan still runs.
-    pub fn poll(&mut self, now: SystemTime) -> bool {
+    pub fn poll(&mut self, now: SystemTime, timeout: Duration) -> bool {
         // a parked browser keeps up too, so changes do not pile up
         if let Some(b) = &mut self.parked {
-            b.poll(now);
+            b.poll(now, Duration::ZERO);
         }
         match &mut self.screen {
-            Screen::Browse(b) => b.poll(now),
+            Screen::Browse(b) => b.poll(now, timeout),
             _ => false,
+        }
+    }
+
+    /// Wakes an [`App::poll`] waiting on another thread, if one would wait.
+    pub fn waker(&self) -> Option<Waker> {
+        match &self.screen {
+            Screen::Browse(b) => b.waker(),
+            _ => None,
         }
     }
 

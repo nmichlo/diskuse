@@ -17,7 +17,7 @@
 
 use crate::access::{reason, terminal_app};
 use crate::labels::{self, Label, Tier};
-use crate::live::{Event, Live, LiveOptions, live};
+use crate::live::{Event, Live, LiveOptions, Waker, live};
 use crate::report::{format_size, largest_first};
 use crate::reveal::Desktop;
 use crate::scan::ScanOptions;
@@ -70,6 +70,9 @@ pub struct Env {
     /// On Linux, watch the dirs shown with inotify. Off, they are listed
     /// again on a timer, as where inotify cannot watch them.
     pub inotify: bool,
+    /// How often a running scan is shown, and changes on disk are taken
+    /// in: [`LiveOptions::interval`].
+    pub interval: Duration,
     /// Draw in colour. Off when `NO_COLOR` is set and not empty.
     pub color: bool,
     /// The home dir, for the labels of known folders in it.
@@ -84,6 +87,7 @@ impl Env {
             terminal: terminal_app(std::env::var("TERM_PROGRAM").ok().as_deref()),
             cache: CacheDir::from_env().ok(),
             inotify: true,
+            interval: Duration::from_secs(1),
             color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
             home: std::env::var_os("HOME").map(PathBuf::from),
         }
@@ -409,8 +413,7 @@ impl Browser {
                 reclaimable: self.reclaimable,
                 ..ScanOptions::default()
             },
-            // every poll takes a snapshot, or checks for changes
-            interval: Duration::ZERO,
+            interval: self.env.interval,
             ignore: self.env.cache.as_ref().map(|c| c.path().into()),
             inotify: self.env.inotify,
             // the dirs shown are followed: a watch on every dir costs kernel
@@ -434,6 +437,12 @@ impl Browser {
     /// A scan runs: the first, after lost changes, or of one dir.
     fn busy(&self) -> bool {
         self.live.as_ref().is_some_and(Live::busy)
+    }
+
+    /// Wakes a [`Browser::poll`] waiting on another thread. `None` if it
+    /// would not wait, with no scan to wait on.
+    pub fn waker(&self) -> Option<Waker> {
+        self.live.as_ref().filter(|l| !l.is_done()).map(Live::waker)
     }
 
     /// Scans the dir at the cursor again, or at a file the current dir, on
@@ -481,13 +490,14 @@ impl Browser {
 
     /// Catches up with the scan: shows a snapshot of it, unless a saved
     /// scan is shown, or once it is done, its tree, and saves that. Then
-    /// shows the changes on disk since the last poll. Returns whether a
-    /// scan still runs.
-    pub fn poll(&mut self, now: SystemTime) -> bool {
+    /// shows the changes on disk since the last poll. Waits up to `timeout`
+    /// for one of those, or until woken ([`Browser::waker`]). Returns
+    /// whether a scan still runs.
+    pub fn poll(&mut self, now: SystemTime, timeout: Duration) -> bool {
         let Some(live) = &mut self.live else {
             return false;
         };
-        match live.wait(Duration::ZERO) {
+        match live.wait(timeout) {
             None => {}
             Some(Err(e)) => {
                 self.rescanning = None;
@@ -1631,6 +1641,7 @@ mod tests {
             terminal: "Terminal".into(),
             cache: None,
             inotify: true,
+            interval: Duration::ZERO,
             color: true,
             home: None,
         };
