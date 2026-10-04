@@ -19,9 +19,9 @@ jobs:
     uses: nmichlo/.github/.github/workflows/pre-commit.yaml@main
     with:
       rust: true
-      # the hooks are cargo fmt/clippy and ruff -- none of them import the
-      # package, so there is no need to spend a Rust build installing it
-      install: false
+      # `ty` imports the package, so the extension is built into `.venv`, and
+      # `[test]` as it checks the tests too
+      install-extras: "test"
 
   # The branch-protection gate; see nmichlo/.github/actions/gate for why it
   # exists. `always()` is required, or the gate is skipped when what it guards

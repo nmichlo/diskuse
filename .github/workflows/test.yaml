@@ -39,7 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v7
-      - run: uv run --with pytest --with pyarrow pytest python/tests -q
+      - run: uv run --extra test pytest python/tests -q
 
   # advisories, licences, bans and sources, from `deny.toml`
   deny:

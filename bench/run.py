@@ -20,7 +20,8 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -39,7 +40,9 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def first_int(out: str) -> int:
-    return int(re.search(r"\d+", ANSI.sub("", out)).group())
+    m = re.search(r"\d+", ANSI.sub("", out))
+    assert m, out
+    return int(m.group())
 
 
 def last_line_int(out: str) -> int:
@@ -76,7 +79,9 @@ UNITS = {"B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 
 def human(out: str) -> tuple[int, int]:
     """`697.9M` -> bytes, and the slack its rounding allows: one last digit."""
-    num, unit = re.match(r"\s*([\d.]+)([BKMGT]?)", out).groups()
+    m = re.match(r"\s*([\d.]+)([BKMGT]?)", out)
+    assert m, out
+    num, unit = m.groups()
     scale = UNITS[unit or "B"]
     decimals = len(num.partition(".")[2])
     return round(float(num) * scale), scale // 10**decimals
@@ -114,9 +119,7 @@ TOOLS = [
         "dua",
         "dua",
         "tree",
-        lambda p, t: (
-            ["-x", *opt("-t", t), "--format", "bytes", "aggregate"] + ["--no-sort", p]
-        ),
+        lambda p, t: ["-x", *opt("-t", t), "--format", "bytes", "aggregate"] + ["--no-sort", p],
         last_line_int,
     ),
     Tool(
@@ -137,9 +140,7 @@ TOOLS = [
         "pdu",
         "pdu",
         "tree",
-        lambda p, t: (
-            ["-x", "-H", "-b", "plain", "--json-output"] + [*opt("--threads", t), p]
-        ),
+        lambda p, t: ["-x", "-H", "-b", "plain", "--json-output"] + [*opt("--threads", t), p],
         lambda out: json.loads(out)["tree"]["size"],
     ),
     Tool(
@@ -311,9 +312,7 @@ def hyperfine(argv: list[str], extra: list[str]) -> dict:
         subprocess.run([*cmd, *extra, shlex.join(argv)], check=True)
         r = json.loads(Path(f.name).read_text())["results"][0]
     keys = ("mean", "stddev", "median", "min", "max", "times")
-    return {k: r[k] for k in keys} | {
-        "failed_runs": sum(c != 0 for c in r["exit_codes"])
-    }
+    return {k: r[k] for k in keys} | {"failed_runs": sum(c != 0 for c in r["exit_codes"])}
 
 
 def peak_rss(argv: list[str]) -> int:
@@ -323,10 +322,10 @@ def peak_rss(argv: list[str]) -> int:
         if MACOS
         else ("-v", r"Maximum resident set size \(kbytes\): (\d+)", 1024)
     )
-    out = run(
-        ["/usr/bin/time", flag, "sh", "-c", inner], env=os.environ | {"LC_ALL": "C"}
-    )
-    return int(re.search(pattern, out.stderr).group(1)) * scale
+    out = run(["/usr/bin/time", flag, "sh", "-c", inner], env=os.environ | {"LC_ALL": "C"})
+    m = re.search(pattern, out.stderr)
+    assert m, out.stderr
+    return int(m.group(1)) * scale
 
 
 def configs(tool: Tool, sweep: bool) -> list[int | None]:
@@ -348,11 +347,7 @@ def bench(args, kind: str) -> None:
     os.environ["DISKUSE_CACHE_DIR"] = os.path.join(cache.name, "diskuse")
     os.environ["DISKSCOUR_CACHE_DIR"] = os.path.join(cache.name, "diskscour")
     if kind == "cold":
-        prepare = (
-            "sudo purge"
-            if MACOS
-            else "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'"
-        )
+        prepare = "sudo purge" if MACOS else "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'"
         # ask for the password once, up front
         subprocess.run(["sudo", "-v"], check=True)
         extra = ["--prepare", prepare, "--runs", str(args.runs or 5)]
@@ -366,9 +361,7 @@ def bench(args, kind: str) -> None:
             row = {"tool": tool.name, "league": tool.league, "threads": threads}
             row["command"] = recorded(tool, path, label, threads)
             if label == "R2" and not tool.one_fs:
-                rows.append(
-                    row | {"valid": False, "note": "cannot stay on one filesystem"}
-                )
+                rows.append(row | {"valid": False, "note": "cannot stay on one filesystem"})
                 break
             argv = [tool.exe, *tool.args(path, threads)]
             row |= total(tool, path, threads, ref["bytes"])
@@ -405,22 +398,14 @@ def machine(args) -> str:
             return run(["sysctl", "-n", key]).stdout.strip()
 
         brand = sysctl("machdep.cpu.brand_string")
-        chip = (
-            brand.removeprefix("Apple ").lower().replace(" ", "")
-            if "Apple" in brand
-            else platform.machine()
-        )
+        chip = brand.removeprefix("Apple ").lower().replace(" ", "") if "Apple" in brand else platform.machine()
         ram = int(sysctl("hw.memsize")) >> 30
         os_ = "macos" + run(["sw_vers", "-productVersion"]).stdout.split(".")[0]
     else:
         chip = platform.machine()
         meminfo = Path("/proc/meminfo").read_text()
         ram = round(int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) / (1 << 20))
-        rel = dict(
-            re.findall(
-                r'^(\w+)="?([^"\n]*)', Path("/etc/os-release").read_text(), re.MULTILINE
-            )
-        )
+        rel = dict(re.findall(r'^(\w+)="?([^"\n]*)', Path("/etc/os-release").read_text(), re.MULTILINE))
         os_ = rel.get("ID", "linux") + rel.get("VERSION_ID", "")
     return f"{chip}-{CORES}c-{ram}g-{os_}"
 
@@ -482,9 +467,7 @@ def latest(machine_dir: Path) -> dict[str, dict]:
 def is_cold(row: dict, warm: list[dict]) -> bool:
     """A cold set counts only if its median is at least 2x the warm one."""
     w = default(warm, row["tool"])
-    return (
-        timed(row) and w is not None and timed(w) and row["median"] >= 2 * w["median"]
-    )
+    return timed(row) and w is not None and timed(w) and row["median"] >= 2 * w["median"]
 
 
 def gates(d: dict) -> list[tuple[bool | None, str]]:
@@ -530,7 +513,7 @@ def gates(d: dict) -> list[tuple[bool | None, str]]:
     mem = d.get("memory", {})
     tree_mem = {t: b for t, b in mem.items() if others.get(t) == "tree"}
     if "diskuse" in mem and tree_mem:
-        rival = min(tree_mem, key=tree_mem.get)
+        rival = min(tree_mem, key=lambda t: tree_mem[t])
         ok = mem["diskuse"] <= tree_mem[rival]
         out.append(
             (
@@ -562,6 +545,7 @@ def table(d: dict) -> list[str]:
     warm, cold, mem = d.get("warm", []), d.get("cold", []), d.get("memory", {})
     for tool in dict.fromkeys(r["tool"] for r in warm + cold):
         row = default(warm, tool) or default(cold, tool)
+        assert row, tool
         if row.get("valid"):
             status = "valid"
         elif "total" in row:
@@ -630,7 +614,7 @@ def check(args) -> int:
         # an unchanged committed copy of the newest result is not "previous"
         previous = [c for c in committed if c != current and "warm" in c]
         now = default(current["warm"], "diskuse")
-        then = previous and default(previous[-1]["warm"], "diskuse")
+        then = default(previous[-1]["warm"], "diskuse") if previous else None
         if not (now and then and timed(now) and timed(then)):
             print(f"SKIP {name}: no previous committed result")
             continue
@@ -644,12 +628,8 @@ def check(args) -> int:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    p.add_argument(
-        "--machine", help="results label [default: from the hardware and OS]"
-    )
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--machine", help="results label [default: from the hardware and OS]")
     sub = p.add_subparsers(dest="cmd", required=True)
     for kind in ("warm", "cold"):
         s = sub.add_parser(kind)

@@ -3,9 +3,8 @@
 //! where Unix permissions deny with `EACCES`. Full Disk Access, given to
 //! the terminal app, lifts it.
 
-use crate::report::denied;
 use crate::sys;
-use crate::tree::Record;
+use crate::tree::{ReadTree, Tree};
 use ratatui::Frame;
 use ratatui::style::Style;
 use ratatui::text::Text;
@@ -73,16 +72,16 @@ pub(crate) fn terminal_app(term_program: Option<&str>) -> String {
     .into()
 }
 
-/// Why the [`Record::DENIED`] dir `r` could not be read, and what would
-/// let it be. `terminal` is from [`terminal_app`].
-pub(crate) fn reason(r: &Record, terminal: &str) -> String {
-    let errno = i32::from(r.errno);
+/// Why the denied dir `id` could not be read, and what would let it be.
+/// `terminal` is from [`terminal_app`].
+pub(crate) fn reason(tree: &Tree, id: u32, terminal: &str) -> String {
+    let errno = i32::from(tree.record(id).errno);
     if errno == Errno::ACCESS.raw_os_error() {
         "permission denied (try sudo)".into()
     } else if cfg!(target_os = "macos") && errno == Errno::PERM.raw_os_error() {
         format!("needs Full Disk Access for {terminal}")
     } else {
-        denied(r)
+        tree.error(id).unwrap_or_default()
     }
 }
 

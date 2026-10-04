@@ -12,16 +12,15 @@
 //! Elsewhere [`Watch::start`] is always `None`, and an open browser follows
 //! only the dirs it shows ([`DirWatch`]).
 
-use crate::store::CacheDir;
 use crate::sys::{self, Event};
-use crate::tree::{ReadTree, Record, Tree};
+use crate::tree::{ReadTree, Record, Tree, dir_path};
 use rustix::fd::AsFd;
 use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// How long the stream must stay quiet after the replay of the changes
 /// made during the scan ends before they are applied. FSEvents sends the
@@ -71,9 +70,10 @@ pub(crate) enum Poll {
 pub(crate) struct Watch {
     stream: sys::Stream,
     rx: Receiver<Vec<Event>>,
-    /// The real root and cache dir, without a trailing `/`, so `/` is `""`.
+    /// The real root and ignored dir, without a trailing `/`, so `/` is
+    /// `""`.
     root: Vec<u8>,
-    cache: Option<Vec<u8>>,
+    ignore: Option<Vec<u8>>,
     firmlinks: Firmlinks,
     pending: Changes,
     /// Why changes were lost, if they were.
@@ -91,9 +91,9 @@ pub(crate) struct Watch {
 
 impl Watch {
     /// Watches `root` from when `tree`, a scan of it, started, ignoring
-    /// changes in `cache`. `None` where the OS keeps no record of changes
+    /// changes below `ignore`. `None` where the OS keeps no record of changes
     /// ([`sys::records_changes`]).
-    pub fn start(root: &Path, tree: &Tree, cache: Option<&CacheDir>) -> Option<Self> {
+    pub fn start(root: &Path, tree: &Tree, ignore: Option<&Path>) -> Option<Self> {
         if tree.since == 0 {
             return None;
         }
@@ -110,14 +110,13 @@ impl Watch {
             let path = path.as_os_str().as_bytes();
             path.strip_suffix(b"/").unwrap_or(path).to_vec()
         };
-        let cache =
-            cache.map(|c| std::fs::canonicalize(c.path()).unwrap_or_else(|_| c.path().into()));
+        let ignore = ignore.map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.into()));
         let now = Instant::now();
         Some(Self {
             stream,
             rx,
             root: trim(&real),
-            cache: cache.as_deref().map(trim),
+            ignore: ignore.as_deref().map(trim),
             firmlinks: Firmlinks(sys::firmlinks()),
             pending: Changes::default(),
             lost: None,
@@ -186,13 +185,13 @@ impl Watch {
         }
     }
 
-    /// `path` relative to the root, unless it is outside it or in the cache
-    /// dir. Tried in both forms [`Firmlinks::forms`] gives, firmlink first.
+    /// `path` relative to the root, unless it is outside it or ignored.
+    /// Tried in both forms [`Firmlinks::forms`] gives, firmlink first.
     fn below(&self, path: &[u8]) -> Option<Box<[u8]>> {
         let path = path.strip_suffix(b"/").unwrap_or(path);
         let forms = self.firmlinks.forms(path);
-        if let Some(cache) = &self.cache
-            && forms.iter().any(|p| inside(p, cache))
+        if let Some(ignore) = &self.ignore
+            && forms.iter().any(|p| inside(p, ignore))
         {
             return None;
         }
@@ -237,8 +236,6 @@ impl Firmlinks {
 /// limit is reached. Changes in other dirs are not seen until the next
 /// scan. The pattern of GIO, KDirWatch and the `notify` crate.
 pub(crate) struct DirWatch {
-    /// When the tree was scanned, as the dirs not shown stand.
-    pub scanned: SystemTime,
     inotify: Option<sys::Inotify>,
     /// The record id of each dir shown, and its watch if it has one. At
     /// most three, so searched in order.
@@ -251,11 +248,9 @@ pub(crate) struct DirWatch {
 }
 
 impl DirWatch {
-    /// Follows no dirs yet, of a tree scanned at `scanned`, with inotify if
-    /// `inotify`.
-    pub fn new(inotify: bool, scanned: SystemTime) -> Self {
+    /// Follows no dirs yet, with inotify if `inotify`.
+    pub fn new(inotify: bool) -> Self {
         Self {
-            scanned,
             inotify: inotify.then(sys::Inotify::new).flatten(),
             dirs: Vec::new(),
             dirty: BTreeSet::new(),
@@ -287,7 +282,7 @@ impl DirWatch {
             if self.dirs.iter().any(|&(k, _)| k == d) {
                 continue;
             }
-            let path = CString::new(tree.dir_path(d)).expect("names hold no NUL");
+            let path = CString::new(dir_path(tree, d)).expect("names hold no NUL");
             // a symlinked root is followed, as the scan does
             let wd = (self.inotify.as_ref()).and_then(|i| i.add(&path, d == 0));
             self.dirs.push((d, wd));

@@ -1,48 +1,44 @@
-//! The native half of the `diskuse` Python package, `diskuse._diskuse`.
-//! `python/diskuse/__init__.py` wraps it; only that module is public.
-//!
-//! Every export is one Python cannot do cheaply itself: the scan, the
-//! per-folder totals, the largest files kept during the scan, and the
-//! tree as columns. A `Dir` is the tree and a record id, so walking it
-//! never looks a path up.
+//! The `diskuse` Python package: the Rust library's API, name for name.
+//! Folders are ids, the root is 0, as in Rust. Only Python has `~`
+//! expansion, `async for`, and the Arrow PyCapsule interface.
 
-use diskuse::{ChildIndex, ReadTree, Record, ScanOptions, Totals, Tree};
-use pyo3::exceptions::PyOSError;
+use arrow_array::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::types::UInt32Type;
+use arrow_array::{
+    ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, RecordBatch, RecordBatchIterator,
+    UInt32Array, UInt64Array,
+};
+use diskuse::{Event, LiveOptions, ReadTree, Record, ScanError, ScanOptions, Tree};
+use pyo3::exceptions::{PyIndexError, PyOSError, PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyCFunction, PyCapsule, PyTuple};
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-/// A finished tree with what its queries need, shared by every `Dir`.
-struct Data {
-    tree: Tree,
-    totals: Totals,
-    index: ChildIndex,
+/// How long a wait for an event runs without the GIL before Python gets to
+/// check for Ctrl-C, or `follow` and `rescan` get the live scan.
+const SLICE: Duration = Duration::from_millis(50);
+
+/// `path` with `~` expanded, as `os.path.expanduser`.
+fn expand(py: Python<'_>, path: PathBuf) -> PyResult<PathBuf> {
+    py.import("os.path")?
+        .call_method1("expanduser", (path,))?
+        .extract()
 }
 
-impl Data {
-    fn new(tree: Tree) -> Arc<Self> {
-        let (totals, index) = (tree.totals(), tree.child_index());
-        Arc::new(Self {
-            tree,
-            totals,
-            index,
-        })
+fn options(threads: Option<usize>) -> ScanOptions {
+    ScanOptions {
+        threads: threads.and_then(NonZeroUsize::new),
+        ..ScanOptions::default()
     }
 }
 
-/// A scan of a folder: every folder's total, and the largest files.
-#[pyclass(frozen, name = "Tree", module = "diskuse")]
-struct PyTree(Arc<Data>);
-
-/// One folder of a [`PyTree`].
-#[pyclass(frozen, name = "Dir", module = "diskuse")]
-struct PyDir {
-    data: Arc<Data>,
-    id: u32,
+fn os_error(e: ScanError) -> PyErr {
+    PyOSError::new_err(e.to_string())
 }
 
 /// Scans `path` with `threads` threads, or as many as help, with the GIL
@@ -50,264 +46,322 @@ struct PyDir {
 #[pyfunction]
 #[pyo3(signature = (path, threads = None))]
 fn scan(py: Python<'_>, path: PathBuf, threads: Option<usize>) -> PyResult<PyTree> {
-    let opts = ScanOptions {
-        threads: threads.and_then(NonZeroUsize::new),
-        ..ScanOptions::default()
-    };
-    let tree = py
-        .detach(|| diskuse::scan(&path, &opts))
-        .map_err(|e| PyOSError::new_err(format!("{}: {e}", path.display())))?;
-    Ok(PyTree(Data::new(tree)))
+    let path = expand(py, path)?;
+    let tree = py.detach(|| diskuse::scan(&path, &options(threads)));
+    let tree = tree.map_err(|e| PyOSError::new_err(format!("{}: {e}", path.display())))?;
+    Ok(PyTree::new(tree))
 }
 
-/// Runs the `diskuse` command line with `args`, the program name first,
-/// for the console script. Returns its exit code.
+/// The `diskuse` console script: the command line, from `sys.argv`.
 #[pyfunction]
-fn main(py: Python<'_>, args: Vec<OsString>) -> u8 {
-    py.detach(|| diskuse::cli(args))
+fn _cli(py: Python<'_>) -> PyResult<u8> {
+    let args: Vec<OsString> = py.import("sys")?.getattr("argv")?.extract()?;
+    Ok(py.detach(|| diskuse::cli(args)))
+}
+
+/// A scanned tree. Every method takes a folder id.
+#[pyclass(frozen, from_py_object, name = "Tree", module = "diskuse")]
+#[derive(Clone)]
+struct PyTree(Arc<Tree>);
+
+impl PyTree {
+    fn new(tree: Tree) -> Self {
+        // derived here, not on the first call, which holds the GIL
+        tree.size(0);
+        Self(Arc::new(tree))
+    }
+
+    fn id(&self, id: u32) -> PyResult<u32> {
+        match (id as usize) < self.0.len() {
+            true => Ok(id),
+            false => Err(PyIndexError::new_err(format!("no folder {id}"))),
+        }
+    }
 }
 
 #[pymethods]
 impl PyTree {
-    /// The scanned folder.
-    #[getter]
-    fn root(&self) -> PyDir {
-        PyDir {
-            data: Arc::clone(&self.0),
-            id: 0,
-        }
+    fn name(&self, id: u32) -> PyResult<OsString> {
+        Ok(OsString::from_vec(self.0.name(self.id(id)?).to_vec()))
     }
 
-    /// The folder at `path`, relative to the root or below it, or `None`.
-    fn find(&self, path: PathBuf) -> Option<PyDir> {
-        let tree = &self.0.tree;
-        let root = Path::new(std::ffi::OsStr::from_bytes(tree.name(0)));
-        let below = path.strip_prefix(root).unwrap_or(&path);
-        let mut id = 0;
-        for name in below.components() {
-            let name = name.as_os_str().as_encoded_bytes();
-            if name == b"." {
-                continue;
-            }
-            let mut kids = self.0.index.children(id).iter();
-            id = *kids.find(|&&k| tree.name(tree.record(k).name) == name)?;
-        }
-        Some(PyDir {
-            data: Arc::clone(&self.0),
-            id,
-        })
+    fn path(&self, id: u32) -> PyResult<PathBuf> {
+        Ok(self.0.path(self.id(id)?))
     }
 
-    /// The `n` largest files as `(path, bytes)`, largest first. Only the
-    /// largest 1000 are kept.
+    fn size(&self, id: u32) -> PyResult<u64> {
+        Ok(self.0.size(self.id(id)?))
+    }
+
+    fn own(&self, id: u32) -> PyResult<u64> {
+        Ok(self.0.own(self.id(id)?))
+    }
+
+    fn error(&self, id: u32) -> PyResult<Option<String>> {
+        Ok(self.0.error(self.id(id)?))
+    }
+
+    fn partial(&self, id: u32) -> PyResult<bool> {
+        Ok(self.0.partial(self.id(id)?))
+    }
+
+    fn other_device(&self, id: u32) -> PyResult<bool> {
+        Ok(self.0.other_device(self.id(id)?))
+    }
+
+    fn children(&self, id: u32) -> PyResult<Vec<u32>> {
+        Ok(self.0.children(self.id(id)?).to_vec())
+    }
+
+    fn find(&self, path: PathBuf) -> Option<u32> {
+        self.0.find(&path)
+    }
+
     #[pyo3(signature = (n = 100))]
     fn largest_files(&self, n: usize) -> Vec<(PathBuf, u64)> {
-        let files = diskuse::largest_files(&self.0.tree, n).into_iter();
-        files
-            .map(|(bytes, path)| (OsString::from_vec(path).into(), bytes))
-            .collect()
+        self.0.largest_files(n)
     }
 
-    /// Every folder as a row of a `pyarrow.Table`; row `i` is folder id `i`.
-    /// Needs `pyarrow`. The columns cross as raw buffers, so no Python object
-    /// is made per folder: see `python/diskuse/_arrow.py`.
-    fn to_arrow<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let columns = columns(py, &self.0);
-        py.import("diskuse._arrow")?
-            .call_method1("table", (columns,))
+    fn stopped(&self) -> bool {
+        self.0.stopped()
+    }
+
+    /// Every folder as a row, for `pyarrow.table(tree)`, polars, duckdb.
+    #[pyo3(signature = (requested_schema = None))]
+    fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        // the one schema there is
+        let _ = requested_schema;
+        let batch = batch(&self.0);
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let stream = FFI_ArrowArrayStream::new(Box::new(reader));
+        PyCapsule::new_with_value(py, stream, c"arrow_array_stream")
     }
 
     fn __repr__(&self) -> String {
-        let root = self.root();
-        format!("<Tree {} {} bytes>", root.path().display(), root.size())
+        format!(
+            "<Tree {} {} bytes>",
+            self.0.path(0).display(),
+            self.0.size(0)
+        )
     }
 }
 
-/// The records of `data` as raw little-endian columns: `id` and `parent`
-/// (u32, with `valid`, a validity bitmap that leaves the root's parent
-/// null), `name` (u32 name id), `size` and `own` (u64), `flags` (u16), and
-/// the names as UTF-8, lossy like the JSON output, with their `offsets`
-/// (i64).
-fn columns<'py>(py: Python<'py>, data: &Data) -> Vec<(&'static str, Bound<'py, PyAny>)> {
-    let Data { tree, totals, .. } = data;
-    let n = tree.len() as u32;
-    let column = |f: &dyn Fn(u32, &mut Vec<u8>)| {
-        let mut out = Vec::new();
-        (0..n).for_each(|i| f(i, &mut out));
-        PyBytes::new(py, &out).into_any()
+/// Every folder not removed, with its id, its parent's (none for the
+/// root), its name as a dictionary of every name, lossy UTF-8, and sizes
+/// and flags.
+fn batch(tree: &Tree) -> RecordBatch {
+    let ids: Vec<u32> = (0..tree.len() as u32)
+        .filter(|&i| tree.record(i).flags & Record::REMOVED == 0)
+        .collect();
+    let names: LargeStringArray = (0..tree.name_count())
+        .map(|n| Some(String::from_utf8_lossy(tree.raw_name(n)).into_owned()))
+        .collect();
+    let keys: UInt32Array = ids.iter().map(|&i| tree.record(i).name).collect();
+    let name = DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(names)).unwrap();
+    let parent: UInt32Array = (ids.iter())
+        .map(|&i| (i != 0).then(|| tree.record(i).parent))
+        .collect();
+    let u64s = |f: &dyn Fn(u32) -> u64| -> ArrayRef {
+        Arc::new(ids.iter().map(|&i| f(i)).collect::<UInt64Array>())
     };
-    let mut names = Vec::new();
-    let mut offsets: Vec<u8> = 0i64.to_le_bytes().to_vec();
-    for id in 0..tree.name_count() {
-        names.extend_from_slice(String::from_utf8_lossy(tree.name(id)).as_bytes());
-        offsets.extend((names.len() as i64).to_le_bytes());
-    }
-    // every bit set but the root's
-    let mut valid = vec![0xffu8; (n as usize).div_ceil(8)];
-    valid[0] &= !1;
-    vec![
-        ("n", n.into_pyobject(py).unwrap().into_any()),
-        ("id", column(&|i, o| o.extend(i.to_le_bytes()))),
-        (
-            "parent",
-            column(&|i, o| o.extend(tree.record(i).parent.to_le_bytes())),
-        ),
-        ("valid", PyBytes::new(py, &valid).into_any()),
-        (
-            "name",
-            column(&|i, o| o.extend(tree.record(i).name.to_le_bytes())),
-        ),
-        (
-            "size",
-            column(&|i, o| o.extend(totals.size[i as usize].to_le_bytes())),
-        ),
-        (
-            "own",
-            column(&|i, o| o.extend(tree.record(i).own.to_le_bytes())),
-        ),
-        (
-            "flags",
-            column(&|i, o| o.extend(totals.flags[i as usize].to_le_bytes())),
-        ),
-        ("names", PyBytes::new(py, &names).into_any()),
-        ("offsets", PyBytes::new(py, &offsets).into_any()),
-    ]
+    let bools = |f: &dyn Fn(u32) -> bool| -> ArrayRef {
+        Arc::new(ids.iter().map(|&i| Some(f(i))).collect::<BooleanArray>())
+    };
+    RecordBatch::try_from_iter([
+        ("id", Arc::new(UInt32Array::from(ids.clone())) as ArrayRef),
+        ("parent", Arc::new(parent)),
+        ("name", Arc::new(name)),
+        ("size", u64s(&|i| tree.size(i))),
+        ("own", u64s(&|i| tree.own(i))),
+        ("denied", bools(&|i| tree.error(i).is_some())),
+        ("partial", bools(&|i| tree.partial(i))),
+        ("other_device", bools(&|i| tree.other_device(i))),
+    ])
+    .unwrap()
 }
 
-#[pymethods]
-impl PyDir {
-    /// Its name; for the root, the path as scanned.
-    #[getter]
-    fn name(&self) -> OsString {
-        let tree = &self.data.tree;
-        OsString::from_vec(tree.name(tree.record(self.id).name).to_vec())
-    }
+/// What a live scan reports, as in Rust.
+#[pyclass(frozen, name = "Event", module = "diskuse")]
+enum PyEvent {
+    Scanning {
+        tree: PyTree,
+    },
+    Ready {
+        tree: PyTree,
+    },
+    Changed {
+        tree: PyTree,
+        changes: Vec<(PathBuf, i64)>,
+    },
+    Rescanning {
+        reason: String,
+    },
+}
 
-    #[getter]
-    fn path(&self) -> PathBuf {
-        PathBuf::from(OsString::from_vec(self.data.tree.dir_path(self.id)))
-    }
-
-    /// Allocated bytes of it and everything below it.
-    #[getter]
-    fn size(&self) -> u64 {
-        self.data.totals.size[self.id as usize]
-    }
-
-    /// Allocated bytes of the folder itself and its files.
-    #[getter]
-    fn own(&self) -> u64 {
-        self.data.tree.record(self.id).own
-    }
-
-    /// Why it could not be read (`EACCES`, `EPERM`, `errno N`), or `None`.
-    #[getter]
-    fn error(&self) -> Option<String> {
-        let r = self.data.tree.record(self.id);
-        (r.flags & Record::DENIED != 0).then(|| diskuse::denied(&r))
-    }
-
-    /// Something below it could not be read, so `size` is a lower bound.
-    #[getter]
-    fn partial(&self) -> bool {
-        self.data.totals.flags[self.id as usize] & Record::PARTIAL != 0
-    }
-
-    /// A mount point, not scanned into.
-    #[getter]
-    fn other_device(&self) -> bool {
-        self.data.tree.record(self.id).flags & Record::OTHER_DEVICE != 0
-    }
-
-    /// Its subfolders, largest first, ties by name.
-    fn children(&self) -> Vec<PyDir> {
-        let Data {
-            tree,
-            totals,
-            index,
-        } = &*self.data;
-        let mut kids = index.children(self.id).to_vec();
-        let key = |&k: &u32| {
-            let size = totals.size[k as usize];
-            (std::cmp::Reverse(size), tree.name(tree.record(k).name))
-        };
-        kids.sort_by(|a, b| key(a).cmp(&key(b)));
-        kids.into_iter()
-            .map(|id| PyDir {
-                data: Arc::clone(&self.data),
-                id,
-            })
-            .collect()
-    }
-
-    fn __repr__(&self) -> String {
-        format!("<Dir {} {} bytes>", self.path().display(), self.size())
+impl From<Event> for PyEvent {
+    fn from(event: Event) -> Self {
+        match event {
+            Event::Scanning(tree) => Self::Scanning {
+                tree: PyTree::new(tree),
+            },
+            Event::Ready(tree) => Self::Ready {
+                tree: PyTree::new(tree),
+            },
+            Event::Changed(tree, changes) => Self::Changed {
+                tree: PyTree::new(tree),
+                changes,
+            },
+            Event::Rescanning(reason) => Self::Rescanning {
+                reason: reason.into(),
+            },
+        }
     }
 }
 
-/// A live scan, wrapped by `diskuse.Live`: `next` returns one event as a
-/// tuple, `("closed",)` once closed, or `None` if nothing happened within
-/// `interval` seconds, waiting with the GIL released. `close` stops it.
-#[pyclass(name = "_Live", module = "diskuse")]
-struct PyLive {
-    live: std::sync::Mutex<Option<diskuse::Live>>,
-    /// Set by `close`, which may come while `next` has the scan out.
-    closed: std::sync::atomic::AtomicBool,
+/// A live scan: iterate it, sync or async. Leaving the loop stops it.
+#[pyclass(frozen, name = "Live", module = "diskuse")]
+struct PyLive(Mutex<diskuse::Live>);
+
+impl PyLive {
+    /// The next event, waiting at most [`SLICE`] without the GIL. `Err(None)`
+    /// once the scan failed and nothing comes again.
+    fn wait(&self, py: Python<'_>) -> Result<Option<PyEvent>, Option<PyErr>> {
+        let (event, done) = py.detach(|| {
+            let mut live = self.0.lock().unwrap();
+            (live.wait(SLICE), live.is_done())
+        });
+        match event {
+            Some(Ok(event)) => Ok(Some(event.into())),
+            Some(Err(e)) => Err(Some(os_error(e))),
+            None if done => Err(None),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Scans `path` and keeps following it: see `Event`. `interval` is how
+/// often, in seconds, a snapshot comes while scanning, and changes after.
+#[pyfunction]
+#[pyo3(signature = (path, interval = 0.5, threads = None))]
+fn live(py: Python<'_>, path: PathBuf, interval: f64, threads: Option<usize>) -> PyResult<PyLive> {
+    let path = expand(py, path)?;
+    let opts = LiveOptions {
+        scan: options(threads),
+        interval: Duration::try_from_secs_f64(interval)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+        ..LiveOptions::default()
+    };
+    Ok(PyLive(Mutex::new(py.detach(|| diskuse::live(&path, opts)))))
 }
 
 #[pymethods]
 impl PyLive {
-    #[new]
-    #[pyo3(signature = (path, threads = None))]
-    fn new(path: PathBuf, threads: Option<usize>) -> Self {
-        let live = diskuse::Live::start(&path, threads.and_then(NonZeroUsize::new));
-        Self {
-            live: std::sync::Mutex::new(Some(live)),
-            closed: Default::default(),
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyEvent>> {
+        loop {
+            match self.wait(py) {
+                Ok(Some(event)) => return Ok(Some(event)),
+                Ok(None) => py.check_signals()?,
+                Err(None) => return Ok(None),
+                Err(Some(e)) => return Err(e),
+            }
         }
     }
 
-    fn next<'py>(&self, py: Python<'py>, interval: f64) -> PyResult<Option<Bound<'py, PyAny>>> {
-        // taken out while it waits, so the lock is not held without the GIL
-        let closed = || ("closed",).into_pyobject(py).map(|t| Some(t.into_any()));
-        let Some(mut live) = self.live.lock().unwrap().take() else {
-            return closed();
-        };
-        let interval = std::time::Duration::from_secs_f64(interval);
-        let event = py.detach(|| live.next(interval));
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-            py.detach(|| drop(live));
-            return closed();
-        }
-        *self.live.lock().unwrap() = Some(live);
-        let event = event.map_err(|e| PyOSError::new_err(e.to_string()))?;
-        let tree = |t: Tree| PyTree(Data::new(t));
-        let event = match event {
-            None => return Ok(None),
-            Some(diskuse::Event::Scanning(t)) => ("scanning", tree(t)).into_pyobject(py)?,
-            Some(diskuse::Event::Ready(t)) => ("ready", tree(t)).into_pyobject(py)?,
-            Some(diskuse::Event::Changed(t, c)) => ("changed", tree(t), c).into_pyobject(py)?,
-            Some(diskuse::Event::Rescanning(why)) => ("rescanning", why).into_pyobject(py)?,
-        };
-        Ok(Some(event.into_any()))
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
     }
 
-    /// Stops the scan and the watch.
-    fn close(&self, py: Python<'_>) {
-        self.closed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(live) = self.live.lock().unwrap().take() {
-            py.detach(|| drop(live));
+    fn __anext__(slf: Py<Self>) -> Next {
+        Next {
+            live: slf,
+            step: None,
+        }
+    }
+
+    /// Where the OS keeps no record of a whole tree (Linux), follows only
+    /// the folders `ids` of the latest tree. Ignored elsewhere.
+    fn follow(&self, py: Python<'_>, ids: Vec<u32>) {
+        py.detach(|| self.0.lock().unwrap().follow(&ids));
+    }
+
+    /// Scans folder `id` of the latest tree again, then reports `Changed`;
+    /// 0 scans it all again.
+    fn rescan(&self, py: Python<'_>, id: u32) {
+        py.detach(|| self.0.lock().unwrap().rescan(id));
+    }
+}
+
+/// The awaitable `__anext__` returns: waits of [`SLICE`] each on a worker
+/// thread (`asyncio.to_thread`), until one brings an event. A cancelled
+/// `async for` so leaves no thread waiting longer than one slice.
+#[pyclass(module = "diskuse")]
+struct Next {
+    live: Py<PyLive>,
+    /// The `__await__` iterator of the running wait.
+    step: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl Next {
+    fn __await__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        loop {
+            let step = match &self.step {
+                Some(step) => step.bind(py).clone(),
+                None => {
+                    let live = self.live.clone_ref(py);
+                    let wait = PyCFunction::new_closure(
+                        py,
+                        None,
+                        None,
+                        move |args: &Bound<'_, PyTuple>, _| match live.get().wait(args.py()) {
+                            Ok(event) => Ok(event),
+                            Err(None) => Err(PyStopAsyncIteration::new_err(())),
+                            Err(Some(e)) => Err(e),
+                        },
+                    )?;
+                    let coro = py.import("asyncio")?.call_method1("to_thread", (wait,))?;
+                    let step = coro.call_method0("__await__")?;
+                    self.step = Some(step.clone().unbind());
+                    step
+                }
+            };
+            match step.call_method0("__next__") {
+                // a future to wait on, for the event loop
+                Ok(future) => return Ok(future.unbind()),
+                Err(e) if e.is_instance_of::<PyStopIteration>(py) => {
+                    self.step = None;
+                    let event = e.value(py).getattr("value")?;
+                    if !event.is_none() {
+                        return Err(PyStopIteration::new_err((event.unbind(),)));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 }
 
 #[pymodule]
-fn _diskuse(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyLive>()?;
+#[pyo3(name = "diskuse")]
+fn diskuse_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan, m)?)?;
-    m.add_function(wrap_pyfunction!(main, m)?)?;
+    m.add_function(wrap_pyfunction!(live, m)?)?;
+    m.add_function(wrap_pyfunction!(_cli, m)?)?;
     m.add_class::<PyTree>()?;
-    m.add_class::<PyDir>()?;
+    m.add_class::<PyEvent>()?;
+    m.add_class::<PyLive>()?;
     Ok(())
 }

@@ -36,3 +36,10 @@ repos:
       - id: ruff-check
         args: ["--fix"]
       - id: ruff-format
+
+  - repo: https://github.com/astral-sh/ty-pre-commit
+    rev: v0.0.79
+    hooks:
+      # `ty` needs the package importable. it auto-detects `.venv`, so build
+      # it there first: `uv sync --extra test`
+      - id: ty

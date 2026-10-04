@@ -7,7 +7,8 @@
 //! tree.
 
 use crate::sys::{self, DirStat, Kind};
-use crate::tree::{Builder, ChildIndex, LargeFile, Links, Progress, ReadTree, Record, Tree};
+use crate::tree::cache::Derived;
+use crate::tree::{Builder, LargeFile, Links, Progress, ReadTree, Record, Tree, derive};
 use crate::watch::Changes;
 use rayon::ThreadPool;
 use rustix::fd::{AsFd, OwnedFd};
@@ -563,7 +564,12 @@ impl Tree {
         if changes.is_empty() {
             return Some(());
         }
-        let index = self.child_index();
+        // taken, as the records change: what reads the tree next derives
+        // it again
+        let index = match std::mem::take(&mut self.cache).into_inner() {
+            Some(index) => index,
+            None => derive(self),
+        };
         let (dirty, fresh) = self.touched(&index, changes)?;
         let root = sys::open_root(Path::new(OsStr::from_bytes(self.name(0)))).ok()?;
         let dev = sys::dir_stat(root.as_fd()).ok()?.dev;
@@ -621,7 +627,7 @@ impl Tree {
     /// The dirs `changes` touched or named, and those of them to list
     /// afresh, with everything below them. `None` if that is the root: a
     /// full scan.
-    fn touched(&self, index: &ChildIndex, changes: &Changes) -> Option<(BTreeSet<u32>, Vec<u32>)> {
+    fn touched(&self, index: &Derived, changes: &Changes) -> Option<(BTreeSet<u32>, Vec<u32>)> {
         // a lookup by name of the children of each dir walked through
         let mut lookups: HashMap<u32, HashMap<&[u8], u32>> = HashMap::new();
         // the deepest dir of `path` in the tree, and whether that is all of
@@ -634,7 +640,7 @@ impl Tree {
             for name in path.split(|&b| b == b'/') {
                 let kids = lookups.entry(d).or_insert_with(|| {
                     let kids = index.children(d).iter();
-                    kids.map(|&k| (self.name(self.record(k).name), k)).collect()
+                    kids.map(|&k| (self.name(k), k)).collect()
                 });
                 match kids.get(name) {
                     Some(&k) => d = k,
@@ -776,7 +782,7 @@ impl Tree {
     /// opened either.
     fn own_blocks(&self, root: &OwnedFd, d: u32, reclaimable: bool) -> Own {
         let r = self.record(d);
-        let name = CString::new(self.name(r.name)).expect("names hold no NUL");
+        let name = CString::new(self.raw_name(r.name)).expect("names hold no NUL");
         let st = (d != 0)
             .then(|| self.open(root, r.parent).ok())
             .flatten()
@@ -801,7 +807,7 @@ impl Tree {
         let mut i = d;
         while i != 0 {
             let r = self.record(i);
-            names.push(CString::new(self.name(r.name)).expect("names hold no NUL"));
+            names.push(CString::new(self.raw_name(r.name)).expect("names hold no NUL"));
             i = r.parent;
         }
         names.reverse();

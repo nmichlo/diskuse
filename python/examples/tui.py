@@ -1,129 +1,134 @@
-"""A tiny disk usage browser in pure Python, on diskuse's public API only.
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["diskuse", "textual>=6"]
+#
+# [tool.uv.sources]
+# diskuse = { path = "../.." }
+# ///
+"""A small disk usage browser on diskuse's public API, as an example.
 
-    uv run python python/examples/tui.py ~/src
+    uv run python/examples/tui.py ~/src
 
-Up/Down move, Right/Enter go in, Left/Backspace go back, q quits. Sizes fill
-in while it scans, then follow changes on disk (macOS). The change column is
-the change since the scan finished. Files come from `os.scandir`, which is
-fast enough for one folder; diskuse only keeps folder totals.
-
-An example, not part of the package: curses only, no dependencies.
+Enter goes into a folder, Backspace goes back, s scans the folder at the
+cursor again, q quits. Sizes fill in while it scans, then follow changes on
+disk. The change column is the change since the scan finished. Files come
+from `os.scandir`: diskuse only keeps folder totals.
 """
 
-import curses
 import os
 import sys
-import threading
+from pathlib import Path
+
+from textual import work
+from textual.app import App
+from textual.app import ComposeResult
+from textual.widgets import DataTable
+from textual.widgets import Footer
+from textual.widgets import Header
 
 import diskuse
 
 
-def human(n):
-    sign, n = ("-" if n < 0 else ""), abs(n)
-    if n < 1024:
-        return f"{sign}{n} B"
-    for unit in ["KiB", "MiB", "GiB", "TiB"]:
-        n /= 1024
-        if n < 1024 or unit == "TiB":
-            return f"{sign}{n:.1f} {unit}"
+def human(n: int) -> str:
+    sign, size = ("-" if n < 0 else ""), float(abs(n))
+    for unit in ["B", "KiB", "MiB", "GiB"]:
+        if size < 1024:
+            return f"{sign}{size:.0f} {unit}" if unit == "B" else f"{sign}{size:.1f} {unit}"
+        size /= 1024
+    return f"{sign}{size:.1f} TiB"
 
 
-class State:
-    """The latest tree, from the live scan's thread."""
+class Browse(App[None]):
+    BINDINGS = [("q", "quit", "quit"), ("backspace", "back", "back"), ("s", "rescan", "rescan")]
 
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.tree = None
-        self.ready = None  # the tree when the scan finished
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self.live = diskuse.live(path, interval=0.25)
+        self.latest: diskuse.Tree | None = None
+        # the tree when the scan finished, for the change column
+        self.ready: diskuse.Tree | None = None
+        self.trail: list[str] = []
         self.status = "scanning..."
 
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(cursor_type="row")
+        yield Footer()
 
-def follow(path, state, stop):
-    with diskuse.live(path, interval=0.25) as live:
-        for e in live:
-            if stop.is_set():
-                return
-            with state.lock:
-                if isinstance(e, diskuse.Rescanning):
-                    state.status = f"rescanning ({e.reason})"
-                    continue
-                state.tree = e.tree
-                if isinstance(e, diskuse.Ready):
-                    state.ready, state.status = e.tree, ""
-                elif isinstance(e, diskuse.Scanning):
-                    state.status = "scanning..."
+    def on_mount(self) -> None:
+        self.query_one(DataTable).add_columns("size", "change", "name")
+        self.follow()
 
+    @work()
+    async def follow(self) -> None:
+        async for event in self.live:
+            match event:
+                case diskuse.Event.Scanning(tree):
+                    self.latest, self.status = tree, "scanning..."
+                case diskuse.Event.Ready(tree):
+                    self.latest = self.ready = tree
+                    self.status = ""
+                case diskuse.Event.Changed(tree, _):
+                    self.latest = tree
+                case diskuse.Event.Rescanning(reason):
+                    self.status = f"rescanning ({reason})"
+            self.show()
 
-def rows(state, below):
-    """(size, change, name, is_dir) of the folder `below`, largest first."""
-    d = state.tree.find(below) if state.tree else None
-    if d is None:
-        return []
-    out = []
-    for k in d.children():
-        was = state.ready.find(os.path.join(below, k.name)) if state.ready else None
-        out.append((k.size, k.size - was.size if was else 0, k.name, True))
-    try:
-        with os.scandir(d.path) as it:
-            for f in it:
-                if not f.is_dir(follow_symlinks=False):
-                    size = f.stat(follow_symlinks=False).st_blocks * 512
-                    out.append((size, 0, f.name, False))
-    except OSError:
-        pass
-    return sorted(out, key=lambda r: (-r[0], r[2]))
+    def here(self) -> int | None:
+        return self.latest.find(Path(*self.trail)) if self.latest else None
 
-
-def main(screen, path):
-    curses.curs_set(0)
-    screen.timeout(250)
-    state, stop = State(), threading.Event()
-    threading.Thread(target=follow, args=(path, state, stop), daemon=True).start()
-    trail, cursor = [], 0
-    while True:
-        below = os.path.join(*trail) if trail else "."
-        with state.lock:
-            items = rows(state, below)
-            total = (
-                state.tree.find(below).size
-                if state.tree and state.tree.find(below)
-                else 0
-            )
-            status = state.status
-        height, width = screen.getmaxyx()
-        cursor = max(0, min(cursor, len(items) - 1))
-        screen.erase()
-        title = f"{os.path.join(path, *trail)}  {human(total)}  {status}"
-        screen.addnstr(0, 0, title, width - 1, curses.A_BOLD)
-        top = max(0, cursor - (height - 3))
-        for y, (size, change, name, is_dir) in enumerate(
-            items[top : top + height - 2], 1
-        ):
-            delta = f"{'+' if change > 0 else ''}{human(change)}" if change else ""
-            line = f"{human(size):>11} {delta:>11}  {name}{'/' if is_dir else ''}"
-            attr = curses.A_REVERSE if top + y - 1 == cursor else 0
-            screen.addnstr(
-                y, 0, line, width - 1, attr | (curses.A_BOLD if is_dir else 0)
-            )
-        screen.addnstr(
-            height - 1, 0, "arrows move  enter in  backspace out  q quit", width - 1
-        )
-        key = screen.getch()
-        if key in (ord("q"), 27):
-            stop.set()
+    def show(self) -> None:
+        tree, d = self.latest, self.here()
+        if tree is None or d is None:
             return
-        if key in (curses.KEY_UP, ord("k")):
-            cursor -= 1
-        elif key in (curses.KEY_DOWN, ord("j")):
-            cursor += 1
-        elif key in (curses.KEY_RIGHT, curses.KEY_ENTER, 10, ord("l")) and items:
-            if items[cursor][3]:
-                trail.append(items[cursor][2])
-                cursor = 0
-        elif key in (curses.KEY_LEFT, curses.KEY_BACKSPACE, 127, ord("h")) and trail:
-            trail.pop()
-            cursor = 0
+        rows = []
+        for k in tree.children(d):
+            was = self.ready.find(Path(*self.trail, tree.name(k))) if self.ready else None
+            change = tree.size(k) - self.ready.size(was) if self.ready and was is not None else 0
+            rows.append((tree.size(k), change, tree.name(k) + "/"))
+        try:
+            with os.scandir(tree.path(d)) as entries:
+                for f in entries:
+                    if not f.is_dir(follow_symlinks=False):
+                        rows.append((f.stat(follow_symlinks=False).st_blocks * 512, 0, f.name))
+        except OSError:
+            pass
+        table = self.query_one(DataTable)
+        at = table.cursor_row
+        table.clear()
+        for size, change, name in sorted(rows, key=lambda r: (-r[0], r[2])):
+            table.add_row(human(size), f"{'+' if change > 0 else ''}{human(change)}" if change else "", name, key=name)
+        table.move_cursor(row=at)
+        self.title = f"{tree.path(d)}  {human(tree.size(d))}  {self.status}"
+        # on Linux, only the folders followed report changes
+        self.live.follow([d])
+
+    def selected(self) -> str | None:
+        table = self.query_one(DataTable)
+        if table.row_count == 0:
+            return None
+        return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+
+    def on_data_table_row_selected(self) -> None:
+        name = self.selected()
+        if name and name.endswith("/"):
+            self.trail.append(name[:-1])
+            self.query_one(DataTable).move_cursor(row=0)
+            self.show()
+
+    def action_back(self) -> None:
+        if self.trail:
+            self.trail.pop()
+            self.query_one(DataTable).move_cursor(row=0)
+            self.show()
+
+    def action_rescan(self) -> None:
+        name, tree = self.selected(), self.latest
+        if name and name.endswith("/") and tree:
+            k = tree.find(Path(*self.trail, name[:-1]))
+            if k is not None:
+                self.live.rescan(k)
 
 
 if __name__ == "__main__":
-    curses.wrapper(main, os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "."))
+    Browse(os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else ".")).run()

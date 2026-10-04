@@ -25,6 +25,7 @@
 //! [rkyv]: https://rkyv.org
 
 use crate::sys;
+use crate::tree::cache::{Cached, Derived};
 use crate::tree::{LargeFile, Links, ReadTree, Record, Tree};
 use rkyv::rancor::Failure;
 use rkyv::util::AlignedVec;
@@ -34,7 +35,7 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"DUSE";
@@ -215,6 +216,7 @@ impl SavedFile {
                 body,
                 root: self.root.as_os_str().as_bytes(),
                 stopped: header[5] & STOPPED != 0,
+                cache: OnceLock::new(),
             },
             reclaimable: header[5] & RECLAIMABLE != 0,
             modified: self.modified,
@@ -227,6 +229,7 @@ pub struct SavedTree<'a> {
     body: &'a ArchivedBody<'a>,
     root: &'a [u8],
     stopped: bool,
+    cache: OnceLock<Derived>,
 }
 
 impl SavedTree<'_> {
@@ -235,7 +238,7 @@ impl SavedTree<'_> {
         let body = self.body;
         let names = boxcar::Vec::with_capacity(body.ends.len());
         for id in 0..body.ends.len() {
-            names.push(self.name(id as u32).into());
+            names.push(self.raw_name(id as u32).into());
         }
         let n = body.records.len();
         Tree {
@@ -252,7 +255,14 @@ impl SavedTree<'_> {
             private: (body.private.iter()).map(|p| p.to_native()).collect(),
             since: 0,
             stopped: self.stopped,
+            cache: OnceLock::new(),
         }
+    }
+}
+
+impl Cached for SavedTree<'_> {
+    fn cache(&self) -> &OnceLock<Derived> {
+        &self.cache
     }
 }
 
@@ -276,7 +286,7 @@ impl ReadTree for SavedTree<'_> {
         (self.body.private.get(id as usize)).map_or(0, |p| p.to_native())
     }
 
-    fn name(&self, name: u32) -> &[u8] {
+    fn raw_name(&self, name: u32) -> &[u8] {
         let ends = &self.body.ends;
         match name as usize {
             0 => self.root,

@@ -37,7 +37,9 @@ def run(binary: str, path: str, args: list[str]) -> tuple[dict, str]:
     p = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
     wall = time.perf_counter() - start
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    stats = {k: float(re.search(v, p.stderr).group(1)) for k, v in FIELDS.items()}
+    found = {k: re.search(v, p.stderr) for k, v in FIELDS.items()}
+    stats = {k: float(m.group(1)) for k, m in found.items() if m}
+    assert len(stats) == len(FIELDS), p.stderr
     cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
     stats |= {"wall": wall, "cpu": cpu}
     return stats, hashlib.sha256(p.stdout.encode()).hexdigest()
@@ -67,17 +69,13 @@ def main() -> int:
     ok = True
     for d in a.dirs:
         print(f"\n{d}")
-        print(
-            f"  {'build':<10}{'wall ms':>18}{'cpu ms':>18}{'instr G':>9}{'mem MiB':>9}"
-        )
+        print(f"  {'build':<10}{'wall ms':>18}{'cpu ms':>18}{'instr G':>9}{'mem MiB':>9}")
         base = None
         for name, _ in bins:
             rs = runs[d, name]
 
             def q(k: str, rs: list[dict] = rs) -> tuple[float, float, float]:
-                return tuple(
-                    statistics.quantiles([r[k] for r in rs], n=4, method="inclusive")
-                )
+                return tuple(statistics.quantiles([r[k] for r in rs], n=4, method="inclusive"))
 
             w, c = q("wall"), q("cpu")
             instr = statistics.median(r["instr"] for r in rs) / 1e9
@@ -91,9 +89,7 @@ def main() -> int:
             if base is None:
                 base = row
             else:
-                line += "  " + " ".join(
-                    f"{(v / max(b, 1e-9) - 1) * 100:+.1f}%" for v, b in zip(row, base)
-                )
+                line += "  " + " ".join(f"{(v / max(b, 1e-9) - 1) * 100:+.1f}%" for v, b in zip(row, base))
             print(line)
         if len(set(outs[d].values())) > 1:
             print("  OUTPUT DIFFERS")
