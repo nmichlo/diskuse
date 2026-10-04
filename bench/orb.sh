@@ -38,7 +38,7 @@ command -v cargo >/dev/null || [ -x ~/.cargo/bin/cargo ] ||
 export PATH=\$HOME/.local/bin:\$PATH
 command -v pdu >/dev/null || $SRC/bench/install.sh
 cd $SRC
-cargo build --release --bin diskuse --example bench-gen
+cargo build --release -p diskuse -p diskuse-core --bin diskuse --example bench-gen
 for id in $DATASETS; do
     [ -d $DATA/\$id ] || target/release/examples/bench-gen \$id $DATA/\$id
     python3 bench/run.py --machine $LABEL warm \$id $DATA/\$id $RUNS

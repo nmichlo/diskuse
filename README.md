@@ -74,12 +74,12 @@ Sizes are allocated bytes like `du -x`. Scans stay on one disk, never follow sym
 
 ## 🦀 &nbsp;Rust
 
-The scanner is a library too (`cargo add diskuse --no-default-features`, without the command's dependencies). Folders are ids of one tree, and the root is 0:
+The scanner is a library too (`cargo add diskuse-core`). Folders are ids of one tree, and the root is 0:
 
 ```rust
-use diskuse::{Event, LiveOptions, ReadTree, ScanOptions};
+use diskuse_core::{Event, LiveOptions, ReadTree, ScanOptions};
 
-let tree = diskuse::scan(path, &ScanOptions::default())?;
+let tree = diskuse_core::scan(path, &ScanOptions::default())?;
 for &k in tree.children(0) {
     println!("{} {}", tree.size(k), tree.path(k).display()); // allocated bytes, like du
 }
@@ -87,7 +87,7 @@ tree.find(Path::new("a/b")); // Some(id)
 tree.largest_files(10); // [(path, bytes), ...]
 tree.files(0, false)?; // the root's files, listed from disk now
 
-for event in diskuse::live(path, LiveOptions::default()) {
+for event in diskuse_core::live(path, LiveOptions::default()) {
     match event? {
         Event::Ready(tree) => {} // the scan finished
         Event::Changed(tree, changes) => {} // [(path, delta_bytes), ...]
@@ -121,7 +121,7 @@ for event in diskuse.live("~/src"):  # or: async for
             ...  # [(path, delta_bytes), ...]
 ```
 
-See [python/examples/tui.py](python/examples/tui.py) for a small browser written in Python with this API.
+See [crates/diskuse-python/examples/tui.py](crates/diskuse-python/examples/tui.py) for a small browser written in Python with this API.
 
 <br/>
 

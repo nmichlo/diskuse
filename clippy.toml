@@ -1,8 +1,8 @@
 # diskuse is read-only by construction: product code never changes the
 # filesystem and never runs other programs. The exceptions opt out per call:
-# `src/store.rs` saves scans in the cache dir, and `src/reveal.rs` runs
-# `open` or `xdg-open` to show an item. Tests that build fixtures opt out per
-# file.
+# `diskuse-core/src/store.rs` saves scans in the cache dir, and
+# `diskuse/src/reveal.rs` runs `open` or `xdg-open` to show an item. Tests
+# that build fixtures opt out per file.
 disallowed-methods = [
     { path = "std::fs::remove_file", reason = "diskuse never deletes" },
     { path = "std::fs::remove_dir", reason = "diskuse never deletes" },
@@ -18,12 +18,12 @@ disallowed-methods = [
     { path = "std::fs::set_permissions", reason = "diskuse never changes permissions" },
     { path = "std::fs::File::create", reason = "diskuse never writes files" },
     { path = "std::fs::File::create_new", reason = "diskuse never writes files" },
-    { path = "std::fs::File::options", reason = "can open for writing; use the read-only opens in src/sys" },
-    { path = "std::fs::OpenOptions::new", reason = "can open for writing; use the read-only opens in src/sys" },
+    { path = "std::fs::File::options", reason = "can open for writing; use the read-only opens in diskuse-core/src/sys" },
+    { path = "std::fs::OpenOptions::new", reason = "can open for writing; use the read-only opens in diskuse-core/src/sys" },
     { path = "std::fs::DirBuilder::new", reason = "diskuse never creates directories" },
-    { path = "std::process::Command::new", reason = "only src/reveal.rs runs programs" },
+    { path = "std::process::Command::new", reason = "only diskuse/src/reveal.rs runs programs" },
     { path = "rustix::fs::unlinkat", reason = "diskuse never deletes" },
     { path = "rustix::fs::renameat", reason = "diskuse never renames" },
     { path = "rustix::fs::mkdirat", reason = "diskuse never creates directories" },
-    { path = "rustix::fs::openat", reason = "flags can write; only src/sys may call it, with fixed read-only flags" },
+    { path = "rustix::fs::openat", reason = "flags can write; only diskuse-core/src/sys may call it, with fixed read-only flags" },
 ]

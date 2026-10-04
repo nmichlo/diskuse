@@ -2,7 +2,7 @@
 check:
     uvx --from pre-commit pre-commit run --all-files
     cargo test
-    uv run --quiet --extra test pytest python/tests -q
+    uv run --quiet --extra test pytest crates/diskuse-python/tests -q
     cargo deny check
     cargo about generate --locked --workspace about.hbs | diff -u THIRD_PARTY_LICENSES.txt -
 
@@ -15,7 +15,7 @@ licenses:
 
 # make dataset ID (S1 to S6) in DIR
 bench-gen ID DIR:
-    cargo run --release --example bench-gen -- {{ID}} {{DIR}}
+    cargo run --release -p diskuse-core --example bench-gen -- {{ID}} {{DIR}}
 
 # warm runs, e.g. `just bench S1 /tmp/diskuse-bench/S1 --runs 2`
 bench DATASET PATH *ARGS:
@@ -40,7 +40,7 @@ bench-orb *ARGS:
     bench/orb.sh {{ARGS}}
 
 # store the screens the browser draws now as the expected ones, for this
-# platform (tests/snapshots); review the diff before committing
+# platform (crates/diskuse/tests/snapshots); review the diff before committing
 snapshots:
     INSTA_UPDATE=always cargo test --test browse
 
