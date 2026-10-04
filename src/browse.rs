@@ -23,8 +23,8 @@ use crate::reveal::Desktop;
 use crate::scan::ScanOptions;
 use crate::store::{CacheDir, Saved};
 use crate::style::Styles;
-use crate::sys::{self, Kind};
-use crate::tree::{LARGEST, ReadTree, Record, Tree, below, dir_path, join};
+use crate::sys;
+use crate::tree::{File, LARGEST, ReadTree, Record, Tree, below, dir_path, join};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
@@ -34,7 +34,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::collections::HashMap;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -110,7 +110,7 @@ pub struct Browser {
     /// The scan, then the changes on disk, from [`Browser::scan`] on.
     live: Option<Live>,
     /// Why a scan started by itself, until it is done.
-    why: Option<&'static str>,
+    why: Option<crate::live::Reason>,
     /// The dir scanned again, by its path below the root, while the tree
     /// shown stays.
     rescanning: Option<Vec<u8>>,
@@ -194,11 +194,12 @@ impl Baseline {
     }
 
     /// Gives each record of `new` from id `from` on the start size of the
-    /// dir at the same path in `old`, an earlier tree of the same root. A
-    /// dir listed afresh comes back as a
-    /// new record, and a full scan numbers every dir anew (`from` 0).
+    /// dir at the same path in `old`, an earlier tree of the same root, or
+    /// 0 if there is none: from `from` on, the ids of `new` are new or
+    /// numbered again ([`Tree::moved_from`]).
     fn carry(&mut self, old: &Tree, new: &Tree, from: usize) {
         let mut sizes = self.sizes.clone();
+        sizes.truncate(from);
         sizes.resize(new.len(), 0);
         // the dir of `old` each record of `new` from `from` is at
         let mut was: HashMap<u32, u32> = HashMap::new();
@@ -279,7 +280,7 @@ impl View {
 /// The files of a dir, `(name, allocated bytes, reclaimable bytes)`:
 /// every entry but subdirectories. Reclaimable bytes are 0 unless asked
 /// for.
-type Files = Vec<(Box<[u8]>, u64, u64)>;
+type Files = Vec<File>;
 
 /// One row of a column.
 #[derive(Clone, Copy, PartialEq)]
@@ -493,7 +494,7 @@ impl Browser {
                 match &mut self.baseline {
                     Some(base) => {
                         if let Some(old) = base.of.take() {
-                            base.carry(&old, &tree, 0);
+                            base.carry(&old, &tree, tree.moved_from(&old) as usize);
                         }
                     }
                     None => {
@@ -507,11 +508,9 @@ impl Browser {
                 self.show(tree, Status::Done);
             }
             Some(Ok(Event::Changed(tree, _))) => {
-                // dirs listed afresh come back as new records
-                if let (Some(base), Some(old)) = (&mut self.baseline, &self.view)
-                    && tree.len() > old.tree.len()
-                {
-                    base.carry(&old.tree, &tree, old.tree.len());
+                // new records, or all of them numbered again
+                if let (Some(base), Some(old)) = (&mut self.baseline, &self.view) {
+                    base.carry(&old.tree, &tree, tree.moved_from(&old.tree) as usize);
                 }
                 if self.rescanning.take().is_some() {
                     self.save(&tree);
@@ -965,12 +964,17 @@ impl Browser {
             return;
         }
         let private = self.reclaimable;
-        let files = (self.files.entry(d)).or_insert_with(|| list(&view.tree, d, private));
+        // the scan did not go into a denied dir, so neither does the browser
+        let list = || match view.tree.error(d) {
+            Some(_) => Vec::new(),
+            None => view.tree.files(d, private).unwrap_or_default(),
+        };
+        let files = self.files.entry(d).or_insert_with(list);
         let path = dir_path(&view.tree, d);
         // the root's name is the whole path
         let parent = Path::new(OsStr::from_bytes(view.tree.name(d)));
         let parent = parent.file_name().unwrap_or_default().as_bytes();
-        let sibling = |file: &str| files.iter().any(|f| *f.0 == *file.as_bytes());
+        let sibling = |file: &str| files.iter().any(|f| *f.name == *file.as_bytes());
         let real = self.real.as_ref().map(|real| {
             let mut real = real.as_os_str().as_bytes().to_vec();
             join(&mut real, &below(&view.tree, d));
@@ -1020,12 +1024,12 @@ impl Browser {
             _ => 0,
         };
         let mut rows: Vec<Row> = (files.iter().enumerate())
-            .map(|(i, (name, size, private))| Row {
-                size: *size,
-                private: *private,
+            .map(|(i, f)| Row {
+                size: f.bytes,
+                private: f.private,
                 item: Item::File(i as u32),
                 label: None,
-                delta: file_delta(name, *size),
+                delta: file_delta(&f.name, f.bytes),
             })
             .chain(dirs)
             .collect();
@@ -1041,10 +1045,7 @@ impl Browser {
             }),
         }
         if counting && known.is_none() {
-            let sizes = files
-                .iter()
-                .map(|(n, size, _)| (n.clone(), *size))
-                .collect();
+            let sizes = files.iter().map(|f| (f.name.clone(), f.bytes)).collect();
             self.seen.insert(dir, sizes);
         }
         self.rows.insert(d, rows);
@@ -1270,36 +1271,8 @@ impl Browser {
 fn name<'a>(view: &'a View, files: &'a Files, item: Item) -> &'a [u8] {
     match item {
         Item::Dir(k) => view.tree.name(k),
-        Item::File(i) => &files[i as usize].0,
+        Item::File(i) => &files[i as usize].name,
     }
-}
-
-/// Lists the files of dir `d` from disk, with reclaimable bytes if
-/// `private`. Empty if it cannot be read, or the scan did not go into it,
-/// so neither does the browser.
-fn list(tree: &Tree, d: u32, private: bool) -> Files {
-    let mut files = Vec::new();
-    if tree.record(d).flags & (Record::DENIED | Record::OTHER_DEVICE) != 0 {
-        return files;
-    }
-    let path = dir_path(tree, d);
-    let fd = match d {
-        // a symlinked root is followed, as the scan does
-        0 => sys::open_root(Path::new(OsStr::from_bytes(&path))),
-        _ => sys::open_child(
-            rustix::fs::CWD,
-            &CString::new(path).expect("names hold no NUL"),
-        ),
-    };
-    if let Ok(fd) = fd {
-        // a listing cut short keeps what it got
-        let _ = sys::read_dir(&fd, private, |e| {
-            if e.kind != Kind::Dir {
-                files.push((e.name.to_bytes().into(), e.bytes, e.private));
-            }
-        });
-    }
-    files
 }
 
 /// Row `row` of a dir of `total` bytes listed as `files`: its sizes, a bar

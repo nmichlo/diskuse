@@ -12,6 +12,7 @@
 //! Elsewhere [`Watch::start`] is always `None`, and an open browser follows
 //! only the dirs it shows ([`DirWatch`]).
 
+use crate::live::Reason;
 use crate::sys::{self, Event};
 use crate::tree::{ReadTree, Record, Tree, dir_path};
 use rustix::fd::AsFd;
@@ -62,7 +63,7 @@ pub(crate) enum Poll {
     /// Or no dir shown is due to be listed again.
     Wait,
     /// Changes were lost: only a full scan is right. Why, for the user.
-    Lost(&'static str),
+    Lost(Reason),
     Changes(Changes),
 }
 
@@ -77,7 +78,7 @@ pub(crate) struct Watch {
     firmlinks: Firmlinks,
     pending: Changes,
     /// Why changes were lost, if they were.
-    lost: Option<&'static str>,
+    lost: Option<Reason>,
     started: Instant,
     /// When the replay ended, if it has.
     replayed: Option<Instant>,
@@ -151,9 +152,7 @@ impl Watch {
         if !self.settled {
             let Some(replayed) = self.replayed else {
                 return match now - self.started > REPLAY_MAX {
-                    true => Poll::Lost(
-                        "macOS did not replay the changes made while scanning within 30 s",
-                    ),
+                    true => Poll::Lost(Reason::NoReplay),
                     false => Poll::Wait,
                 };
             };

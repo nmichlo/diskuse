@@ -83,12 +83,20 @@ def test_a_folder_id_out_of_range_is_an_index_error(root: Path) -> None:
         t.size(99)
 
 
-def test_largest_files(root: Path) -> None:
+def test_files_and_largest_files(root: Path) -> None:
     t = diskuse.scan(root)
     files = [root / "a/b/g", root / "a/f", root / "top"]
     expected = sorted(((f, blocks(f)) for f in files), key=lambda x: (-x[1], str(x[0])))
     assert t.largest_files() == expected
     assert t.largest_files(1) == expected[:1]
+    a = t.find("a")
+    assert a is not None
+    assert (t.files(0), t.files(a)) == ([("top", blocks(root / "top"))], [("f", blocks(root / "a/f"))])
+
+
+def test_a_missing_root_is_file_not_found(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        diskuse.scan(tmp_path / "nope")
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every folder")

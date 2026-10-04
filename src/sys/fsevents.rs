@@ -7,6 +7,7 @@
 #![allow(unsafe_code)]
 
 use super::Event;
+use crate::live::Reason;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 use std::sync::mpsc::Sender;
@@ -274,11 +275,11 @@ extern "C" fn callback(
 
 fn event(flags: u32, path: &[u8]) -> Event {
     if flags & (USER_DROPPED | KERNEL_DROPPED) != 0 {
-        Event::Lost("macOS dropped change events")
+        Event::Lost(Reason::Dropped)
     } else if flags & EVENT_IDS_WRAPPED != 0 {
-        Event::Lost("macOS event ids wrapped")
+        Event::Lost(Reason::IdsWrapped)
     } else if flags & ROOT_CHANGED != 0 {
-        Event::Lost("the scanned dir moved")
+        Event::Lost(Reason::RootMoved)
     } else if flags & HISTORY_DONE != 0 {
         Event::HistoryDone
     } else if flags & MUST_SCAN_SUB_DIRS != 0 {

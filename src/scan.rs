@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::{CString, OsStr};
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -87,6 +87,19 @@ impl fmt::Display for ScanError {
 }
 
 impl std::error::Error for ScanError {}
+
+/// Why [`Tree::apply`] could not bring a tree up to date.
+#[derive(Debug)]
+pub(crate) enum ApplyError {
+    /// The changes reach the root: only a full scan can.
+    FullScan,
+    Scan(ScanError),
+}
+
+/// What changed on disk: each folder whose own bytes changed, and each
+/// folder that appeared or went, with its whole size, by path, summed per
+/// path. `None` if nothing did, not even a folder of 0 bytes.
+pub(crate) type Deltas = Option<Vec<(PathBuf, i64)>>;
 
 /// Scans `root` without crossing devices or mount points, or following
 /// symlinks.
@@ -558,11 +571,15 @@ impl Walk {
 impl Tree {
     /// Brings the tree up to date with `changes`: lists each dir the
     /// changes touched again, one bulk read each, then scans the
-    /// subdirectories new in them in one walk. `None`, with the tree left
-    /// as it was, if only a full scan can bring it up to date.
-    pub(crate) fn apply(&mut self, changes: &Changes, opts: &ScanOptions) -> Option<()> {
+    /// subdirectories new in them in one walk. Returns what changed. On an
+    /// error the tree is left as it was.
+    pub(crate) fn apply(
+        &mut self,
+        changes: &Changes,
+        opts: &ScanOptions,
+    ) -> Result<Deltas, ApplyError> {
         if changes.is_empty() {
-            return Some(());
+            return Ok(None);
         }
         // taken, as the records change: what reads the tree next derives
         // it again
@@ -570,11 +587,12 @@ impl Tree {
             Some(index) => index,
             None => derive(self),
         };
-        let (dirty, fresh) = self.touched(&index, changes)?;
-        let root = sys::open_root(Path::new(OsStr::from_bytes(self.name(0)))).ok()?;
-        let dev = sys::dir_stat(root.as_fd()).ok()?.dev;
-        let lister = lister(&root, opts).ok()?;
-        let (pool, gate) = pool(opts).ok()?;
+        let (dirty, fresh) = self.touched(&index, changes).ok_or(ApplyError::FullScan)?;
+        let root_err = |e: Errno| ApplyError::Scan(ScanError::Root(e.into()));
+        let root = sys::open_root(Path::new(OsStr::from_bytes(self.name(0)))).map_err(root_err)?;
+        let dev = sys::dir_stat(root.as_fd()).map_err(root_err)?.dev;
+        let lister = lister(&root, opts).map_err(root_err)?;
+        let (pool, gate) = pool(opts).map_err(|e| ApplyError::Scan(ScanError::ThreadPool(e)))?;
         sys::raise_fd_limit();
         sys::keep_placeholders_remote();
         // listed afresh: everything below them goes, and comes back as new
@@ -600,9 +618,27 @@ impl Tree {
             }
         }
         self.prune();
-        if new.is_empty() {
-            return Some(());
+        if !new.is_empty() {
+            self.scan_new(&root, new, dev, lister, &pool, gate, opts);
         }
+        let deltas = self.deltas(&index);
+        self.compact();
+        Ok(deltas)
+    }
+
+    /// Scans `new`, the subdirectories new in dirs listed again, in one
+    /// walk appending to the tree.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_new(
+        &mut self,
+        root: &OwnedFd,
+        new: Vec<(Vec<CString>, u32, Vec<Child>)>,
+        dev: u64,
+        lister: sys::Lister,
+        pool: &ThreadPool,
+        gate: Gate,
+        opts: &ScanOptions,
+    ) {
         let links = std::mem::take(&mut self.links);
         let walk = Walk::new(
             Builder::append(self),
@@ -614,14 +650,67 @@ impl Tree {
         );
         // each parent is opened again from the root, rather than kept open
         // since its listing, so no more dirs are open at once than in a scan
-        walk.run(&pool, |s| {
+        walk.run(pool, |s| {
             for (names, d, kids) in new {
-                let (walk, root) = (&walk, &root);
+                let walk = &walk;
                 s.spawn(move |s| walk.adopt(s, root, &names, d, kids));
             }
         });
         *self = walk.finish(self.since, self.stopped);
-        Some(())
+    }
+
+    /// What [`Tree::apply`] changed, from `index`, derived before it.
+    /// Records past its end are new; removed ones are still in place.
+    fn deltas(&self, index: &Derived) -> Deltas {
+        let n = index.size.len();
+        let gone = |id: u32| self.records[id as usize].flags & Record::REMOVED != 0;
+        let own_before = |id: u32| {
+            let kids = index.children(id).iter();
+            index.size[id as usize] - kids.map(|&k| index.size[k as usize]).sum::<u64>()
+        };
+        // the sizes of the new records, children first
+        let mut size = vec![0u64; self.records.len() - n];
+        for i in (n..self.records.len()).rev() {
+            let r = self.records[i];
+            size[i - n] += r.own;
+            if r.parent as usize >= n {
+                size[r.parent as usize - n] += size[i - n];
+            }
+        }
+        let mut out = Vec::new();
+        for id in 0..n as u32 {
+            let r = self.records[id as usize];
+            if index.flags[id as usize] & Record::REMOVED != 0 {
+                continue;
+            }
+            if gone(id) {
+                if id == 0 || !gone(r.parent) {
+                    out.push((self.path(id), -(index.size[id as usize] as i64)));
+                }
+            } else if r.own != own_before(id) {
+                out.push((self.path(id), r.own as i64 - own_before(id) as i64));
+            }
+        }
+        for i in n..self.records.len() {
+            let r = self.records[i];
+            if (r.parent as usize) < n {
+                out.push((self.path(i as u32), size[i - n] as i64));
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        // a dir listed afresh goes and comes back, at one path
+        out.sort();
+        out.dedup_by(|b, a| {
+            let same = a.0 == b.0;
+            if same {
+                a.1 += b.1;
+            }
+            same
+        });
+        out.retain(|&(_, d)| d != 0);
+        Some(out)
     }
 
     /// The dirs `changes` touched or named, and those of them to list

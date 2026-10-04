@@ -4,7 +4,10 @@
 //! [`LARGEST`] largest files are kept, by name.
 //!
 //! A live update appends the dirs new since, so the order holds, and flags
-//! the ones gone [`Record::REMOVED`] rather than moving any record.
+//! the ones gone [`Record::REMOVED`] rather than moving any record. Once
+//! those are half the records, it drops them and numbers the rest again,
+//! in order. So an id is a folder of the tree it came from: a later tree
+//! may number it differently, and [`ReadTree::find`] finds it by path.
 
 use crate::sys;
 use hashbrown::HashTable;
@@ -82,6 +85,16 @@ pub(crate) mod cache {
 }
 
 use cache::{Cached, Derived};
+
+/// A file of a folder, from [`ReadTree::files`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct File {
+    pub name: Box<[u8]>,
+    /// Allocated bytes, not the apparent length.
+    pub bytes: u64,
+    /// Of `bytes`, those not shared with a clone, if asked for, else 0.
+    pub private: u64,
+}
 
 /// One of the [`LARGEST`] largest files. Ordered by `bytes` first.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize)]
@@ -224,6 +237,37 @@ pub trait ReadTree: Cached {
             id = *self.children(id).iter().find(|&&k| self.name(k) == name)?;
         }
         Some(id)
+    }
+
+    /// The files of folder `id`, listed from disk now, as the tree keeps
+    /// only folder totals: each one's allocated bytes, and with
+    /// `reclaimable` of those the ones not shared with a clone (macOS),
+    /// else 0. None for a folder on another device, which the scan did not
+    /// go into.
+    fn files(&self, id: u32, reclaimable: bool) -> std::io::Result<Vec<File>> {
+        let mut files = Vec::new();
+        if self.other_device(id) {
+            return Ok(files);
+        }
+        let path = dir_path(self, id);
+        let fd = match id {
+            // a symlinked root is followed, as the scan does
+            0 => sys::open_root(Path::new(OsStr::from_bytes(&path))),
+            _ => sys::open_child(
+                rustix::fs::CWD,
+                &std::ffi::CString::new(path).expect("names hold no NUL"),
+            ),
+        }?;
+        sys::read_dir(&fd, reclaimable, |e| {
+            if e.kind != sys::Kind::Dir {
+                files.push(File {
+                    name: e.name.to_bytes().into(),
+                    bytes: e.bytes,
+                    private: e.private,
+                });
+            }
+        })?;
+        Ok(files)
     }
 
     /// The `n` largest files, of the [`LARGEST`] kept, as `(path, bytes)`,
@@ -409,6 +453,64 @@ impl Tree {
         let removed = |id: u32| self.records[id as usize].flags & Record::REMOVED != 0;
         self.links.retain(|_, &mut dir| !removed(dir));
         self.largest.retain(|f| !removed(f.dir));
+    }
+
+    /// Once removed records are half the tree, drops them and the names
+    /// only they used, and numbers the rest again, in order, so a tree
+    /// followed for long stays the size of what is on disk.
+    pub(crate) fn compact(&mut self) {
+        let removed = |r: &Record| r.flags & Record::REMOVED != 0;
+        if self.records.iter().filter(|r| removed(r)).count() * 2 <= self.records.len() {
+            return;
+        }
+        let mut id = vec![u32::MAX; self.records.len()];
+        let mut name = vec![u32::MAX; self.names.count()];
+        let names = boxcar::Vec::new();
+        names.push(self.names[0].clone());
+        name[0] = 0;
+        let mut records = Vec::new();
+        let mut private = Vec::new();
+        for (i, r) in self.records.iter().enumerate() {
+            if removed(r) {
+                continue;
+            }
+            id[i] = records.len() as u32;
+            let n = &mut name[r.name as usize];
+            if *n == u32::MAX {
+                *n = names.push(self.names[r.name as usize].clone()) as u32;
+            }
+            records.push(Record {
+                parent: match i {
+                    0 => Record::NO_PARENT,
+                    _ => id[r.parent as usize],
+                },
+                name: *n,
+                ..*r
+            });
+            if let Some(&p) = self.private.get(i) {
+                private.push(p);
+            }
+        }
+        for f in &mut self.largest {
+            f.dir = id[f.dir as usize];
+        }
+        for d in self.links.values_mut() {
+            *d = id[*d as usize];
+        }
+        (self.records, self.private, self.names) = (records, private, Arc::new(names));
+        self.cache = OnceLock::new();
+    }
+
+    /// The first id of `self` that no longer names the folder it named in
+    /// `old`, an earlier tree of the same root: where new records start,
+    /// or where [`Tree::compact`] or a full scan numbered them again.
+    pub(crate) fn moved_from(&self, old: &Tree) -> u32 {
+        let same = |k: usize| {
+            let (a, b) = (old.records[k], self.records[k]);
+            a.parent == b.parent && old.names[a.name as usize] == self.names[b.name as usize]
+        };
+        let n = old.records.len().min(self.records.len());
+        (0..n).find(|&k| !same(k)).unwrap_or(n) as u32
     }
 
     /// Appends a name, without looking for an equal one, which would need
