@@ -1,78 +1,27 @@
-[package]
-name = "diskuse"
+# The workspace: three crates, released together under one version.
+#
+#   crates/diskuse-core    the library: scanner, tree, live scans, saved scans
+#   crates/diskuse         the `diskuse` command and its browser
+#   crates/diskuse-python  the Python bindings (PyPI, not crates.io)
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# what plain `cargo build` and `cargo test` cover: the bindings need Python
+# and are built by maturin (pyproject.toml)
+default-members = ["crates/diskuse-core", "crates/diskuse"]
+
+# the tag is the only version: the release writes it here and into the
+# internal pins below (nmichlo/.github actions/stamp-cargo-version)
+[workspace.package]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nmichlo/diskuse"
-description = "Read-only disk usage browser for macOS and Linux, built for speed"
-readme = "README.md"
-keywords = ["disk", "du", "disk-usage", "cli", "tui"]
-categories = ["command-line-utilities", "filesystem"]
-# what crates.io gets: the sources of every target, so it builds and tests.
-# bench/ and the repo tooling stay in git. the bench-gen example is kept, or
-# cargo warns that its target is missing.
-include = [
-    "/src",
-    "/tests",
-    "/examples",
-    "/README.md",
-    "/LICENSE-*",
-    "/THIRD_PARTY_LICENSES.txt",
-]
 
-
-[workspace]
-# the Python bindings: their own crate, so `cargo install diskuse` never
-# builds Python code
-members = ["python"]
-
-# inherited by python/Cargo.toml, so the release stamps the wheel's version
-# with the crate's (nmichlo/.github actions/stamp-cargo-version)
-[workspace.package]
-version = "0.0.0"
-
-[features]
-default = ["cli"]
-# the `diskuse` command: the browser, text and JSON output, saved scans.
-# Off, the library is the scanner, the tree and live scans only:
-# `diskuse = { version = "...", default-features = false }`
-cli = ["dep:clap", "dep:crc32fast", "dep:memmap2", "dep:ratatui", "dep:rkyv", "dep:signal-hook", "dep:unicode-width"]
-
-[[bin]]
-name = "diskuse"
-path = "src/main.rs"
-required-features = ["cli"]
-
-[[test]]
-name = "browse"
-required-features = ["cli"]
-
-[[test]]
-name = "scan"
-required-features = ["cli"]
-
-[dependencies]
-boxcar = "0.2.14"
-clap = { version = "4.6.7", features = ["derive"], optional = true }
-crc32fast = { version = "1.5.2", optional = true }
-hashbrown = { version = "0.16.1", default-features = false }
-memmap2 = { version = "0.9.11", optional = true }
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"], optional = true }
-rayon = "1.12.0"
-rkyv = { version = "0.8.18", optional = true }
-rustix = { version = "1.1.5", features = ["fs", "process", "time"] }
-signal-hook = { version = "0.3.18", optional = true }
-# the columns a name takes on screen, to cut it to fit (ratatui uses it too)
-unicode-width = { version = "0.2.2", optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2.189"
-
-[dev-dependencies]
-insta = { version = "1.49.0", features = ["filters"] }
-proptest = "1.11.0"
-tempfile = "3.27.0"
+[workspace.dependencies]
+diskuse-core = { path = "crates/diskuse-core", version = "0.0.0" }
+diskuse = { path = "crates/diskuse", version = "0.0.0" }
 
 [profile.release]
 lto = "thin"

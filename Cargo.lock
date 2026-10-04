@@ -501,21 +501,30 @@ dependencies = [
 name = "diskuse"
 version = "0.0.0"
 dependencies = [
- "boxcar",
  "clap",
- "crc32fast",
- "hashbrown 0.16.1",
+ "diskuse-core",
  "insta",
- "libc",
- "memmap2",
- "proptest",
  "ratatui",
- "rayon",
- "rkyv",
  "rustix",
  "signal-hook",
  "tempfile",
  "unicode-width",
+]
+
+[[package]]
+name = "diskuse-core"
+version = "0.0.0"
+dependencies = [
+ "boxcar",
+ "crc32fast",
+ "hashbrown 0.16.1",
+ "libc",
+ "memmap2",
+ "proptest",
+ "rayon",
+ "rkyv",
+ "rustix",
+ "tempfile",
 ]
 
 [[package]]
@@ -524,6 +533,7 @@ version = "0.0.0"
 dependencies = [
  "arrow-array",
  "diskuse",
+ "diskuse-core",
  "pyo3",
 ]
 

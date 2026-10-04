@@ -1,0 +1,29 @@
+[package]
+name = "diskuse-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read-only disk usage scanning for macOS and Linux: the library of diskuse"
+readme = "../../README.md"
+keywords = ["disk", "du", "disk-usage", "filesystem"]
+categories = ["filesystem"]
+# what crates.io gets: the sources of every target, so it builds and tests
+include = ["/src", "/tests", "/examples", "/LICENSE-*"]
+
+[dependencies]
+boxcar = "0.2.14"
+crc32fast = "1.5.2"
+hashbrown = { version = "0.16.1", default-features = false }
+memmap2 = "0.9.11"
+rayon = "1.12.0"
+rkyv = "0.8.18"
+rustix = { version = "1.1.5", features = ["fs", "process", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"

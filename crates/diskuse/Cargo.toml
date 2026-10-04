@@ -1,0 +1,27 @@
+[package]
+name = "diskuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read-only disk usage browser for macOS and Linux, built for speed"
+readme = "../../README.md"
+keywords = ["disk", "du", "disk-usage", "cli", "tui"]
+categories = ["command-line-utilities", "filesystem"]
+# what crates.io gets: the sources. The tests stay in git: they share
+# fixtures with diskuse-core and hold the stored screens
+include = ["/src", "/LICENSE-*", "/THIRD_PARTY_LICENSES.txt"]
+
+[dependencies]
+diskuse-core.workspace = true
+clap = { version = "4.6.7", features = ["derive"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+signal-hook = "0.3.18"
+# the columns a name takes on screen, to cut it to fit (ratatui uses it too)
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+insta = { version = "1.49.0", features = ["filters"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+tempfile = "3.27.0"
