@@ -404,7 +404,9 @@ def machine(args) -> str:
     else:
         chip = platform.machine()
         meminfo = Path("/proc/meminfo").read_text()
-        ram = round(int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) / (1 << 20))
+        total = re.search(r"MemTotal:\s+(\d+)", meminfo)
+        assert total, meminfo
+        ram = round(int(total.group(1)) / (1 << 20))
         rel = dict(re.findall(r'^(\w+)="?([^"\n]*)', Path("/etc/os-release").read_text(), re.MULTILINE))
         os_ = rel.get("ID", "linux") + rel.get("VERSION_ID", "")
     return f"{chip}-{CORES}c-{ram}g-{os_}"
