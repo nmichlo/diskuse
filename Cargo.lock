@@ -478,6 +478,7 @@ dependencies = [
  "rustix",
  "signal-hook",
  "tempfile",
+ "unicode-width",
 ]
 
 [[package]]

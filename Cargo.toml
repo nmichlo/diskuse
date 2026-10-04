@@ -37,7 +37,7 @@ default = ["cli"]
 # the `diskuse` command: the browser, text and JSON output, saved scans.
 # Off, the library is the scanner, the tree and live scans only:
 # `diskuse = { version = "...", default-features = false }`
-cli = ["dep:clap", "dep:crc32fast", "dep:memmap2", "dep:ratatui", "dep:rkyv", "dep:signal-hook"]
+cli = ["dep:clap", "dep:crc32fast", "dep:memmap2", "dep:ratatui", "dep:rkyv", "dep:signal-hook", "dep:unicode-width"]
 
 [[bin]]
 name = "diskuse"
@@ -63,6 +63,8 @@ rayon = "1.12.0"
 rkyv = { version = "0.8.18", optional = true }
 rustix = { version = "1.1.5", features = ["fs", "process", "time"] }
 signal-hook = { version = "0.3.18", optional = true }
+# the columns a name takes on screen, to cut it to fit (ratatui uses it too)
+unicode-width = { version = "0.2.2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2.189"

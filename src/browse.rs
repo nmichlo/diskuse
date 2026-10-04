@@ -18,7 +18,7 @@
 use crate::access::{reason, terminal_app};
 use crate::labels::{self, Label, Tier};
 use crate::live::{Event, Live, LiveOptions, Waker, live};
-use crate::report::{format_size, largest_first};
+use crate::report::{Units, largest_first};
 use crate::reveal::Desktop;
 use crate::scan::ScanOptions;
 use crate::store::{CacheDir, Saved};
@@ -41,20 +41,17 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const HELP: &str = "hjkl move  r reveal  o open  space pick  p picks  s/S rescan  / filter  t top  \
-                    ? help  q quit";
+/// The browser's keys, most useful first: on a narrow screen [`fit_keys`]
+/// leaves out those before `? help` until the line fits.
+const HELP: &str = "hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  \
+                    / filter  t top  o open  ? help  q quit";
 const PANEL_HELP: &str = "arrows/jk scroll  d close  ? help  q quit";
+const INFO_HELP: &str = "i close  ? help  q quit";
 const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
 const PICKS_HELP: &str = "arrows/jk move  r reveal  o open  space unpick  p close  ? help  q quit";
 
 /// How a valid `CACHEDIR.TAG` starts (<https://bford.info/cachedir/>).
 const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
-
-/// The width of the bar of a row's share of its dir.
-const BAR: u64 = 10;
-
-/// Columns narrower than this have no bars, so names keep the room.
-const BAR_COLUMN: u16 = 40;
 
 /// Two clicks on one row within this are a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -73,6 +70,8 @@ pub struct Env {
     /// How often a running scan is shown, and changes on disk are taken
     /// in: [`LiveOptions::interval`].
     pub interval: Duration,
+    /// How sizes print, switched with `u`.
+    pub units: Units,
     /// Draw in colour. Off when `NO_COLOR` is set and not empty.
     pub color: bool,
     /// The home dir, for the labels of known folders in it.
@@ -88,6 +87,7 @@ impl Env {
             cache: CacheDir::from_env().ok(),
             inotify: true,
             interval: Duration::from_secs(1),
+            units: Units::Binary,
             color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
             home: std::env::var_os("HOME").map(PathBuf::from),
         }
@@ -160,6 +160,12 @@ pub struct Browser {
     top: Option<Top>,
     /// Sizes when the first scan of the session was done.
     baseline: Option<Baseline>,
+    /// The `i` pop-up about the row at the cursor, while it is shown.
+    info: bool,
+    /// The running scan's latest snapshot, `(bytes, folders)`, also while
+    /// a saved scan is shown, and when it started, from the first poll.
+    progress: Option<(u64, usize)>,
+    started: Option<SystemTime>,
     /// Paths picked, below the root, in the order picked. Saved with the
     /// scan, so they outlive the session.
     picks: Vec<Vec<u8>>,
@@ -361,7 +367,8 @@ impl Browser {
             real_home: (env.home.as_ref()).and_then(|h| std::fs::canonicalize(h).ok()),
             display: display.into(),
             env,
-            used,
+            // a filesystem that reports none in use reports nothing useful
+            used: used.filter(|&u| u > 0),
             reclaimable,
             view: None,
             live: None,
@@ -386,6 +393,9 @@ impl Browser {
             panel: None,
             top: None,
             baseline: None,
+            info: false,
+            progress: None,
+            started: None,
             picks: Vec::new(),
             picking: None,
             seen: HashMap::new(),
@@ -408,6 +418,7 @@ impl Browser {
         self.keep_baseline();
         self.why = None;
         self.rescanning = None;
+        (self.progress, self.started) = (None, None);
         let opts = LiveOptions {
             scan: ScanOptions {
                 reclaimable: self.reclaimable,
@@ -437,6 +448,11 @@ impl Browser {
     /// A scan runs: the first, after lost changes, or of one dir.
     fn busy(&self) -> bool {
         self.live.as_ref().is_some_and(Live::busy)
+    }
+
+    /// Prints sizes in `units` from now on.
+    pub fn set_units(&mut self, units: Units) {
+        self.env.units = units;
     }
 
     /// Wakes a [`Browser::poll`] waiting on another thread. `None` if it
@@ -497,6 +513,9 @@ impl Browser {
         let Some(live) = &mut self.live else {
             return false;
         };
+        if live.busy() && self.started.is_none() {
+            self.started = Some(now);
+        }
         match live.wait(timeout) {
             None => {}
             Some(Err(e)) => {
@@ -505,6 +524,7 @@ impl Browser {
             }
             // a saved scan shows until the scan is done
             Some(Ok(Event::Scanning(tree))) => {
+                self.progress = Some((tree.size(0), tree.len()));
                 if !matches!(
                     self.view.as_ref().map(|v| v.status),
                     Some(Status::Saved { .. })
@@ -514,6 +534,7 @@ impl Browser {
             }
             Some(Ok(Event::Ready(tree))) => {
                 self.why = None;
+                (self.progress, self.started) = (None, None);
                 self.scanned = now;
                 self.save(&tree);
                 match &mut self.baseline {
@@ -602,6 +623,14 @@ impl Browser {
             }
             return ControlFlow::Continue(());
         }
+        if self.info {
+            match key.code {
+                KeyCode::Char('i') | KeyCode::Esc => self.info = false,
+                KeyCode::Char('q') => return ControlFlow::Break(()),
+                _ => {}
+            }
+            return ControlFlow::Continue(());
+        }
         if let Some(top) = &mut self.top {
             let n = (self.view.as_ref()).map_or(0, |v| top.paths(v).count());
             if let Some(at) = nav(key.code, top.cursor, n, page) {
@@ -641,6 +670,7 @@ impl Browser {
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Char('d') => self.panel = Some(0),
             KeyCode::Char('t') => self.top = Some(Top::default()),
+            KeyCode::Char('i') if !self.current.is_empty() => self.info = true,
             KeyCode::Char(' ') => {
                 if let Some(p) = self.cursor_below() {
                     self.pick(p);
@@ -761,9 +791,9 @@ impl Browser {
     /// files, and the footer. `now` dates a saved scan.
     pub fn draw(&mut self, frame: &mut Frame, now: SystemTime) {
         let styles = Styles::new(self.env.color);
-        let footer: Vec<Line> = (self.unaccounted().map(Line::raw).into_iter())
-            .chain(self.info(styles))
-            .chain([self.footer(styles)])
+        let width = frame.area().width.into();
+        let footer: Vec<Line> = (self.status(styles, width).into_iter())
+            .chain([self.footer(styles, width)])
             .collect();
         let [top, body, bottom] = Layout::vertical([
             Constraint::Length(1),
@@ -772,9 +802,9 @@ impl Browser {
         ])
         .areas(frame.area());
         self.body = body;
-        let title = self.title(now);
+        let title = self.title(now, styles);
         let buf = frame.buffer_mut();
-        buf.set_stringn(top.x, top.y, title, top.width.into(), Style::new());
+        buf.set_line(top.x, top.y, &title, top.width);
         for (y, line) in (bottom.y..).zip(footer) {
             buf.set_line(bottom.x, y, &line, bottom.width);
         }
@@ -787,12 +817,21 @@ impl Browser {
             return;
         }
         if let Some(top) = &mut self.top {
-            top_files(buf, body, view, top, styles);
+            top_files(buf, body, view, top, styles, self.env.units);
             return;
         }
         if let Some(list) = &mut self.picking {
             let root = self.root.as_os_str().as_bytes();
-            picks(buf, body, view, root, &self.picks, list, styles);
+            picks(
+                buf,
+                body,
+                view,
+                root,
+                &self.picks,
+                list,
+                styles,
+                self.env.units,
+            );
             return;
         }
         let height = body.height.into();
@@ -801,7 +840,7 @@ impl Browser {
         for (i, area) in self.columns().into_iter().enumerate() {
             let listing = self.listing(i, height);
             if let (Some(area), Some((d, rows, offset, mark))) = (area, listing) {
-                self.column(buf, area, d, rows, offset, mark.zip(marks[i]));
+                self.column(buf, area, d, rows, offset, mark.zip(marks[i]), i != 1);
             }
         }
         if self.current.is_empty() && !self.filter.is_empty() {
@@ -809,17 +848,35 @@ impl Browser {
             let text = format!("no matches for '{}'", self.filter);
             buf.set_stringn(area.x, area.y, text, area.width.into(), styles.dim);
         }
+        if self.info {
+            self.draw_info(buf, now, styles);
+        }
     }
 
-    /// Where the parent, current and preview columns are drawn. At the
-    /// root, there is no parent column, and the other two move left.
+    /// Where the parent, current and preview columns are drawn: 20 / 50 / 30
+    /// of the width. At the root or under 100 columns there is no parent
+    /// column, and the other two take 60 / 40; under 60 columns, only the
+    /// current one shows.
     fn columns(&self) -> [Option<Rect>; 3] {
-        let [left, mid, right] = Layout::horizontal([Constraint::Fill(1); 3])
-            .spacing(1)
-            .areas(self.body);
-        match self.dirs.len() {
-            1 => [None, Some(left), Some(mid)],
-            _ => [Some(left), Some(mid), Some(right)],
+        let split = |weights: &[u16]| {
+            Layout::horizontal(weights.iter().map(|&w| Constraint::Fill(w)))
+                .spacing(1)
+                .split(self.body)
+        };
+        match self.body.width {
+            ..60 => [None, Some(self.body), None],
+            60..100 => {
+                let a = split(&[60, 40]);
+                [None, Some(a[0]), Some(a[1])]
+            }
+            _ if self.dirs.len() == 1 => {
+                let a = split(&[60, 40]);
+                [None, Some(a[0]), Some(a[1])]
+            }
+            _ => {
+                let a = split(&[20, 50, 30]);
+                [Some(a[0]), Some(a[1]), Some(a[2])]
+            }
         }
     }
 
@@ -827,6 +884,9 @@ impl Browser {
     /// rows high: the dir, its rows, the first of them drawn, and the
     /// marked one, if any. Nothing for the parent column at the root, or
     /// the preview of a file.
+    ///
+    /// The parent and preview columns show sizes and names only; the
+    /// current one adds each row's share and change.
     fn listing(&self, i: usize, height: usize) -> Option<(u32, &[Row], usize, Option<usize>)> {
         let d = self.dir();
         match i {
@@ -858,7 +918,9 @@ impl Browser {
     }
 
     /// Draws `rows[offset..]` of dir `d` that fit in `area`, with `mark`, a
-    /// row index and its style, if given.
+    /// row index and its style, if given. A `side` column shows sizes and
+    /// names only.
+    #[allow(clippy::too_many_arguments)]
     fn column(
         &self,
         buf: &mut Buffer,
@@ -867,14 +929,16 @@ impl Browser {
         rows: &[Row],
         offset: usize,
         mark: Option<(usize, Style)>,
+        side: bool,
     ) {
         let view = self.view.as_ref().unwrap();
         let styles = Styles::new(self.env.color);
         let total = view.tree.size(d);
         let dir = below(&view.tree, d);
         let look = Look {
-            bar: area.width >= BAR_COLUMN,
-            changes: rows.iter().any(|r| r.delta != 0),
+            side,
+            changes: !side && rows.iter().any(|r| r.delta != 0),
+            units: self.env.units,
         };
         let lines = (area.y..area.bottom()).zip(rows.iter().enumerate().skip(offset));
         for (y, (i, row)) in lines {
@@ -884,7 +948,8 @@ impl Browser {
                 join_below(&mut path, name(view, files, row.item));
                 self.picks.contains(&path)
             };
-            let line = line(view, files, row, total, look, picked, styles);
+            let width = area.width.into();
+            let line = line(view, files, row, total, look, picked, width, styles);
             buf.set_line(area.x, y, &line, area.width);
             if let Some((_, style)) = mark.filter(|&(at, _)| at == i) {
                 buf.set_style(
@@ -1137,11 +1202,6 @@ impl Browser {
         }
     }
 
-    /// The label of the row at the cursor, if any.
-    fn label_at_cursor(&self) -> Option<Label> {
-        self.current.get(self.cursor)?.label
-    }
-
     /// The path of the row at the cursor, below the root.
     fn cursor_below(&self) -> Option<Vec<u8>> {
         let (view, (_, name)) = (self.view.as_ref()?, self.at_cursor()?);
@@ -1185,110 +1245,300 @@ impl Browser {
         };
     }
 
-    fn title(&self, now: SystemTime) -> String {
-        let root = &self.display;
-        // why a scan started by itself
-        let why = match self.why {
-            Some(why) => format!("  ({why})"),
-            None => String::new(),
-        };
-        let Some(view) = &self.view else {
-            return format!("{root}  scanning...{why}");
-        };
-        let total = format_size(view.tree.size(0));
-        let partial = match view.denied.len() {
-            0 => String::new(),
-            n => format!("  (partial: {n} denied)"),
-        };
-        // how much the root grew or shrank since the session started
-        let change = match &self.baseline {
-            Some(base) if view.status == Status::Done => {
-                match view.tree.size(0) as i64 - base.size(0) as i64 {
-                    0 => String::new(),
-                    d => {
-                        let age = age(now.duration_since(base.at).unwrap_or_default());
-                        format!("  ({} in {age})", signed(d))
-                    }
+    /// The top line: the root, its total, and what to know about it, each
+    /// part after a dim `|`, the parts with nothing to say left out.
+    fn title(&self, now: SystemTime, styles: &Styles) -> Line<'static> {
+        let units = self.env.units;
+        let fmt = |n| units.format(n);
+        let mut parts: Vec<Span> = Vec::new();
+        let status = self.view.as_ref().map(|v| v.status);
+        // a snapshot, or a full scan runs while no finished tree is shown
+        let scanning = self.busy() && status != Some(Status::Done);
+        if scanning || status == Some(Status::Scanning) {
+            let (bytes, folders) = match (&self.view, self.progress) {
+                (_, Some(progress)) => progress,
+                (Some(v), None) if v.status == Status::Scanning => (v.tree.size(0), v.tree.len()),
+                _ => (0, 0),
+            };
+            // a whole volume's used bytes, else the last scan's total
+            let saved = self.view.as_ref().filter(|v| v.status != Status::Scanning);
+            match self
+                .used
+                .or(saved.map(|v| v.tree.size(0)))
+                .filter(|&g| g > 0)
+            {
+                Some(goal) => {
+                    // the used bytes count more than a scan finds, so it
+                    // stops short of 100%
+                    let pct = (u128::from(bytes) * 100 / u128::from(goal.max(1))).min(99);
+                    parts.push(Span::raw(format!(
+                        "scanning {} of ~{} ({pct}%)",
+                        fmt(bytes),
+                        fmt(goal)
+                    )));
+                }
+                None => {
+                    let since = self.started.and_then(|t| now.duration_since(t).ok());
+                    parts.extend([
+                        Span::raw(format!("scanning {}", fmt(bytes))),
+                        Span::raw(format!("{} folders", thousands(folders as u64))),
+                        Span::raw(age(since.unwrap_or_default())),
+                    ]);
                 }
             }
-            _ => String::new(),
-        };
-        let sorted = match self.by_change {
-            true => "  [by change]",
-            false => "",
-        };
-        let rescanning = match &self.rescanning {
-            Some(dir) => format!("  rescanning {}/...", String::from_utf8_lossy(dir)),
-            None => String::new(),
-        };
-        match view.status {
-            Status::Scanning => format!("{root}  scanning... at least {total}{why}"),
-            // changes in the dirs not shown are not seen since
-            Status::Done if self.live.as_ref().is_some_and(|l| !l.follows_all()) => {
-                let age = age(now.duration_since(self.scanned).unwrap_or_default());
-                format!("{root}  {total}{change}{partial}  scanned {age} ago{sorted}{rescanning}")
+        } else if let Some(view) = &self.view {
+            let total = view.tree.size(0);
+            parts.push(match (view.status, self.used) {
+                (Status::Done, Some(used)) => {
+                    Span::styled(format!("{} of {}", fmt(total), fmt(used)), styles.dir)
+                }
+                _ => Span::styled(fmt(total), styles.dir),
+            });
+        }
+        if let Some(View {
+            status: Status::Saved { at },
+            tree,
+            ..
+        }) = &self.view
+        {
+            let age = age(now.duration_since(*at).unwrap_or_default());
+            let incomplete = if tree.stopped() { ", incomplete" } else { "" };
+            parts.push(Span::raw(format!(
+                "showing the scan saved {age} ago{incomplete}"
+            )));
+        }
+        if let Some(view) = &self.view {
+            // how much the root grew or shrank since the session started
+            if let Some(base) = self
+                .baseline
+                .as_ref()
+                .filter(|_| view.status == Status::Done)
+            {
+                let d = view.tree.size(0) as i64 - base.size(0) as i64;
+                if d != 0 {
+                    let age = age(now.duration_since(base.at).unwrap_or_default());
+                    parts.push(Span::raw(format!(
+                        "{} since opened {age} ago",
+                        signed(d, units)
+                    )));
+                }
             }
-            Status::Done => format!("{root}  {total}{change}{partial}{sorted}{rescanning}"),
-            Status::Saved { at } => {
-                let age = age(now.duration_since(at).unwrap_or_default());
-                let stopped = match view.tree.stopped() {
-                    true => " (incomplete)",
-                    false => "",
-                };
-                let scanning = match self.busy() {
-                    true => ", rescanning...",
-                    false => "",
-                };
-                format!("{root}  {total}{partial}  saved {age} ago{stopped}{scanning}")
+            if !view.denied.is_empty() {
+                let n = view.denied.len() as u64;
+                let folders = if n == 1 { "folder" } else { "folders" };
+                parts.push(Span::raw(format!(
+                    "{} {folders} unreadable (d)",
+                    thousands(n)
+                )));
+            }
+            // changes in the dirs not shown are not seen since
+            if view.status == Status::Done && self.live.as_ref().is_some_and(|l| !l.follows_all()) {
+                let age = age(now.duration_since(self.scanned).unwrap_or_default());
+                parts.push(Span::raw(format!("scanned {age} ago")));
             }
         }
+        if self.by_change {
+            parts.push(Span::raw("sorted by change"));
+        }
+        if let Some(dir) = &self.rescanning {
+            parts.push(Span::raw(format!(
+                "rescanning {}/...",
+                String::from_utf8_lossy(dir)
+            )));
+        }
+        // why a scan started by itself
+        if let Some(why) = self.why {
+            parts.push(Span::raw(format!("scanning again: {why}")));
+        }
+        let mut spans = vec![Span::raw(self.display.clone())];
+        if !parts.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        for (i, part) in parts.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" | ", styles.dim));
+            }
+            spans.push(part);
+        }
+        Line::from(spans)
     }
 
-    /// The bottom line: the message, else the keys of what is shown.
-    fn footer(&self, styles: &Styles) -> Line<'static> {
+    /// The bottom line: the message, else the keys of what is shown, as
+    /// many as fit in `width`.
+    fn footer(&self, styles: &Styles, width: usize) -> Line<'static> {
         let keys = match &self.message {
             Some(message) => return Line::raw(message.clone()),
+            None if self.info => INFO_HELP.into(),
             None if self.panel.is_some() => PANEL_HELP.into(),
             None if self.top.is_some() => TOP_HELP.into(),
             None if self.picking.is_some() => PICKS_HELP.into(),
             None if self.typing => format!("/{}  enter keep  esc clear", self.filter),
             None if !self.filter.is_empty() => format!("/{}  esc clear", self.filter),
-            None => HELP.into(),
+            None => fit_keys(HELP, width),
         };
         styles.keys(&keys)
     }
 
-    /// The line above the footer explaining the label of the row at the
-    /// cursor, and what to do about it, if it has one.
-    fn info(&self, styles: &Styles) -> Option<Line<'static>> {
+    /// The line above the footer: everything about the row at the cursor
+    /// in one line of `width`, the name first, then its sizes, then what
+    /// else there is to know, each cut in the middle to fit.
+    fn status(&self, styles: &Styles, width: usize) -> Option<Line<'static>> {
         let shown = self.panel.is_none() && self.top.is_none() && self.picking.is_none();
-        let label = self.label_at_cursor().filter(|_| shown)?;
-        let (style, keys) = match label.tier {
-            Tier::Cache => (styles.cache, "r reveal to delete  space pick"),
-            Tier::Known => (styles.known, "r reveal  space pick"),
-            Tier::System => (styles.system, ""),
-        };
-        let mut spans = vec![
-            Span::styled(format!("[{}]", label.text), style),
-            Span::raw(format!(" {}.", label.why)),
-        ];
-        if !keys.is_empty() {
-            spans.push(Span::raw("  "));
-            spans.extend(styles.keys(keys).spans);
+        let (row, name) = self.at_cursor().filter(|_| shown)?;
+        let view = self.view.as_ref()?;
+        let units = self.env.units;
+        let (name_style, name) = row_name(&row, name, styles);
+        let mut sizes = units.format(row.size);
+        let mut notes = Vec::new();
+        if let Item::Dir(k) = row.item {
+            sizes += &format!(", own {}", units.format(view.tree.own(k)));
+            if let Some(error) = view.tree.error(k) {
+                notes.push(format!("unreadable: {error}"));
+            } else if view.tree.other_device(k) {
+                notes.push("on another device, not scanned".into());
+            }
+            let n = self.denied_below(k);
+            if n > 0 {
+                let folders = if n == 1 { "folder" } else { "folders" };
+                notes.push(format!(
+                    "{} {folders} below unreadable",
+                    thousands(n as u64)
+                ));
+            }
+        }
+        if view.reclaimable {
+            sizes += &format!(", deletes {}", units.format(row.private));
+        }
+        if let Some(l) = row.label {
+            notes.push(format!("{}: {}", l.text, l.why));
+        }
+        let note = notes.join("  ");
+        // the name gets room first, then the sizes, then the notes
+        let gap = 2;
+        let fixed = width_of(&name) + gap + width_of(&sizes);
+        let mut spans = Vec::new();
+        if fixed > width {
+            spans.extend(cut_middle(&name, width, name_style, styles));
+        } else {
+            spans.push(Span::styled(name, name_style));
+            spans.push(Span::raw(format!("  {sizes}")));
+            let room = width - fixed;
+            if !note.is_empty() && room > gap {
+                spans.push(Span::raw("  "));
+                spans.extend(cut_middle(&note, room - gap, Style::new(), styles));
+            }
         }
         Some(Line::from(spans))
     }
 
-    /// The bytes the volume uses beyond those a finished scan of its root
-    /// found: snapshots, purgeable space, denied dirs. None if the scan
-    /// found more, which clones that share blocks can cause.
-    fn unaccounted(&self) -> Option<String> {
-        let view = self.view.as_ref().filter(|v| v.status == Status::Done)?;
-        let lost = self
-            .used?
-            .checked_sub(view.tree.size(0))
-            .filter(|&n| n > 0)?;
-        Some(format!("not accounted for: {}", format_size(lost)))
+    /// How many denied dirs are below dir `d`, not counting itself.
+    fn denied_below(&self, d: u32) -> usize {
+        let view = self.view.as_ref().unwrap();
+        let mut path = dir_path(&view.tree, d);
+        path.push(b'/');
+        let start = view.denied.partition_point(|(p, _)| p[..] < path[..]);
+        (view.denied[start..].iter())
+            .take_while(|(p, _)| p.starts_with(&path))
+            .count()
+    }
+
+    /// The `i` pop-up: everything about the row at the cursor, in a box in
+    /// the middle of the columns.
+    fn draw_info(&self, buf: &mut Buffer, now: SystemTime, styles: &Styles) {
+        let (Some((row, name)), Some(view)) = (self.at_cursor(), &self.view) else {
+            return;
+        };
+        let units = self.env.units;
+        let mut path = self.root.as_os_str().as_bytes().to_vec();
+        for name in &self.trail {
+            join(&mut path, name);
+        }
+        join(&mut path, name);
+        let mut facts = vec![("path", String::from_utf8_lossy(&path).into_owned())];
+        let mut size = units.format(row.size);
+        if let Item::Dir(k) = row.item {
+            size += &format!(" (own {})", units.format(view.tree.own(k)));
+        }
+        facts.push(("size", size));
+        if view.reclaimable {
+            facts.push(("deletes", units.format(row.private)));
+        }
+        if let Item::Dir(k) = row.item {
+            let mut below = 0u64;
+            let mut stack = view.tree.children(k).to_vec();
+            while let Some(c) = stack.pop() {
+                below += 1;
+                stack.extend_from_slice(view.tree.children(c));
+            }
+            facts.push(("folders", format!("{} below", thousands(below))));
+            if let Some(error) = view.tree.error(k) {
+                facts.push(("unreadable", error));
+            }
+            let n = self.denied_below(k);
+            if n > 0 {
+                facts.push((
+                    "partial",
+                    format!("{} folders below unreadable", thousands(n as u64)),
+                ));
+            }
+        }
+        if let Some(l) = row.label {
+            facts.push(("label", format!("{}: {}", l.text, l.why)));
+        }
+        if let Some(base) = &self.baseline {
+            let since = age(now.duration_since(base.at).unwrap_or_default());
+            let change = match row.delta {
+                0 => "none".to_string(),
+                d => signed(d, units),
+            };
+            facts.push(("change", format!("{change} since opened {since} ago")));
+        }
+        let area = self.body;
+        let width = (area.width.saturating_sub(4)).min(72);
+        let height = (facts.len() as u16 + 2).min(area.height);
+        let r = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        let inner = usize::from(width.saturating_sub(4));
+        let edge = |left: &str, text: &str| {
+            let text = format!(" {text} ");
+            let fill = usize::from(width).saturating_sub(2 + width_of(&text));
+            format!(
+                "{left}{}{text}{}{left}",
+                "-".repeat(fill / 2),
+                "-".repeat(fill - fill / 2)
+            )
+        };
+        let name = String::from_utf8_lossy(name);
+        buf.set_style(r, Style::reset());
+        buf.set_stringn(r.x, r.y, edge("+", &name), width.into(), Style::new());
+        for (y, (key, value)) in (r.y + 1..r.bottom() - 1).zip(&facts) {
+            let mut spans = vec![
+                Span::raw("| "),
+                Span::styled(format!("{key:<11}"), styles.dim),
+            ];
+            spans.extend(cut_middle(
+                value,
+                inner.saturating_sub(11),
+                Style::new(),
+                styles,
+            ));
+            let line = Line::from(spans);
+            buf.set_stringn(r.x, y, " ".repeat(width.into()), width.into(), Style::new());
+            buf.set_line(r.x, y, &line, width - 1);
+            buf.set_stringn(r.right() - 1, y, "|", 1, Style::new());
+        }
+        let bottom = r.bottom() - 1;
+        buf.set_stringn(
+            r.x,
+            bottom,
+            edge("+", "i or esc close"),
+            width.into(),
+            Style::new(),
+        );
     }
 }
 
@@ -1300,18 +1550,39 @@ fn name<'a>(view: &'a View, files: &'a Files, item: Item) -> &'a [u8] {
     }
 }
 
-/// Row `row` of a dir of `total` bytes listed as `files`: its sizes, a bar
-/// of its share of `total` if `bar`, and its name.
 /// How a column draws its rows.
 #[derive(Clone, Copy)]
 struct Look {
-    /// The share bar, in columns wide enough.
-    bar: bool,
+    /// A parent or preview column: sizes and names only.
+    side: bool,
     /// The change since the session started, when some row of the column
     /// changed.
     changes: bool,
+    units: Units,
 }
 
+/// The name of `row` as a column shows it, `/` after a dir, and its style:
+/// a dir's is bold, in its label's colour if it has one.
+fn row_name(row: &Row, name: &[u8], styles: &Styles) -> (Style, String) {
+    let name = String::from_utf8_lossy(name).into_owned();
+    match row.item {
+        Item::File(_) => (Style::new(), name),
+        Item::Dir(_) => {
+            let style = match row.label.map(|l| l.tier) {
+                Some(Tier::System) => styles.dir.patch(styles.system),
+                Some(Tier::Cache) => styles.dir.patch(styles.cache),
+                Some(Tier::Known) => styles.dir.patch(styles.known),
+                None => styles.dir,
+            };
+            (style, name + "/")
+        }
+    }
+}
+
+/// Row `row` of a dir of `total` bytes listed as `files`, in `width`
+/// columns: its sizes, unless a side column its change and share of
+/// `total`, then its name, cut in the middle to fit.
+#[allow(clippy::too_many_arguments)]
 fn line(
     view: &View,
     files: &Files,
@@ -1319,71 +1590,137 @@ fn line(
     total: u64,
     look: Look,
     picked: bool,
+    width: usize,
     styles: &Styles,
 ) -> Line<'static> {
-    let label = String::from_utf8_lossy(name(view, files, row.item)).into_owned();
+    let units = look.units;
     // something below was denied, so the sizes are lower bounds
     let plus = match row.item {
         Item::Dir(k) if view.tree.partial(k) => "+",
         _ => " ",
     };
-    let size = |n: u64| Span::styled(format!("{:>10}", format_size(n)), styles.size(n));
+    let size = |n: u64| Span::styled(format!("{:>10}", units.format(n)), styles.size(n, units));
     let mut spans = vec![size(row.size), Span::styled(plus, styles.dim)];
-    if view.reclaimable {
+    if view.reclaimable && !look.side {
         spans.extend([size(row.private), Span::styled(plus, styles.dim)]);
     }
     if look.changes {
         spans.push(match row.delta {
             0 => Span::raw(format!("{:11}", "")),
-            d @ 1.. => Span::styled(format!("{:>11}", signed(d)), styles.grew),
-            d => Span::styled(format!("{:>11}", signed(d)), styles.shrank),
+            d @ 1.. => Span::styled(format!("{:>11}", signed(d, units)), styles.grew),
+            d => Span::styled(format!("{:>11}", signed(d, units)), styles.shrank),
         });
     }
     spans.push(Span::raw(" "));
-    if look.bar {
-        spans.extend(self::bar(row.size, total, styles.size(row.size), styles));
+    if !look.side {
+        spans.push(Span::styled(
+            percent(row.size, total),
+            styles.size(row.size, units),
+        ));
         spans.push(Span::raw(" "));
     }
-    match row.item {
-        Item::Dir(k) => {
-            spans.push(Span::styled(format!("{label}/"), styles.dir));
-            spans.push(match view.tree.error(k) {
-                Some(error) => Span::styled(format!(" (denied: {error})"), styles.denied),
-                None if view.tree.other_device(k) => Span::styled(" (other device)", styles.dim),
-                None => Span::raw(""),
-            });
-            if let Some(l) = row.label {
-                let style = match l.tier {
-                    Tier::System => styles.system,
-                    Tier::Cache => styles.cache,
-                    Tier::Known => styles.known,
-                };
-                spans.push(Span::styled(format!("  [{}]", l.text), style));
+    let (style, name) = row_name(row, name(view, files, row.item), styles);
+    let mut after = Vec::new();
+    if let Item::Dir(k) = row.item {
+        match view.tree.error(k) {
+            Some(error) => after.push(Span::styled(format!(" (denied: {error})"), styles.denied)),
+            None if view.tree.other_device(k) => {
+                after.push(Span::styled(" (other device)", styles.dim));
             }
+            None => {}
         }
-        Item::File(_) => spans.push(Span::raw(label)),
     }
     if picked {
-        spans.push(Span::styled(" *", styles.picked));
+        after.push(Span::styled(" *", styles.picked));
     }
+    let used: usize = spans.iter().chain(&after).map(Span::width).sum();
+    spans.extend(cut_middle(&name, width.saturating_sub(used), style, styles));
+    spans.extend(after);
     Line::from(spans)
 }
 
-/// A bar of `size`'s share of `total`: a `#`, in `style`, for each tenth,
-/// rounded to the nearest, at least one from 1%, then a dim `.` for each
-/// tenth left.
-pub(crate) fn bar(size: u64, total: u64, style: Style, styles: &Styles) -> [Span<'static>; 2] {
-    let (size, total) = (u128::from(size), u128::from(total));
-    let n = match total {
-        0 => 0,
-        _ if size * 100 < total => 0,
-        _ => ((size * 20 + total) / (2 * total)).clamp(1, BAR.into()),
-    };
-    let n = n as usize;
-    [
-        Span::styled("#".repeat(n), style),
-        Span::styled(".".repeat(BAR as usize - n), styles.dim),
+/// `size`'s share of `total` in 5 columns, the decimal point always in
+/// the same place: `99.1%`, ` 0.3%`, `<0.1%`, ` 100%`, blank for 0 B.
+pub(crate) fn percent(size: u64, total: u64) -> String {
+    if size == 0 || total == 0 {
+        return " ".repeat(5);
+    }
+    // tenths of a percent, rounded
+    let tenths =
+        ((u128::from(size) * 2000 + u128::from(total)) / (2 * u128::from(total))).min(1000);
+    match tenths {
+        0 => "<0.1%".into(),
+        1000 => " 100%".into(),
+        t => format!("{:>2}.{}%", t / 10, t % 10),
+    }
+}
+
+/// The columns `text` takes on screen.
+fn width_of(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// `text` in `style`, cut in the middle to `width` columns if wider, with a
+/// dim ellipsis where it was cut, so both ends show.
+fn cut_middle(text: &str, width: usize, style: Style, styles: &Styles) -> Vec<Span<'static>> {
+    if width_of(text) <= width {
+        return vec![Span::styled(text.to_owned(), style)];
+    }
+    if width == 0 {
+        return Vec::new();
+    }
+    let char_width = |c: char| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    // the end gets half, the start the rest, after 1 for the ellipsis
+    let mut tail_room = (width - 1) / 2;
+    let mut head_room = width - 1 - tail_room;
+    let mut head = String::new();
+    for c in text.chars() {
+        let w = char_width(c);
+        if w > head_room {
+            break;
+        }
+        head_room -= w;
+        head.push(c);
+    }
+    tail_room += head_room;
+    let mut tail = Vec::new();
+    for c in text.chars().rev() {
+        let w = char_width(c);
+        if w > tail_room {
+            break;
+        }
+        tail_room -= w;
+        tail.push(c);
+    }
+    let tail: String = tail.into_iter().rev().collect();
+    vec![
+        Span::styled(head, style),
+        Span::styled("\u{2026}", styles.dim),
+        Span::styled(tail, style),
     ]
+}
+
+/// `n` with a comma every 3 digits: `48,210`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `keys`, `key what` pairs two spaces apart, leaving out those just
+/// before the last two (`? help  q quit`) until it fits in `width`.
+fn fit_keys(keys: &str, width: usize) -> String {
+    let mut pairs: Vec<&str> = keys.split("  ").collect();
+    while width_of(&pairs.join("  ")) > width && pairs.len() > 3 {
+        pairs.remove(pairs.len() - 3);
+    }
+    pairs.join("  ")
 }
 
 /// Draws the denied dirs of `view` from row `offset`, each with why it
@@ -1420,7 +1757,14 @@ fn panel(
 /// Draws the largest files of `view` still there, as paths below the root,
 /// from `top`'s offset, the one at its cursor selected. A file is checked
 /// with one `lstat` when first drawn, and left out if gone.
-fn top_files(buf: &mut Buffer, area: Rect, view: &View, top: &mut Top, styles: &Styles) {
+fn top_files(
+    buf: &mut Buffer,
+    area: Rect,
+    view: &View,
+    top: &mut Top,
+    styles: &Styles,
+    units: Units,
+) {
     if view.largest.is_empty() && view.status == Status::Scanning {
         buf.set_stringn(
             area.x,
@@ -1459,7 +1803,10 @@ fn top_files(buf: &mut Buffer, area: Rect, view: &View, top: &mut Top, styles: &
     for (y, (i, &(size, path))) in lines {
         let below = path[root..].strip_prefix(b"/").unwrap_or(&path[root..]);
         let line = Line::from_iter([
-            Span::styled(format!("{:>10}", format_size(size)), styles.size(size)),
+            Span::styled(
+                format!("{:>10}", units.format(size)),
+                styles.size(size, units),
+            ),
             Span::raw(format!("  {}", String::from_utf8_lossy(below))),
         ]);
         buf.set_line(area.x, y, &line, area.width);
@@ -1528,6 +1875,7 @@ fn join_below(path: &mut Vec<u8>, name: &[u8]) {
 /// at its cursor selected, after a head with their count and total. A
 /// dir's size is from the tree, a file's from one `lstat`, and either is
 /// `gone` if not found.
+#[allow(clippy::too_many_arguments)]
 fn picks(
     buf: &mut Buffer,
     area: Rect,
@@ -1536,6 +1884,7 @@ fn picks(
     picks: &[Vec<u8>],
     list: &mut Picks,
     styles: &Styles,
+    units: Units,
 ) {
     let size = |path: &[u8]| match view.tree.find(Path::new(OsStr::from_bytes(path))) {
         Some(d) => Some(view.tree.size(d)),
@@ -1549,7 +1898,7 @@ fn picks(
     let total: u64 = sizes.iter().flatten().sum();
     let head = match picks.len() {
         0 => "nothing picked: space picks the item at the cursor".into(),
-        n => format!("{n} picked, {} in all:", format_size(total)),
+        n => format!("{n} picked, {} in all:", units.format(total)),
     };
     buf.set_stringn(area.x, area.y, head, area.width.into(), Style::new());
     let height = usize::from(area.height.saturating_sub(1));
@@ -1557,7 +1906,7 @@ fn picks(
     let rows = picks.iter().zip(&sizes).enumerate().skip(list.offset);
     for (y, (i, (path, size))) in (area.y + 1..area.bottom()).zip(rows) {
         let size = match size {
-            Some(n) => Span::styled(format!("{:>10}", format_size(*n)), styles.size(*n)),
+            Some(n) => Span::styled(format!("{:>10}", units.format(*n)), styles.size(*n, units)),
             None => Span::styled(format!("{:>10}", "gone"), styles.dim),
         };
         let line = Line::from_iter([
@@ -1577,9 +1926,9 @@ fn picks(
 }
 
 /// `+1.5 GiB` or `-4.0 KiB`.
-fn signed(bytes: i64) -> String {
+fn signed(bytes: i64, units: Units) -> String {
     let sign = if bytes < 0 { '-' } else { '+' };
-    format!("{sign}{}", format_size(bytes.unsigned_abs()))
+    format!("{sign}{}", units.format(bytes.unsigned_abs()))
 }
 
 /// `5 min`: whole seconds, minutes, hours or days.
@@ -1600,28 +1949,33 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Modifier};
 
-    /// 100x20: `title`, empty columns and the help.
+    /// 100x20: `title`, empty columns and the keys.
     fn screen(title: &str) -> Buffer {
         let mut lines = vec![format!("{title:<100}")];
         lines.extend((0..18).map(|_| format!("{:100}", "")));
         lines.push(String::new());
         let mut buf = Buffer::with_lines(lines);
-        buf.set_line(0, 19, &Styles::new(true).keys(HELP), 100);
+        buf.set_line(0, 19, &Styles::new(true).keys(&fit_keys(HELP, 100)), 100);
         buf
     }
 
-    /// A dir's row of `size` KiB, green, with no bar: the columns are
-    /// narrower than 40.
-    fn dir_row(size: &str, name: &str) -> Line<'static> {
-        Line::from_iter([
-            Span::styled(format!("{size:>10}"), Style::new().fg(Color::Green)),
+    /// A dir's row of `size` KiB, green: with its share `percent` in the
+    /// current column, without in the preview.
+    fn dir_row(size: &str, percent: Option<&str>, name: &str) -> Line<'static> {
+        let green = Style::new().fg(Color::Green);
+        let mut spans = vec![
+            Span::styled(format!("{size:>10}"), green),
             Span::styled(" ", Style::new().fg(Color::DarkGray)),
             Span::raw(" "),
-            Span::styled(
-                format!("{name}/"),
-                Style::new().add_modifier(Modifier::BOLD),
-            ),
-        ])
+        ];
+        if let Some(percent) = percent {
+            spans.extend([Span::styled(percent.to_string(), green), Span::raw(" ")]);
+        }
+        spans.push(Span::styled(
+            format!("{name}/"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+        Line::from(spans)
     }
 
     fn draw(b: &mut Browser) -> Buffer {
@@ -1642,12 +1996,13 @@ mod tests {
             cache: None,
             inotify: true,
             interval: Duration::ZERO,
+            units: Units::Binary,
             color: true,
             home: None,
         };
         let mut b = Browser::new(dir.path(), "/scan", env, None, None, false);
         assert!(tree.progress().snapshot().is_none());
-        assert_eq!(draw(&mut b), screen("/scan  scanning..."));
+        assert_eq!(draw(&mut b), screen("/scan"));
 
         let ids = tree.intern([&b"a"[..], b"x"].into_iter());
         let dir = |parent, name, own| Record {
@@ -1661,15 +2016,28 @@ mod tests {
         tree.push(dir(0, ids[0], 4096), 0);
         tree.push(dir(1, ids[1], 8192), 0);
         b.show(tree.progress().snapshot().unwrap(), Status::Scanning);
-        // the root's column starts at x 0, the preview at 34
-        let mut expected = screen("/scan  scanning... at least 12.0 KiB");
-        expected.set_line(0, 1, &dir_row("12.0 KiB", "a"), 33);
+        // at the root, the current column is at x 0, the preview at 60
+        let mut expected = screen("");
+        let title = Line::from_iter([
+            Span::raw("/scan  scanning 12.0 KiB"),
+            Span::styled(" | ", Style::new().fg(Color::DarkGray)),
+            Span::raw("3 folders"),
+            Span::styled(" | ", Style::new().fg(Color::DarkGray)),
+            Span::raw("0 s"),
+        ]);
+        expected.set_line(0, 0, &title, 100);
+        expected.set_line(0, 1, &dir_row("12.0 KiB", Some(" 100%"), "a"), 59);
         let selected = Style::new().fg(Color::Indexed(231)).bg(Color::Indexed(25));
         expected.set_style(
-            Rect::new(0, 1, 33, 1),
+            Rect::new(0, 1, 59, 1),
             selected.add_modifier(Modifier::BOLD),
         );
-        expected.set_line(34, 1, &dir_row("8.0 KiB", "x"), 32);
+        expected.set_line(60, 1, &dir_row("8.0 KiB", None, "x"), 40);
+        let status = Line::from_iter([
+            Span::styled("a/", Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw("  12.0 KiB, own 4.0 KiB"),
+        ]);
+        expected.set_line(0, 18, &status, 100);
         assert_eq!(draw(&mut b), expected);
     }
 }

@@ -2,8 +2,8 @@
 //! filesystem, with its size, used and free bytes, and a bar of its used
 //! share.
 
-use crate::browse::bar;
-use crate::report::format_size;
+use crate::browse::percent;
+use crate::report::Units;
 use crate::style::Styles;
 use crate::volumes::Mount;
 use ratatui::Frame;
@@ -52,26 +52,32 @@ fn offset(area: Rect, cursor: usize) -> usize {
     (cursor + 1).saturating_sub(height(area))
 }
 
-/// Draws `volumes`, each with a bar of its used share, the row at `cursor`
-/// selected and on screen.
-pub(crate) fn draw(frame: &mut Frame, volumes: &[Mount], cursor: usize, styles: &Styles) {
+/// Draws `volumes`, each with its used share, sizes in `units`, the row at
+/// `cursor` selected and on screen.
+pub(crate) fn draw(
+    frame: &mut Frame,
+    volumes: &[Mount],
+    cursor: usize,
+    styles: &Styles,
+    units: Units,
+) {
     let area = frame.area();
     let buf = frame.buffer_mut();
     let width = area.width.into();
     buf.set_stringn(0, 0, "volumes", width, Style::new());
     let rows = (1..).zip(volumes.iter().enumerate().skip(offset(area, cursor)));
     for (y, (i, v)) in rows.take(height(area)) {
-        let used = styles.size(v.used);
-        let mut line = Line::from_iter([
-            Span::styled(format!("{:>10}", format_size(v.used)), used),
+        let used = styles.size(v.used, units);
+        let line = Line::from_iter([
+            Span::styled(format!("{:>10}", units.format(v.used)), used),
             Span::raw(format!(
                 " used of {:>10}  {:>10} free  ",
-                format_size(v.total),
-                format_size(v.free)
+                units.format(v.total),
+                units.format(v.free)
             )),
+            Span::styled(percent(v.used, v.total), used),
+            Span::raw(format!("  {}", v.point.display())),
         ]);
-        line.extend(bar(v.used, v.total, used, styles));
-        line.push_span(Span::raw(format!("  {}", v.point.display())));
         buf.set_line(0, y, &line, area.width);
         if i == cursor {
             buf.set_style(Rect::new(0, y, area.width, 1), styles.selected);

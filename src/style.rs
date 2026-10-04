@@ -2,13 +2,14 @@
 //! table without colours is used: it keeps the modifiers, so the selection
 //! still shows.
 
+use crate::report::Units;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// How the parts of a screen are drawn.
 pub(crate) struct Styles {
     /// Sizes of at least 1 GiB, 1 MiB and 1 KiB, and smaller ones, like
-    /// OmniDiskSweeper.
+    /// OmniDiskSweeper: by the unit they print in ([`Units::tier`]).
     sizes: [Style; 4],
     /// The name of a directory.
     pub dir: Style,
@@ -32,10 +33,6 @@ pub(crate) struct Styles {
     pub grew: Style,
     pub shrank: Style,
 }
-
-const KIB: u64 = 1 << 10;
-const MIB: u64 = 1 << 20;
-const GIB: u64 = 1 << 30;
 
 const COLOR: Styles = Styles {
     sizes: [
@@ -89,14 +86,9 @@ impl Styles {
         }
     }
 
-    /// The style of a size of `bytes`.
-    pub fn size(&self, bytes: u64) -> Style {
-        match bytes {
-            GIB.. => self.sizes[0],
-            MIB.. => self.sizes[1],
-            KIB.. => self.sizes[2],
-            _ => self.sizes[3],
-        }
+    /// The style of a size of `bytes`, printed in `units`.
+    pub fn size(&self, bytes: u64, units: Units) -> Style {
+        self.sizes[units.tier(bytes)]
     }
 
     /// A line of `key what` pairs, two spaces apart, each key highlighted.

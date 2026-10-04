@@ -16,6 +16,8 @@ struct Cli {
     path: Option<PathBuf>,
     #[command(flatten)]
     reclaimable: Reclaimable,
+    #[command(flatten)]
+    si: Si,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -68,12 +70,32 @@ impl Reclaimable {
     }
 }
 
+/// `--si`.
+#[derive(Args)]
+struct Si {
+    /// Sizes in powers of 1000 (kB, MB, GB), as Finder and disk makers, not
+    /// of 1024 (KiB, MiB, GiB). The browser switches with `u`
+    #[arg(long)]
+    si: bool,
+}
+
+impl Si {
+    fn units(&self) -> crate::Units {
+        match self.si {
+            true => crate::Units::Decimal,
+            false => crate::Units::Binary,
+        }
+    }
+}
+
 /// Flags `scan` and `show` share, so `show` can print what `scan` did.
 #[derive(Args)]
 struct Output {
     #[command(flatten)]
     reclaimable: Reclaimable,
-    /// Print JSON instead of text
+    #[command(flatten)]
+    si: Si,
+    /// Print JSON instead of text, sizes in bytes
     #[arg(long)]
     json: bool,
     /// Levels of subdirectories in the JSON [default: 1]
@@ -97,7 +119,10 @@ impl Output {
                 "{}",
                 crate::json(tree, self.reclaimable(), self.depth.unwrap_or(1), top)
             ),
-            false => print!("{}", crate::report(tree, self.reclaimable(), top)),
+            false => print!(
+                "{}",
+                crate::report(tree, self.reclaimable(), top, self.si.units())
+            ),
         }
     }
 }
@@ -119,12 +144,12 @@ pub fn cli(args: impl IntoIterator<Item = OsString>) -> u8 {
             _,
         ) => scan(&path, threads, reader, stop_after, &output),
         (Some(Command::Show { path, output }), _) => show(&path, &output),
-        (None, path) => browse(path.as_deref(), cli.reclaimable.on()),
+        (None, path) => browse(path.as_deref(), cli.reclaimable.on(), cli.si.units()),
     }
 }
 
-fn browse(path: Option<&Path>, reclaimable: bool) -> u8 {
-    match (crate::browse(path, reclaimable), path) {
+fn browse(path: Option<&Path>, reclaimable: bool, units: crate::Units) -> u8 {
+    match (crate::browse(path, reclaimable, units), path) {
         (Ok(()), _) => 0,
         (Err(e), Some(path)) => {
             eprintln!("diskuse: {}: {e}", path.display());

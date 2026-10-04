@@ -6,7 +6,9 @@ mod common;
 
 use common::{Fixture, file, fixture, kib};
 use diskuse::reveal::Desktop;
-use diskuse::{App, Browser, CacheDir, Env, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions};
+use diskuse::{
+    App, Browser, CacheDir, Env, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions, Units,
+};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
@@ -26,17 +28,27 @@ use std::time::{Duration, Instant, SystemTime};
 
 const WIDTH: usize = 100;
 const HEIGHT: usize = 20;
-/// `(x, width)` of the parent, current and preview columns. At the root,
-/// the current and preview columns take the first two.
-const COLUMNS: [(usize, usize); 3] = [(0, 33), (34, 32), (67, 33)];
+/// `(x, width)` of the parent, current and preview columns, 20 / 50 / 30
+/// of 100 columns, and at the root, of the current and preview columns,
+/// 60 / 40.
+const COLUMNS: Columns = Columns {
+    three: [(0, 20), (21, 49), (71, 29)],
+    root: [(0, 59), (60, 40)],
+};
 /// A wider terminal, for rows too long for 100 columns.
 const WIDE: usize = 130;
-const WIDE_COLUMNS: [(usize, usize); 3] = [(0, 43), (44, 42), (87, 43)];
-const HELP: &str =
-    "hjkl move  r reveal  o open  space pick  p picks  s/S rescan  / filter  t top  ? help  q quit";
+const WIDE_COLUMNS: Columns = Columns {
+    three: [(0, 26), (27, 64), (92, 38)],
+    root: [(0, 77), (78, 52)],
+};
+/// The keys that fit in 100 columns, and in 130, of all of them.
+const HELP: &str = "hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  / filter  ? help  q quit";
+const WIDE_HELP: &str = "hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  \
+                         / filter  t top  o open  ? help  q quit";
 const PICKS_HELP: &str = "arrows/jk move  r reveal  o open  space unpick  p close  ? help  q quit";
 const PANEL_HELP: &str = "arrows/jk scroll  d close  ? help  q quit";
 const TOP_HELP: &str = "arrows/jk move  r reveal  o open  t close  ? help  q quit";
+const INFO_HELP: &str = "i close  ? help  q quit";
 const VOLUMES_HELP: &str = "arrows/jk move  enter scan  ? help  q quit";
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -44,8 +56,15 @@ const MIB: u64 = 1 << 20;
 /// dirs shown follow changes.
 const SCANNED: &str = match cfg!(target_os = "macos") {
     true => "",
-    false => "  scanned 0 s ago",
+    false => " | scanned 0 s ago",
 };
+
+/// Where the columns are, in a terminal of some width.
+#[derive(Clone, Copy)]
+struct Columns {
+    three: [(usize, usize); 3],
+    root: [(usize, usize); 2],
+}
 
 /// The time of day the tests' clock always gives, so a scan is dated, and
 /// drawn, then.
@@ -123,36 +142,60 @@ fn signed(bytes: i64) -> String {
     format!("{sign}{}", size(bytes.unsigned_abs()))
 }
 
-/// The `#`s and `.`s of a bar of `size`'s share of `of`: tenths, to the
-/// nearest, at least one from 1%.
-fn bar(size: u64, of: u64) -> (String, String) {
-    let n = match of {
-        0 => 0,
-        _ if size * 100 < of => 0,
-        _ => ((size as f64 * 10.0 / of as f64).round() as usize).max(1),
-    };
-    ("#".repeat(n), ".".repeat(10 - n))
+/// `size`'s share of `of` in 5 columns: `99.1%`, ` 0.3%`, `<0.1%`, ` 100%`,
+/// blank for 0 B.
+fn percent(size: u64, of: u64) -> String {
+    if size == 0 || of == 0 {
+        return " ".repeat(5);
+    }
+    let tenths = (size as f64 * 1000.0 / of as f64).round() as u64;
+    match tenths {
+        0 => "<0.1%".into(),
+        1000.. => " 100%".into(),
+        t => format!("{:>2}.{}%", t / 10, t % 10),
+    }
 }
 
-/// What a row shows after its sizes and bar.
+/// `text` in `style`, cut in the middle to `width` if longer, with a dim
+/// ellipsis: the end gets half of what is left after it.
+fn cut(text: &str, width: usize, style: Style, look: Look) -> Vec<Span<'static>> {
+    if text.len() <= width {
+        return vec![Span::styled(text.to_string(), style)];
+    }
+    if width == 0 {
+        return Vec::new();
+    }
+    let tail = (width - 1) / 2;
+    let head = width - 1 - tail;
+    vec![
+        Span::styled(text[..head].to_string(), style),
+        Span::styled("\u{2026}", look.dim()),
+        Span::styled(text[text.len() - tail..].to_string(), style),
+    ]
+}
+
+/// What a row shows after its sizes.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     File,
-    /// `+` after the size if `partial`: something below was denied.
+    /// `+` after the size if `partial`: a folder below was denied.
     Dir {
         partial: bool,
     },
     Denied,
-    /// A dir with a cache label.
-    Label(&'static str),
-    /// A dir with the label of a known big folder.
-    Known(&'static str),
+    /// A dir with a cache label, and why.
+    Label(&'static str, &'static str),
+    /// A dir with the label of a known big folder, and why.
+    Known(&'static str, &'static str),
 }
 
 /// An expected row of a column: `size` bytes of a dir of `of` bytes.
 #[derive(Clone, PartialEq)]
 struct Row {
     size: u64,
+    /// A dir's own bytes, with its files', for the line about the row at
+    /// the cursor: all of `size` but for [`Row::own`].
+    own: u64,
     /// Reclaimable bytes, shown with `-r`.
     private: Option<u64>,
     of: u64,
@@ -169,6 +212,7 @@ impl Row {
     fn new(size: u64, of: u64, name: &str, kind: Kind) -> Self {
         Row {
             size,
+            own: size,
             private: None,
             of,
             name: name.into(),
@@ -189,6 +233,11 @@ impl Row {
         Row { delta, ..self }
     }
 
+    /// A dir with subdirs, of `own` bytes itself.
+    fn own(self, own: u64) -> Self {
+        Row { own, ..self }
+    }
+
     fn file(size: u64, of: u64, name: &str) -> Self {
         Self::new(size, of, name, Kind::File)
     }
@@ -197,11 +246,24 @@ impl Row {
         Self::new(size, of, name, Kind::Dir { partial: false })
     }
 
-    /// `size  ##........ name`, the size coloured, and the `#`s the same,
-    /// the bar only if `bar`.
+    /// The name as a column shows it, and its style.
+    fn name(&self, look: Look) -> (String, Style) {
+        match self.kind {
+            Kind::File => (self.name.clone(), Style::new()),
+            Kind::Label(..) => (self.name.clone() + "/", bold().patch(look.fg(Color::Green))),
+            Kind::Known(..) => (
+                self.name.clone() + "/",
+                bold().patch(look.fg(Color::Yellow)),
+            ),
+            _ => (self.name.clone() + "/", bold()),
+        }
+    }
+
+    /// `size  42.0% name`, the size and share coloured by the size, in a
+    /// column `width` wide; a `side` column has sizes and names only.
     /// `changes`: the column shows each row's change, as one of its rows
     /// changed.
-    fn line(&self, look: Look, bar: bool, changes: bool) -> Line<'static> {
+    fn line(&self, look: Look, side: bool, changes: bool, width: usize) -> Line<'static> {
         let plus = match self.kind {
             Kind::Dir { partial: true } => "+",
             _ => " ",
@@ -211,10 +273,10 @@ impl Row {
             Span::styled(format!("{text:>10}"), look.size(&text))
         };
         let mut spans = vec![size(self.size), Span::styled(plus, look.dim())];
-        if let Some(private) = self.private {
+        if let Some(private) = self.private.filter(|_| !side) {
             spans.extend([size(private), Span::styled(plus, look.dim())]);
         }
-        if changes {
+        if changes && !side {
             spans.push(match self.delta {
                 0 => Span::raw(" ".repeat(11)),
                 d => {
@@ -224,46 +286,82 @@ impl Row {
             });
         }
         spans.push(Span::raw(" "));
-        if bar {
-            let (filled, empty) = self::bar(self.size, self.of);
+        if !side {
+            let style = look.size(&size(self.size).content);
             spans.extend([
-                Span::styled(filled, look.size(&size(self.size).content)),
-                Span::styled(empty, look.dim()),
+                Span::styled(percent(self.size, self.of), style),
                 Span::raw(" "),
             ]);
         }
-        let name = self.name.clone();
-        match self.kind {
-            Kind::File => spans.push(Span::raw(name)),
-            Kind::Dir { .. } => spans.push(Span::styled(name + "/", bold())),
-            Kind::Denied => spans.extend([
-                Span::styled(name + "/", bold()),
-                Span::styled(" (denied: EACCES)", look.fg(Color::Red)),
-            ]),
-            Kind::Label(label) => spans.extend([
-                Span::styled(name + "/", bold()),
-                Span::styled(format!("  [{label}]"), look.fg(Color::Green)),
-            ]),
-            Kind::Known(label) => spans.extend([
-                Span::styled(name + "/", bold()),
-                Span::styled(format!("  [{label}]"), look.fg(Color::Yellow)),
-            ]),
+        let mut after = Vec::new();
+        if self.kind == Kind::Denied {
+            after.push(Span::styled(" (denied: EACCES)", look.fg(Color::Red)));
         }
         if self.picked {
             let style = match look.color {
                 true => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 false => bold(),
             };
-            spans.push(Span::styled(" *", style));
+            after.push(Span::styled(" *", style));
+        }
+        let used: usize = spans.iter().chain(&after).map(Span::width).sum();
+        let (name, style) = self.name(look);
+        spans.extend(cut(&name, width.saturating_sub(used), style, look));
+        spans.extend(after);
+        Line::from(spans)
+    }
+
+    /// The line about the row at the cursor, above the keys, `width` wide.
+    fn status(&self, look: Look, width: usize) -> Line<'static> {
+        let (name, style) = self.name(look);
+        let mut sizes = size(self.size);
+        let mut notes = Vec::new();
+        if self.kind != Kind::File {
+            sizes += &format!(", own {}", size(self.own));
+        }
+        if let Some(private) = self.private {
+            sizes += &format!(", deletes {}", size(private));
+        }
+        match self.kind {
+            Kind::Denied => notes.push("unreadable: EACCES".to_string()),
+            // the fixture's partial dirs have one denied dir below
+            Kind::Dir { partial: true } => notes.push("1 folder below unreadable".into()),
+            Kind::Label(text, why) | Kind::Known(text, why) => notes.push(format!("{text}: {why}")),
+            _ => {}
+        }
+        let note = notes.join("  ");
+        let fixed = name.len() + 2 + sizes.len();
+        let mut spans = vec![Span::styled(name, style), Span::raw(format!("  {sizes}"))];
+        if !note.is_empty() && width > fixed + 2 {
+            spans.push(Span::raw("  "));
+            spans.extend(cut(&note, width - fixed - 2, Style::new(), look));
         }
         Line::from(spans)
     }
 }
 
+/// The top line: `root  first | second | ...`, the first part bold unless
+/// it is a running scan, each `|` dim.
+fn title_line(look: Look, title: &str) -> Line<'static> {
+    let (root, rest) = title.split_once("  ").unwrap();
+    let mut spans = vec![Span::raw(format!("{root}  "))];
+    for (i, part) in rest.split(" | ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" | ", look.dim()));
+        }
+        let style = match i == 0 && !part.starts_with("scanning") {
+            true => bold(),
+            false => Style::new(),
+        };
+        spans.push(Span::styled(part.to_string(), style));
+    }
+    Line::from(spans)
+}
+
 /// An expected screen: `title`, the rows of the parent, current and
-/// preview columns, and `footer`. `parent` is the marked row of the
-/// parent column, `None` at the root, and `current` the selected row of
-/// the current column.
+/// preview columns, the line about the selected row, and `footer`.
+/// `parent` is the marked row of the parent column, `None` at the root,
+/// and `current` the selected row of the current column.
 fn screen(
     title: &str,
     columns: [&[Row]; 3],
@@ -282,7 +380,7 @@ fn screen(
 fn screen_in(
     look: Look,
     width: usize,
-    layout: [(usize, usize); 3],
+    layout: Columns,
     title: &str,
     columns: [&[Row]; 3],
     parent: Option<usize>,
@@ -290,31 +388,33 @@ fn screen_in(
     footer: &str,
 ) -> Buffer {
     let mut buf = Buffer::empty(Rect::new(0, 0, width as u16, HEIGHT as u16));
-    buf.set_stringn(0, 0, title, width, Style::new());
+    buf.set_line(0, 0, &title_line(look, title), width as u16);
+    if let Some(row) = columns[1].get(current) {
+        buf.set_line(0, HEIGHT as u16 - 2, &row.status(look, width), width as u16);
+    }
     buf.set_line(0, HEIGHT as u16 - 1, &bottom(look, footer), width as u16);
-    // at the root, the columns move left
+    // at the root, the columns are the current and preview ones
     let places = match parent {
-        None => [None, Some(layout[0]), Some(layout[1])],
-        Some(_) => layout.map(Some),
+        None => [None, Some(layout.root[0]), Some(layout.root[1])],
+        Some(_) => layout.three.map(Some),
     };
     let marks = [
         parent.map(|i| (i, look.parent())),
         Some((current, look.selected())),
         None,
     ];
-    for ((rows, place), mark) in columns.iter().zip(places).zip(marks) {
+    for (i, ((rows, place), mark)) in columns.iter().zip(places).zip(marks).enumerate() {
         let Some((x, width)) = place else {
             assert!(rows.is_empty(), "no parent column at the root");
             continue;
         };
-        let (x, width) = (x as u16, width as u16);
         let changes = rows.iter().any(|r| r.delta != 0);
-        for (y, row) in (1..HEIGHT as u16 - 1).zip(rows.iter()) {
-            // narrower columns have no bars
-            buf.set_line(x, y, &row.line(look, width >= 40, changes), width);
+        for (y, row) in (1..HEIGHT as u16 - 2).zip(rows.iter()) {
+            let line = row.line(look, i != 1, changes, width);
+            buf.set_line(x as u16, y, &line, width as u16);
         }
         if let Some((i, style)) = mark.filter(|&(i, _)| i < rows.len()) {
-            buf.set_style(Rect::new(x, 1 + i as u16, width, 1), style);
+            buf.set_style(Rect::new(x as u16, 1 + i as u16, width as u16, 1), style);
         }
     }
     buf
@@ -334,9 +434,13 @@ fn plain(lines: &[Line<'static>], selected: Option<usize>) -> Buffer {
 }
 
 /// `lines` as unstyled lines, the last at the bottom, the others from the
-/// top.
+/// top; a first line of a root, two spaces and more is a title.
 fn text(lines: &[&str], bottom: &str) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = lines.iter().map(|l| Line::raw(l.to_string())).collect();
+    let line = |(i, l): (usize, &&str)| match i == 0 && l.contains("  ") {
+        true => title_line(COLOR, l),
+        false => Line::raw(l.to_string()),
+    };
+    let mut lines: Vec<Line> = lines.iter().enumerate().map(line).collect();
     lines.resize(HEIGHT - 1, Line::default());
     lines.push(self::bottom(COLOR, bottom));
     lines
@@ -344,8 +448,17 @@ fn text(lines: &[&str], bottom: &str) -> Vec<Line<'static>> {
 
 /// The bottom line: a line of keys, each highlighted, or a message.
 fn bottom(look: Look, footer: &str) -> Line<'static> {
-    let help = [HELP, TOP_HELP, PICKS_HELP, PANEL_HELP, VOLUMES_HELP];
-    match help.contains(&footer) || footer.starts_with('/') {
+    let help = [
+        HELP,
+        WIDE_HELP,
+        TOP_HELP,
+        PICKS_HELP,
+        PANEL_HELP,
+        INFO_HELP,
+        VOLUMES_HELP,
+    ];
+    let keys = help.contains(&footer) || footer.starts_with('/') || footer.ends_with("q quit");
+    match keys {
         true => key_line(look, footer),
         false => Line::raw(footer.to_string()),
     }
@@ -379,6 +492,7 @@ fn env(desktop: Desktop) -> Env {
         cache: None,
         inotify: true,
         interval: Duration::ZERO,
+        units: Units::Binary,
         color: true,
         home: None,
     }
@@ -424,12 +538,13 @@ fn expected(f: &Fixture) -> Expected {
     small.retain(|r| !(as_root && r.kind == Kind::Denied));
     let mut root = vec![
         Row::dir(big_bytes, of, "big"),
-        dir(a_bytes, of, "a"),
+        // h1 and h2 are hard links of one file, counted once
+        dir(a_bytes, of, "a").own(4096 + 8192 + d),
         Row::file(8192, of, "top"),
     ];
     root.extend(small);
     let a = vec![
-        dir(b_bytes, a_bytes, "b"),
+        dir(b_bytes, a_bytes, "b").own(8192 + d),
         Row::file(8192, a_bytes, "h1"),
         Row::file(8192, a_bytes, "h2"),
         Row::file(4096, a_bytes, "f1"),
@@ -443,7 +558,7 @@ fn expected(f: &Fixture) -> Expected {
     }
     let title = match as_root {
         true => format!("/fixture  {total}{SCANNED}"),
-        false => format!("/fixture  {total}  (partial: 2 denied){SCANNED}"),
+        false => format!("/fixture  {total} | 2 folders unreadable (d){SCANNED}"),
     };
     Expected {
         title,
@@ -452,6 +567,16 @@ fn expected(f: &Fixture) -> Expected {
         b,
         big: vec![Row::file(1572864, big_bytes, "f")],
         c: vec![Row::file(12288, c_bytes, "f3")],
+    }
+}
+
+/// The fixture's title while a scan saved `age` ago is shown.
+fn saved_title(e: &Expected, age: &str) -> String {
+    let title = e.title.strip_suffix(SCANNED).unwrap();
+    let saved = format!("showing the scan saved {age} ago");
+    match title.split_once(" | ") {
+        Some((total, rest)) => format!("{total} | {saved} | {rest}"),
+        None => format!("{title} | {saved}"),
     }
 }
 
@@ -539,28 +664,50 @@ fn scanned_as(root: &Path, display: &str, desktop: Desktop, reclaimable: bool) -
     b
 }
 
-/// Columns of 40 cells or more have a bar of each row's share of its dir.
+/// Wider, every key fits.
 #[test]
 fn shows_the_finished_scan() {
     let f = fixture();
     let e = expected(&f);
     let mut b = scanned(f.dir.path(), Desktop::None);
     let columns = [&[][..], &e.root, &e.big];
-    let expected = screen_in(COLOR, WIDE, WIDE_COLUMNS, &e.title, columns, None, 0, HELP);
+    let expected = screen_in(
+        COLOR,
+        WIDE,
+        WIDE_COLUMNS,
+        &e.title,
+        columns,
+        None,
+        0,
+        WIDE_HELP,
+    );
     assert_eq!(render_in(WIDE, |f| b.draw(f, now())), expected);
 }
 
-/// Columns under 40 cells, as in 100 wide, have no bars: names need the
-/// room.
+/// Under 100 columns the parent column goes, under 60 the preview too,
+/// and the keys that do not fit.
 #[test]
-fn hides_the_bars_in_narrow_columns() {
+fn drops_columns_on_narrow_screens() {
     let f = fixture();
     let e = expected(&f);
     let mut b = scanned(f.dir.path(), Desktop::None);
-    let drawn = draw(&mut b, now());
-    let first: String = (0..33).map(|x| drawn[(x, 1)].symbol()).collect();
-    assert_eq!(first, format!("{:<33}", "   1.5 MiB  big/"));
-    assert_eq!(drawn, first_view(&e, &e.title, HELP));
+    press(&mut b, &[KeyCode::Down, KeyCode::Right]);
+    let narrow = Columns {
+        three: [(0, 0), (0, 47), (48, 32)],
+        root: [(0, 47), (48, 32)],
+    };
+    let keys = "hjkl move  i info  u units  space pick  p picks  r reveal  ? help  q quit";
+    let columns = [&[][..], &e.a, &e.b];
+    let expected = screen_in(COLOR, 80, narrow, &e.title, columns, None, 0, keys);
+    assert_eq!(render_in(80, |f| b.draw(f, now())), expected);
+
+    let one = Columns {
+        three: [(0, 0), (0, 59), (0, 0)],
+        root: [(0, 59), (0, 0)],
+    };
+    let keys = "hjkl move  i info  u units  space pick  ? help  q quit";
+    let expected = screen_in(COLOR, 59, one, &e.title, [&[], &e.a, &[]], None, 0, keys);
+    assert_eq!(render_in(59, |f| b.draw(f, now())), expected);
 }
 
 #[test]
@@ -618,8 +765,7 @@ fn shows_a_saved_scan_with_its_age() {
         false,
     );
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + 5 * 60);
-    let title = e.title.strip_suffix(SCANNED).unwrap();
-    let title = format!("{title}  saved 5 min ago");
+    let title = saved_title(&e, "5 min");
     assert_eq!(draw(&mut b, now), first_view(&e, &title, HELP));
 }
 
@@ -736,7 +882,7 @@ fn says_one_directory_could_not_be_read() {
     let drawn = draw(&mut b, now());
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let title = format!("/one  {}  (partial: 1 denied){SCANNED}", kib(2 * d));
+    let title = format!("/one  {} | 1 folder unreadable (d){SCANNED}", kib(2 * d));
     let head = "1 directory could not be read, so its contents are not counted:";
     let mut lines = text(&[&title, head], PANEL_HELP);
     lines[2] = Line::from_iter([
@@ -747,11 +893,11 @@ fn says_one_directory_could_not_be_read() {
 }
 
 /// A row of the volume list: `used`, coloured `color`, of `total`, `free`,
-/// then a bar of `tenths` `#`s, coloured the same, and `point`.
+/// then the used share `percent`, coloured the same, and `point`.
 fn volume(
     used: &str,
     [total, free]: [&str; 2],
-    tenths: usize,
+    percent: &str,
     color: Color,
     point: &str,
 ) -> Line<'static> {
@@ -759,8 +905,7 @@ fn volume(
     Line::from_iter([
         Span::styled(format!("{used:>10}"), color),
         Span::raw(format!(" used of {total:>10}  {free:>10} free  ")),
-        Span::styled("#".repeat(tenths), color),
-        Span::styled(".".repeat(10 - tenths), COLOR.dim()),
+        Span::styled(percent.to_string(), color),
         Span::raw(format!("  {point}")),
     ])
 }
@@ -802,12 +947,17 @@ fn lists_the_volumes() {
     ];
     let mut app = App::new(None, mounts, env(Desktop::Mac), None, false);
     let mut screen = text(&["volumes"], VOLUMES_HELP);
-    // the bars are used of total, to the nearest tenth: 8.6 and 1.6
-    screen[1] = volume("800.0 GiB", ["926.0 GiB", "126.0 GiB"], 9, Color::Red, "/");
+    screen[1] = volume(
+        "800.0 GiB",
+        ["926.0 GiB", "126.0 GiB"],
+        "86.4%",
+        Color::Red,
+        "/",
+    );
     screen[2] = volume(
         "10.0 GiB",
         ["64.0 GiB", "54.0 GiB"],
-        2,
+        "15.6%",
         Color::Red,
         "/Volumes/USB",
     );
@@ -831,7 +981,7 @@ fn shows_every_key_on_question_mark() {
     list[1] = volume(
         "10.0 GiB",
         ["64.0 GiB", "54.0 GiB"],
-        2,
+        "15.6%",
         Color::Red,
         "/Volumes/USB",
     );
@@ -853,6 +1003,8 @@ fn shows_every_key_on_question_mark() {
         "/                 filter the column by text; Enter keeps the filter, Esc clears it",
         "d                 list the directories that could not be read, and why",
         "t                 list the largest files",
+        "i                 show everything about the selected item",
+        "u                 switch sizes between GiB (1024) and GB (1000)",
         "?                 show or hide this help",
         "q Esc             quit; Esc closes a filter or list first, or goes back to the volume list",
         "click             select; in the parent or preview column, go there",
@@ -917,11 +1069,17 @@ fn clicks_select_and_scan_a_volume() {
     list[1] = volume(
         "10.0 GiB",
         ["64.0 GiB", "54.0 GiB"],
-        2,
+        "15.6%",
         Color::Red,
         "/Volumes/USB",
     );
-    list[2] = volume("0 B", ["100.0 GiB", "50.0 GiB"], 0, Color::DarkGray, &root);
+    list[2] = volume(
+        "0 B",
+        ["100.0 GiB", "50.0 GiB"],
+        "     ",
+        Color::DarkGray,
+        &root,
+    );
     draw_app(&mut app);
     app.mouse(click(5, 2), after(0));
     assert_eq!(draw_app(&mut app), plain(&list, Some(2)));
@@ -980,18 +1138,17 @@ fn guides_to_full_disk_access_once_before_the_first_scan() {
     let runs = press_app(&mut app, &[KeyCode::Char('o')]);
     assert_eq!(runs, [("/usr/bin/open".to_string(), vec![settings.into()])]);
 
-    // the browser of the volume, with what its scan did not find
+    // the browser of the volume: what its scan found of the bytes in use
     press_app(&mut app, &[KeyCode::Char('c')]);
     finish(&mut app);
     let root = f.dir.path().display().to_string();
-    let title = e.title.replacen("/fixture", &root, 1);
-    let mut browsing = first_view(&e, &title, HELP);
-    browsing.set_string(
-        0,
-        HEIGHT as u16 - 2,
-        "not accounted for: 1.0 MiB",
-        Style::new(),
+    let found = size(total.size(0));
+    let title = (e.title.replacen("/fixture", &root, 1)).replacen(
+        &found,
+        &format!("{found} of {}", size(used)),
+        1,
     );
+    let browsing = first_view(&e, &title, HELP);
     assert_eq!(draw_app(&mut app), browsing);
 
     // back on the list and in again: the same browser, no guide
@@ -999,7 +1156,7 @@ fn guides_to_full_disk_access_once_before_the_first_scan() {
     let used = size(used);
     let of = ["100.0 GiB", "50.0 GiB"];
     let mut list = text(&["volumes"], VOLUMES_HELP);
-    list[1] = volume(&used, of, 0, Color::Yellow, &root);
+    list[1] = volume(&used, of, "<0.1%", Color::Yellow, &root);
     assert_eq!(draw_app(&mut app), plain(&list, Some(1)));
     press_app(&mut app, &[KeyCode::Enter]);
     assert_eq!(draw_app(&mut app), browsing);
@@ -1051,7 +1208,8 @@ fn shows_reclaimable_sizes() {
 ///   venv/                           no label, no pyvenv.cfg
 /// ```
 ///
-/// The footer explains the label of the row at the cursor.
+/// Each label colours its name, and the line above the keys says what it
+/// means for the row at the cursor.
 #[test]
 fn labels_dirs_by_how_safe_deleting_them_is() {
     let dir = tempfile::tempdir().unwrap();
@@ -1098,83 +1256,129 @@ fn labels_dirs_by_how_safe_deleting_them_is() {
         std::thread::sleep(Duration::from_millis(1));
     }
     let of = 45056 + tag + 10 * d;
-    let label = |size, name, label| Row::new(size, of, name, Kind::Label(label));
+    let label = |size, name, label, why| Row::new(size, of, name, Kind::Label(label, why));
+    let python = "Python bytecode: rebuilt on import";
+    let venv = "a Python virtualenv: recreate it from the project's requirements";
+    let tagged = "the tool that made it marked it a cache (CACHEDIR.TAG): rebuilt on demand";
+    let downloads = "downloaded files, often old installers and archives";
     let rows = [
-        Row::dir(20480 + 2 * d, of, "rust"),
-        label(12288 + d, "node_modules", "cache: npm"),
+        Row::dir(20480 + 2 * d, of, "rust").own(4096 + d),
+        label(
+            12288 + d,
+            "node_modules",
+            "cache: npm",
+            "npm install rebuilds it",
+        ),
         Row::dir(8192 + d, of, "target"),
-        label(4096 + d, "__pycache__", "cache: python"),
-        label(tag + d, "tagged", "cache"),
-        label(d, ".venv", "cache: venv"),
-        Row::new(d, of, "Downloads", Kind::Known("downloads")),
+        label(4096 + d, "__pycache__", "cache: python", python),
+        label(tag + d, "tagged", "cache", tagged),
+        label(d, ".venv", "cache: venv", venv),
+        Row::new(d, of, "Downloads", Kind::Known("downloads", downloads)),
         Row::dir(d, of, "venv"),
     ];
+    let cargo = "Rust build output: cargo build rebuilds it";
     let rust = [
         Row::new(
             16384 + d,
             20480 + 2 * d,
             "target",
-            Kind::Label("cache: cargo"),
+            Kind::Label("cache: cargo", cargo),
         ),
         Row::file(4096, 20480 + 2 * d, "Cargo.toml"),
     ];
     let title = format!("/labels  {}{SCANNED}", kib(of));
-    let screen = |at: usize, preview: &[Row], footer: &str| {
+    let screen = |at: usize, preview: &[Row]| {
+        let columns = [&[][..], &rows, preview];
         screen_in(
             COLOR,
             WIDE,
             WIDE_COLUMNS,
             &title,
-            [&[], &rows, preview],
+            columns,
             None,
             at,
-            footer,
+            WIDE_HELP,
         )
     };
-    assert_eq!(
-        render_in(WIDE, |f| b.draw(f, now())),
-        screen(0, &rust, HELP)
-    );
-    // the row above the keys explains the label at the cursor
-    let explained = |at, preview: &[Row], tag: &str, color, why: &str, keys: &str| {
-        let mut buf = screen(at, preview, HELP);
-        let y = HEIGHT as u16 - 2;
-        buf.set_string(0, y, " ".repeat(WIDE), Style::new());
-        let mut line = Line::from_iter([
-            Span::styled(format!("[{tag}]"), COLOR.fg(color)),
-            Span::raw(format!(" {why}.  ")),
-        ]);
-        line.spans.extend(key_line(COLOR, keys).spans);
-        buf.set_line(0, y, &line, WIDE as u16);
-        buf
-    };
+    assert_eq!(render_in(WIDE, |f| b.draw(f, now())), screen(0, &rust));
+    // the line above the keys says what the label at the cursor means
     press(&mut b, &[KeyCode::Down]);
     let npm = [Row::file(12288, 12288 + d, "m")];
-    let why = "npm install rebuilds it";
-    assert_eq!(
-        render_in(WIDE, |f| b.draw(f, now())),
-        explained(
-            1,
-            &npm,
-            "cache: npm",
-            Color::Green,
-            why,
-            "r reveal to delete  space pick"
-        )
-    );
+    assert_eq!(render_in(WIDE, |f| b.draw(f, now())), screen(1, &npm));
     press(&mut b, &[KeyCode::End, KeyCode::Up]);
-    let why = "downloaded files, often old installers and archives";
-    assert_eq!(
-        render_in(WIDE, |f| b.draw(f, now())),
-        explained(
-            6,
-            &[],
-            "downloads",
-            Color::Yellow,
-            why,
-            "r reveal  space pick"
+    assert_eq!(render_in(WIDE, |f| b.draw(f, now())), screen(6, &[]));
+}
+
+/// `i` shows everything about the row at the cursor in a box over the
+/// columns; `i` again closes it.
+#[test]
+fn shows_everything_about_a_row_on_i() {
+    let f = fixture();
+    let e = expected(&f);
+    let mut b = scanned(f.dir.path(), Desktop::None);
+    press(&mut b, &[KeyCode::Char('i')]);
+    let path = f.dir.path().join("big").display().to_string();
+    let big = size(e.root[0].size);
+    let facts = [
+        ("path", path),
+        ("size", format!("{big} (own {big})")),
+        ("folders", "0 below".into()),
+        ("change", "none since opened 0 s ago".into()),
+    ];
+    // 72 wide, in the middle of the 17 rows of columns
+    let (x, y, width) = (14u16, 6u16, 72usize);
+    let edge = |text: &str| {
+        let text = format!(" {text} ");
+        let fill = width - 2 - text.len();
+        format!(
+            "+{}{text}{}+",
+            "-".repeat(fill / 2),
+            "-".repeat(fill - fill / 2)
         )
+    };
+    let mut expected = first_view(&e, &e.title, INFO_HELP);
+    expected.set_style(Rect::new(x, y, width as u16, 6), Style::reset());
+    expected.set_string(x, y, edge("big"), Style::new());
+    for (dy, (key, value)) in (1..).zip(&facts) {
+        let mut spans = vec![
+            Span::raw("| "),
+            Span::styled(format!("{key:<11}"), COLOR.dim()),
+        ];
+        spans.extend(cut(value, width - 4 - 11, Style::new(), COLOR));
+        expected.set_string(x, y + dy, " ".repeat(width), Style::new());
+        expected.set_line(x, y + dy, &Line::from(spans), width as u16 - 1);
+        expected.set_string(x + width as u16 - 1, y + dy, "|", Style::new());
+    }
+    expected.set_string(x, y + 5, edge("i or esc close"), Style::new());
+    assert_eq!(draw(&mut b, now()), expected);
+
+    press(&mut b, &[KeyCode::Char('i')]);
+    assert_eq!(draw(&mut b, now()), first_view(&e, &e.title, HELP));
+}
+
+/// `u` switches every size between GiB (1024) and GB (1000), and back.
+#[test]
+fn switches_units_on_u() {
+    let usb = mount(
+        "/Volumes/USB".as_ref(),
+        "exfat",
+        false,
+        64 * GIB,
+        10 * GIB,
+        54 * GIB,
     );
+    let mut app = App::new(None, vec![usb], env(Desktop::Mac), None, false);
+    let mut list = text(&["volumes"], VOLUMES_HELP);
+    let gib = ["64.0 GiB", "54.0 GiB"];
+    list[1] = volume("10.0 GiB", gib, "15.6%", Color::Red, "/Volumes/USB");
+    let binary = plain(&list, Some(1));
+    // 10 GiB is 10.7 GB
+    let gb = ["68.7 GB", "58.0 GB"];
+    list[1] = volume("10.7 GB", gb, "15.6%", Color::Red, "/Volumes/USB");
+    press_app(&mut app, &[KeyCode::Char('u')]);
+    assert_eq!(draw_app(&mut app), plain(&list, Some(1)));
+    press_app(&mut app, &[KeyCode::Char('u')]);
+    assert_eq!(draw_app(&mut app), binary);
 }
 
 /// `NO_COLOR`: no colours, but the selection is reversed, the parent
@@ -1233,7 +1437,7 @@ fn clicks_select_go_up_and_into_dirs() {
     let expected = screen(&e.title, [&[], &e.root, &e.a], None, 1, HELP);
     assert_eq!(draw(&mut b, now()), expected);
     // `b/`, in the preview of `a/`: into `a/`, `b/` selected
-    b.mouse(click(40, 1), after(1000));
+    b.mouse(click(65, 1), after(1000));
     let in_a = screen(&e.title, [&e.root, &e.a, &e.b], Some(1), 0, HELP);
     assert_eq!(draw(&mut b, now()), in_a);
     // `big/`, in the parent column: up to the root, `big/` selected
@@ -1279,16 +1483,16 @@ fn pages_and_scrolls_long_columns() {
     let parent = [Row::dir(many, many + d, "many")];
     // the wheel over the preview scrolls it, by a row
     draw(&mut b, now());
-    b.mouse(mouse(MouseEventKind::ScrollDown, 40, 5), now());
+    b.mouse(mouse(MouseEventKind::ScrollDown, 65, 5), now());
     let expected = screen(&title, [&[], &parent, &files[1..]], None, 0, HELP);
     assert_eq!(draw(&mut b, now()), expected);
 
-    // a page is the 18 rows shown
+    // a page is the 17 rows shown
     press(&mut b, &[KeyCode::Right, KeyCode::PageDown]);
-    let expected = screen(&title, [&parent, &files[1..], &[]], Some(0), 17, HELP);
+    let expected = screen(&title, [&parent, &files[1..], &[]], Some(0), 16, HELP);
     assert_eq!(draw(&mut b, now()), expected);
     press(&mut b, &[KeyCode::End]);
-    let expected = screen(&title, [&parent, &files[7..], &[]], Some(0), 17, HELP);
+    let expected = screen(&title, [&parent, &files[8..], &[]], Some(0), 16, HELP);
     assert_eq!(draw(&mut b, now()), expected);
     press(&mut b, &[KeyCode::Char('g')]);
     let expected = screen(&title, [&parent, &files, &[]], Some(0), 0, HELP);
@@ -1399,7 +1603,7 @@ fn follows_changes(inotify: bool, within: Duration, at: fn(&Path) -> PathBuf) {
         let delta = a as i64 - (d + 8192 + 4096) as i64;
         let change = match delta {
             0 => String::new(),
-            _ => format!("  ({} in {age})", signed(delta)),
+            _ => format!(" | {} since opened {age} ago", signed(delta)),
         };
         let scanned = SCANNED.replace("0 s", age);
         let title = format!("/live  {}{change}{scanned}", kib(a + d));
@@ -1561,13 +1765,12 @@ fn rescans_over_a_stopped_saved_scan() {
     );
     b.scan();
     let d = common::own_bytes(root);
-    let title = format!(
-        "/stopped  {}  saved 0 s ago (incomplete), rescanning...",
-        kib(d)
-    );
+    // the saved scan found nothing to head for
+    let title =
+        "/stopped  scanning 0 B | 0 folders | 0 s | showing the scan saved 0 s ago, incomplete";
     assert_eq!(
         draw(&mut b, now()),
-        screen(&title, [&[], &[], &[]], None, 0, HELP)
+        screen(title, [&[], &[], &[]], None, 0, HELP)
     );
 
     while b.poll(now(), Duration::ZERO) {
@@ -1606,11 +1809,11 @@ fn rescans_the_selected_dir_or_all() {
         let (a, total) = (x + d, x + bb + 2 * d);
         let change = match new {
             0 => String::new(),
-            _ => format!("  (+{} in 0 s)", kib(new)),
+            _ => format!(" | +{} since opened 0 s ago", kib(new)),
         };
         let title = format!("/fixture  {}{change}{SCANNED}{title_end}", kib(total));
         let root = [
-            Row::dir(a, total, "a").changed(new as i64),
+            Row::dir(a, total, "a").own(d).changed(new as i64),
             Row::dir(bb, total, "b"),
         ];
         let preview = [Row::dir(x, a, "x").changed(new as i64)];
@@ -1619,7 +1822,7 @@ fn rescans_the_selected_dir_or_all() {
     file(&root.join("a/x/new"), 8192);
 
     press(&mut b, &[KeyCode::Char('s')]);
-    assert_eq!(draw(&mut b, now()), shown(0, "  rescanning a/..."));
+    assert_eq!(draw(&mut b, now()), shown(0, " | rescanning a/..."));
     while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -1628,7 +1831,13 @@ fn rescans_the_selected_dir_or_all() {
     press(&mut b, &[KeyCode::Char('S')]);
     assert_eq!(
         draw(&mut b, now()),
-        screen("/fixture  scanning...", [&[], &[], &[]], None, 0, HELP)
+        screen(
+            "/fixture  scanning 0 B | 0 folders | 0 s",
+            [&[], &[], &[]],
+            None,
+            0,
+            HELP
+        )
     );
     while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
@@ -1737,7 +1946,10 @@ fn sorts_by_change_on_c() {
     let d = common::own_bytes(root);
     let (big, small) = (16384 + d, 12288 + d);
     let total = big + small + d;
-    let title = format!("/fixture  {}  (+8.0 KiB in 0 s){SCANNED}", kib(total));
+    let title = format!(
+        "/fixture  {} | +8.0 KiB since opened 0 s ago{SCANNED}",
+        kib(total)
+    );
     let bigs = Row::dir(big, total, "big");
     let smalls = Row::dir(small, total, "small").changed(8192);
     // `small/` was not shown before it changed, so its files' sizes then
@@ -1753,7 +1965,7 @@ fn sorts_by_change_on_c() {
     );
     assert_eq!(draw(&mut b, now()), by_size);
     press(&mut b, &[KeyCode::Char('c')]);
-    let title = format!("{title}  [by change]");
+    let title = format!("{title} | sorted by change");
     let by_change = screen(&title, [&[], &[smalls, bigs], &files], None, 0, HELP);
     assert_eq!(draw(&mut b, now()), by_change);
     press(&mut b, &[KeyCode::Char('c')]);

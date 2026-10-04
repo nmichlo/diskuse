@@ -36,7 +36,7 @@ Prebuilt binaries for macOS and Linux are also on the [releases](https://github.
 
 - As fast as dua and dumac, and faster than dust, pdu, gdu and ncdu (see [benchmarks](#-benchmarks))
 - Read-only, it never deletes anything. Reveal an item in Finder with `r` and delete it yourself
-- Three columns like OmniDiskSweeper, with sizes filling in while it scans
+- Three columns like OmniDiskSweeper, with sizes filling in while it scans, and how far a whole-disk scan has got
 - Updates live while open, with a column showing what grew or shrank
 - Labels for caches and other large folders, eg. `node_modules`, `target`, `.venv`, Xcode, Docker
 - Pick items with `space` to come back to later
@@ -53,6 +53,7 @@ Prebuilt binaries for macOS and Linux are also on the [releases](https://github.
 | `o` | open | `c` | sort by change |
 | `/` | filter | `s` / `S` | rescan folder / everything |
 | `t` | largest files | `d` | folders that could not be read |
+| `i` | everything about the selected item | `u` | sizes in GiB or GB |
 | `?` | help | `q` | quit |
 
 <br/>
@@ -64,6 +65,7 @@ diskuse scan ~/src           # print sizes, largest first
 diskuse scan ~/src --top 10  # also list the 10 largest files
 diskuse scan ~/src --json    # json output for scripts
 diskuse show ~/src           # print the last scan again
+diskuse scan ~/src --si      # sizes in kB, MB, GB (powers of 1000)
 ```
 
 Sizes are allocated bytes like `du -x`. Scans stay on one disk, never follow symlinks, and count hard links once.

@@ -56,6 +56,24 @@ fn scan_reports_exact_sizes() {
     }
 }
 
+/// ```text
+/// root/
+///   f    16384
+/// ```
+///
+/// `--si` prints powers of 1000.
+#[test]
+fn scan_prints_si_units() {
+    let dir = tempfile::tempdir().unwrap();
+    file(&dir.path().join("f"), 16384);
+    let total = 16384 + own_bytes(dir.path());
+    // 16.4 kB, or 20.5 kB with a 4096 B dir (ext4)
+    let kb = format!("{:.1} kB", total as f64 / 1000.0);
+    let root = dir.path().display();
+    let expected = format!("{kb:>10}  {root}\n{kb:>10}  [files]\n");
+    assert_eq!(scan(dir.path(), &["--si"]), expected);
+}
+
 #[test]
 fn scan_output_is_independent_of_thread_count() {
     let f = fixture();
