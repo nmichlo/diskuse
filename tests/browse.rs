@@ -30,7 +30,7 @@ const WIDTH: usize = 100;
 const HEIGHT: usize = 20;
 /// `(x, width)` of the parent, current and preview columns, 20 / 50 / 30
 /// of 100 columns, and at the root, of the current and preview columns,
-/// 60 / 40.
+/// 60 / 40. Wider, they are at most 30, 60 and 40 wide.
 const COLUMNS: Columns = Columns {
     three: [(0, 20), (21, 49), (71, 29)],
     root: [(0, 59), (60, 40)],
@@ -38,8 +38,8 @@ const COLUMNS: Columns = Columns {
 /// A wider terminal, for rows too long for 100 columns.
 const WIDE: usize = 130;
 const WIDE_COLUMNS: Columns = Columns {
-    three: [(0, 26), (27, 64), (92, 38)],
-    root: [(0, 77), (78, 52)],
+    three: [(0, 26), (27, 60), (88, 40)],
+    root: [(0, 60), (61, 40)],
 };
 /// The keys that fit in 100 columns, and in 130, of all of them.
 const HELP: &str = "hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  / filter  ? help  q quit";
@@ -311,41 +311,69 @@ impl Row {
         Line::from(spans)
     }
 
-    /// The line about the row at the cursor, above the keys, `width` wide.
+    /// The line about the row at the cursor, above the keys, `width` wide:
+    /// name, sizes, what could not be read and the label, each after a dim
+    /// `|`, in fewer words under 80 columns.
     fn status(&self, look: Look, width: usize) -> Line<'static> {
+        let narrow = width < 80;
         let (name, style) = self.name(look);
-        let mut sizes = size(self.size);
-        let mut notes = Vec::new();
+        let size_text = size(self.size);
+        let mut sizes = vec![Span::styled(size_text.clone(), look.size(&size_text))];
         if self.kind != Kind::File {
-            sizes += &format!(", own {}", size(self.own));
+            sizes.push(Span::styled("  own ", look.dim()));
+            sizes.push(Span::raw(size(self.own)));
         }
         if let Some(private) = self.private {
-            sizes += &format!(", deletes {}", size(private));
+            sizes.push(Span::styled("  deletes ", look.dim()));
+            sizes.push(Span::raw(size(private)));
         }
-        match self.kind {
-            Kind::Denied => notes.push("unreadable: EACCES".to_string()),
+        let mut parts = vec![vec![Span::styled(name, style)], sizes];
+        let warn = match (self.kind, narrow) {
+            (Kind::Denied, _) => Some("unreadable: EACCES"),
             // the fixture's partial dirs have one denied dir below
-            Kind::Dir { partial: true } => notes.push("1 folder below unreadable".into()),
-            Kind::Label(text, why) | Kind::Known(text, why) => notes.push(format!("{text}: {why}")),
+            (Kind::Dir { partial: true }, false) => Some("1 folder below unreadable"),
+            (Kind::Dir { partial: true }, true) => Some("1 unreadable"),
+            _ => None,
+        };
+        parts.extend(warn.map(|w| vec![Span::styled(w, look.fg(Color::Yellow))]));
+        let label = |text: &str, why: &str, color| {
+            // the reason in a few words: what follows its colon
+            let short = why.rsplit_once(": ").map_or(why, |(_, what)| what);
+            let text = match narrow {
+                true => text.to_string(),
+                false => format!("{text}: {short}"),
+            };
+            vec![Span::styled(text, look.fg(color))]
+        };
+        match self.kind {
+            Kind::Label(text, why) => parts.push(label(text, why, Color::Green)),
+            Kind::Known(text, why) => parts.push(label(text, why, Color::Yellow)),
             _ => {}
         }
-        let note = notes.join("  ");
-        let fixed = name.len() + 2 + sizes.len();
-        let mut spans = vec![Span::styled(name, style), Span::raw(format!("  {sizes}"))];
-        if !note.is_empty() && width > fixed + 2 {
-            spans.push(Span::raw("  "));
-            spans.extend(cut(&note, width - fixed - 2, Style::new(), look));
+        let used: usize = parts.iter().flatten().map(Span::width).sum();
+        assert!(used + 3 * (parts.len() - 1) <= width, "the tests' rows fit");
+        let mut spans = Vec::new();
+        for (i, part) in parts.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" | ", look.dim()));
+            }
+            spans.extend(part);
         }
         Line::from(spans)
     }
 }
 
 /// The top line: `root  first | second | ...`, the first part bold unless
-/// it is a running scan, each `|` dim.
-fn title_line(look: Look, title: &str) -> Line<'static> {
+/// it is a running scan, each `|` dim. In `width` columns, the last parts
+/// that do not fit are left out.
+fn title_line(look: Look, title: &str, width: usize) -> Line<'static> {
     let (root, rest) = title.split_once("  ").unwrap();
+    let mut parts: Vec<&str> = rest.split(" | ").collect();
+    while root.len() + 2 + parts.join(" | ").len() > width && parts.len() > 1 {
+        parts.pop();
+    }
     let mut spans = vec![Span::raw(format!("{root}  "))];
-    for (i, part) in rest.split(" | ").enumerate() {
+    for (i, part) in parts.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" | ", look.dim()));
         }
@@ -388,7 +416,7 @@ fn screen_in(
     footer: &str,
 ) -> Buffer {
     let mut buf = Buffer::empty(Rect::new(0, 0, width as u16, HEIGHT as u16));
-    buf.set_line(0, 0, &title_line(look, title), width as u16);
+    buf.set_line(0, 0, &title_line(look, title, width), width as u16);
     if let Some(row) = columns[1].get(current) {
         buf.set_line(0, HEIGHT as u16 - 2, &row.status(look, width), width as u16);
     }
@@ -437,7 +465,7 @@ fn plain(lines: &[Line<'static>], selected: Option<usize>) -> Buffer {
 /// top; a first line of a root, two spaces and more is a title.
 fn text(lines: &[&str], bottom: &str) -> Vec<Line<'static>> {
     let line = |(i, l): (usize, &&str)| match i == 0 && l.contains("  ") {
-        true => title_line(COLOR, l),
+        true => title_line(COLOR, l, WIDTH),
         false => Line::raw(l.to_string()),
     };
     let mut lines: Vec<Line> = lines.iter().enumerate().map(line).collect();
@@ -708,6 +736,38 @@ fn drops_columns_on_narrow_screens() {
     let keys = "hjkl move  i info  u units  space pick  ? help  q quit";
     let expected = screen_in(COLOR, 59, one, &e.title, [&[], &e.a, &[]], None, 0, keys);
     assert_eq!(render_in(59, |f| b.draw(f, now())), expected);
+}
+
+/// 200 columns: the parent, current and preview columns are 30, 60 and 40
+/// wide, and the room left shows the two levels above the parent.
+#[test]
+fn shows_older_levels_on_a_wide_screen() {
+    let f = fixture();
+    let e = expected(&f);
+    let mut b = scanned(f.dir.path(), Desktop::None);
+    press(
+        &mut b,
+        &[
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::Right,
+            KeyCode::Right,
+        ],
+    );
+    let wide = Columns {
+        three: [(62, 30), (93, 60), (154, 40)],
+        root: [(0, 60), (61, 40)],
+    };
+    let columns = [&e.b[..], &e.c, &[]];
+    let mut expected = screen_in(COLOR, 200, wide, &e.title, columns, Some(0), 0, WIDE_HELP);
+    // the root, with `a/` marked, then `a/`, with `b/` marked
+    for (x, rows, marked) in [(0, &e.root, 1), (31, &e.a, 0)] {
+        for (y, row) in (1..).zip(rows) {
+            expected.set_line(x, y, &row.line(COLOR, true, false, 30), 30);
+        }
+        expected.set_style(Rect::new(x, 1 + marked, 30, 1), COLOR.parent());
+    }
+    assert_eq!(render_in(200, |f| b.draw(f, now())), expected);
 }
 
 #[test]
