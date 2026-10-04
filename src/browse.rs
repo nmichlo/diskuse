@@ -16,7 +16,7 @@
 //! kept until another scan's tree is shown.
 
 use crate::access::{reason, terminal_app};
-use crate::labels::{self, Label, Tier};
+use crate::labels::{self, Label};
 use crate::live::{Event, Live, LiveOptions, Waker, live};
 use crate::report::{Units, largest_first};
 use crate::reveal::Desktop;
@@ -52,6 +52,18 @@ const PICKS_HELP: &str = "arrows/jk move  r reveal  o open  space unpick  p clos
 
 /// How a valid `CACHEDIR.TAG` starts (<https://bford.info/cachedir/>).
 const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// The width of the column of a dir above the parent, where there is room.
+const OLDER: usize = 30;
+
+/// A column of the browser.
+#[derive(Clone, Copy, PartialEq)]
+enum Col {
+    /// A dir above the current one, by how many levels: 1 is its parent.
+    Above(usize),
+    Current,
+    Preview,
+}
 
 /// Two clicks on one row within this are a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -733,20 +745,21 @@ impl Browser {
             }
             return;
         }
-        let mut columns = self.columns().into_iter().enumerate();
-        let Some((i, area)) = columns.find_map(|(i, a)| Some((i, a.filter(|a| a.contains(at))?)))
-        else {
+        let columns = self.columns();
+        let Some(&(col, area)) = columns.iter().find(|(_, a)| a.contains(at)) else {
             return;
         };
-        let Some((d, rows, offset, _)) = self.listing(i, area.height.into()) else {
+        let Some((d, rows, offset, _)) = self.listing(col, area.height.into()) else {
             return;
         };
         if key.is_some() {
             let n = rows.len();
-            match i {
-                0 => self.parent_offset = Some(moved(offset, n)),
-                1 => self.select(moved(self.cursor, n)),
-                _ => self.preview_offset = moved(offset, n),
+            match col {
+                Col::Above(1) => self.parent_offset = Some(moved(offset, n)),
+                // older levels keep the dir gone into in view
+                Col::Above(_) => {}
+                Col::Current => self.select(moved(self.cursor, n)),
+                Col::Preview => self.preview_offset = moved(offset, n),
             }
             self.refresh();
             return;
@@ -760,10 +773,10 @@ impl Browser {
             // into the row the first click selected
             self.enter();
         } else {
-            match i {
-                0 => self.back(),
-                1 => {}
-                _ => self.enter(),
+            match col {
+                Col::Above(level) => (0..level).for_each(|_| self.back()),
+                Col::Current => {}
+                Col::Preview => self.enter(),
             }
             self.selected = Some(name);
             self.preview_offset = 0;
@@ -802,7 +815,7 @@ impl Browser {
         ])
         .areas(frame.area());
         self.body = body;
-        let title = self.title(now, styles);
+        let title = self.title(now, styles, width);
         let buf = frame.buffer_mut();
         buf.set_line(top.x, top.y, &title, top.width);
         for (y, line) in (bottom.y..).zip(footer) {
@@ -836,15 +849,26 @@ impl Browser {
         }
         let height = body.height.into();
         self.offset = scroll(self.offset, self.cursor, height);
-        let marks = [Some(styles.parent), Some(styles.selected), None];
-        for (i, area) in self.columns().into_iter().enumerate() {
-            let listing = self.listing(i, height);
-            if let (Some(area), Some((d, rows, offset, mark))) = (area, listing) {
-                self.column(buf, area, d, rows, offset, mark.zip(marks[i]), i != 1);
+        let columns = self.columns();
+        // older levels come and go with the width
+        for &(col, _) in &columns {
+            if let Col::Above(level) = col {
+                self.ensure(self.dirs[self.dirs.len() - 1 - level]);
+            }
+        }
+        for &(col, area) in &columns {
+            let style = match col {
+                Col::Above(_) => Some(styles.parent),
+                Col::Current => Some(styles.selected),
+                Col::Preview => None,
+            };
+            if let Some((d, rows, offset, mark)) = self.listing(col, height) {
+                let side = col != Col::Current;
+                self.column(buf, area, d, rows, offset, mark.zip(style), side);
             }
         }
         if self.current.is_empty() && !self.filter.is_empty() {
-            let area = self.columns()[1].unwrap();
+            let (_, area) = columns.iter().find(|(c, _)| *c == Col::Current).unwrap();
             let text = format!("no matches for '{}'", self.filter);
             buf.set_stringn(area.x, area.y, text, area.width.into(), styles.dim);
         }
@@ -853,57 +877,84 @@ impl Browser {
         }
     }
 
-    /// Where the parent, current and preview columns are drawn: 20 / 50 / 30
-    /// of the width. At the root or under 100 columns there is no parent
-    /// column, and the other two take 60 / 40; under 60 columns, only the
-    /// current one shows.
-    fn columns(&self) -> [Option<Rect>; 3] {
-        let split = |weights: &[u16]| {
-            Layout::horizontal(weights.iter().map(|&w| Constraint::Fill(w)))
-                .spacing(1)
-                .split(self.body)
-        };
-        match self.body.width {
-            ..60 => [None, Some(self.body), None],
-            60..100 => {
-                let a = split(&[60, 40]);
-                [None, Some(a[0]), Some(a[1])]
-            }
-            _ if self.dirs.len() == 1 => {
-                let a = split(&[60, 40]);
-                [None, Some(a[0]), Some(a[1])]
+    /// The columns drawn, left to right, and where. With a dir above the
+    /// current one and 100 columns or more: its parent, the current dir
+    /// and the preview, 20 / 50 / 30 of the width but at most 30, 60 and
+    /// 40 wide; width left over shows older levels, 30 each, nearest
+    /// first. At the root or under 100 columns: current and preview, 60 /
+    /// 40, at most 60 and 40 wide. Under 60: the current one alone.
+    fn columns(&self) -> Vec<(Col, Rect)> {
+        let w = usize::from(self.body.width);
+        let above = self.dirs.len() - 1;
+        let share = |of: usize, tenths: usize| (of * tenths + 5) / 10;
+        let mut widths = match w {
+            ..60 => vec![(Col::Current, w)],
+            _ if w < 100 || above == 0 => {
+                let current = share(w - 1, 6).min(60);
+                vec![
+                    (Col::Current, current),
+                    (Col::Preview, (w - 1 - current).min(40)),
+                ]
             }
             _ => {
-                let a = split(&[20, 50, 30]);
-                [Some(a[0]), Some(a[1]), Some(a[2])]
+                let parent = share(w - 2, 2).min(30);
+                let current = share(w - 2, 5).min(60);
+                let preview = (w - 2 - parent - current).min(40);
+                vec![
+                    (Col::Above(1), parent),
+                    (Col::Current, current),
+                    (Col::Preview, preview),
+                ]
             }
+        };
+        // older levels where three capped columns leave room
+        let mut spare = w - (widths.iter().map(|&(_, w)| w + 1).sum::<usize>() - 1);
+        for level in 2..=above {
+            if widths.len() < 3 || spare < OLDER + 1 {
+                break;
+            }
+            widths.insert(0, (Col::Above(level), OLDER));
+            spare -= OLDER + 1;
         }
+        let mut x = self.body.x;
+        (widths.into_iter())
+            .map(|(col, width)| {
+                let area = Rect {
+                    x,
+                    width: width as u16,
+                    ..self.body
+                };
+                x += width as u16 + 1;
+                (col, area)
+            })
+            .collect()
     }
 
-    /// What column `i` of [`Browser::columns`] lists, in a column `height`
-    /// rows high: the dir, its rows, the first of them drawn, and the
-    /// marked one, if any. Nothing for the parent column at the root, or
-    /// the preview of a file.
+    /// What column `col` lists, in a column `height` rows high: the dir,
+    /// its rows, the first of them drawn, and the marked one, if any.
+    /// Nothing for the preview of a file.
     ///
-    /// The parent and preview columns show sizes and names only; the
-    /// current one adds each row's share and change.
-    fn listing(&self, i: usize, height: usize) -> Option<(u32, &[Row], usize, Option<usize>)> {
+    /// The columns of dirs above and the preview show sizes and names
+    /// only; the current one adds each row's share and change.
+    fn listing(&self, col: Col, height: usize) -> Option<(u32, &[Row], usize, Option<usize>)> {
         let d = self.dir();
-        match i {
-            0 => {
-                let [.., parent, _] = self.dirs[..] else {
-                    return None;
-                };
-                let rows = &self.rows[&parent];
-                let at = rows.iter().position(|r| r.item == Item::Dir(d)).unwrap();
-                let offset = match self.parent_offset {
+        match col {
+            Col::Above(level) => {
+                let at = self.dirs.len() - 1 - level;
+                let (dir, child) = (self.dirs[at], self.dirs[at + 1]);
+                let rows = &self.rows[&dir];
+                let marked = rows
+                    .iter()
+                    .position(|r| r.item == Item::Dir(child))
+                    .unwrap();
+                let offset = match self.parent_offset.filter(|_| level == 1) {
                     Some(offset) => offset.min(rows.len().saturating_sub(height)),
-                    None => scroll(0, at, height),
+                    None => scroll(0, marked, height),
                 };
-                Some((parent, rows, offset, Some(at)))
+                Some((dir, rows, offset, Some(marked)))
             }
-            1 => Some((d, &self.current, self.offset, Some(self.cursor))),
-            _ => {
+            Col::Current => Some((d, &self.current, self.offset, Some(self.cursor))),
+            Col::Preview => {
                 let Some(&Row {
                     item: Item::Dir(k), ..
                 }) = self.current.get(self.cursor)
@@ -938,6 +989,7 @@ impl Browser {
         let look = Look {
             side,
             changes: !side && rows.iter().any(|r| r.delta != 0),
+            percent: !side && self.body.width >= 50,
             units: self.env.units,
         };
         let lines = (area.y..area.bottom()).zip(rows.iter().enumerate().skip(offset));
@@ -1246,8 +1298,9 @@ impl Browser {
     }
 
     /// The top line: the root, its total, and what to know about it, each
-    /// part after a dim `|`, the parts with nothing to say left out.
-    fn title(&self, now: SystemTime, styles: &Styles) -> Line<'static> {
+    /// part after a dim `|`, the parts with nothing to say left out, and
+    /// in `width` columns the last ones that do not fit.
+    fn title(&self, now: SystemTime, styles: &Styles, width: usize) -> Line<'static> {
         let units = self.env.units;
         let fmt = |n| units.format(n);
         let mut parts: Vec<Span> = Vec::new();
@@ -1262,11 +1315,16 @@ impl Browser {
             };
             // a whole volume's used bytes, else the last scan's total
             let saved = self.view.as_ref().filter(|v| v.status != Status::Scanning);
-            match self
-                .used
-                .or(saved.map(|v| v.tree.size(0)))
-                .filter(|&g| g > 0)
-            {
+            let goal = self.used.or(saved.map(|v| v.tree.size(0)));
+            match goal.filter(|&g| g > 0) {
+                // a scan counts each copy of a cloned file, the used bytes
+                // count it once: past them, they are no target
+                Some(goal) if bytes > goal => {
+                    parts.extend([
+                        Span::raw(format!("scanning {}", fmt(bytes))),
+                        Span::raw(format!("{} folders", thousands(folders as u64))),
+                    ]);
+                }
                 Some(goal) => {
                     // the used bytes count more than a scan finds, so it
                     // stops short of 100%
@@ -1288,12 +1346,17 @@ impl Browser {
             }
         } else if let Some(view) = &self.view {
             let total = view.tree.size(0);
-            parts.push(match (view.status, self.used) {
-                (Status::Done, Some(used)) => {
-                    Span::styled(format!("{} of {}", fmt(total), fmt(used)), styles.dir)
-                }
-                _ => Span::styled(fmt(total), styles.dir),
-            });
+            match self.used.filter(|_| view.status == Status::Done) {
+                Some(used) if total <= used => parts.push(Span::styled(
+                    format!("{} of {}", fmt(total), fmt(used)),
+                    styles.dir,
+                )),
+                Some(used) => parts.extend([
+                    Span::styled(fmt(total), styles.dir),
+                    Span::raw(format!("disk reports {} in use", fmt(used))),
+                ]),
+                None => parts.push(Span::styled(fmt(total), styles.dir)),
+            }
         }
         if let Some(View {
             status: Status::Saved { at },
@@ -1350,16 +1413,20 @@ impl Browser {
         if let Some(why) = self.why {
             parts.push(Span::raw(format!("scanning again: {why}")));
         }
+        // on a narrow screen the last parts go, down to the first
+        let room = width.saturating_sub(width_of(&self.display) + 2);
+        let fits = |parts: &[Span]| {
+            let text: usize = parts.iter().map(Span::width).sum();
+            text + 3 * parts.len().saturating_sub(1) <= room
+        };
+        while !fits(&parts) && parts.len() > 1 {
+            parts.pop();
+        }
         let mut spans = vec![Span::raw(self.display.clone())];
         if !parts.is_empty() {
             spans.push(Span::raw("  "));
         }
-        for (i, part) in parts.into_iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" | ", styles.dim));
-            }
-            spans.push(part);
-        }
+        spans.extend(join_parts(parts.into_iter().map(|p| vec![p]).collect(), styles).spans);
         Line::from(spans)
     }
 
@@ -1379,56 +1446,71 @@ impl Browser {
         styles.keys(&keys)
     }
 
-    /// The line above the footer: everything about the row at the cursor
-    /// in one line of `width`, the name first, then its sizes, then what
-    /// else there is to know, each cut in the middle to fit.
+    /// The line above the footer, about the row at the cursor: its name,
+    /// sizes, what could not be read and its label, each after a dim `|`.
+    /// Under 80 columns in fewer words; parts that still do not fit are
+    /// left out from the end, down to the name and size.
     fn status(&self, styles: &Styles, width: usize) -> Option<Line<'static>> {
         let shown = self.panel.is_none() && self.top.is_none() && self.picking.is_none();
         let (row, name) = self.at_cursor().filter(|_| shown)?;
         let view = self.view.as_ref()?;
         let units = self.env.units;
+        let narrow = width < 80;
         let (name_style, name) = row_name(&row, name, styles);
-        let mut sizes = units.format(row.size);
-        let mut notes = Vec::new();
+        let size = Span::styled(units.format(row.size), styles.size(row.size, units));
+        let mut sizes = vec![size.clone()];
+        let mut warn = None;
         if let Item::Dir(k) = row.item {
-            sizes += &format!(", own {}", units.format(view.tree.own(k)));
-            if let Some(error) = view.tree.error(k) {
-                notes.push(format!("unreadable: {error}"));
+            sizes.push(Span::styled("  own ", styles.dim));
+            sizes.push(Span::raw(units.format(view.tree.own(k))));
+            let below = self.denied_below(k);
+            warn = if let Some(error) = view.tree.error(k) {
+                Some(format!("unreadable: {error}"))
             } else if view.tree.other_device(k) {
-                notes.push("on another device, not scanned".into());
-            }
-            let n = self.denied_below(k);
-            if n > 0 {
-                let folders = if n == 1 { "folder" } else { "folders" };
-                notes.push(format!(
-                    "{} {folders} below unreadable",
-                    thousands(n as u64)
-                ));
-            }
+                Some(match narrow {
+                    true => "other device".into(),
+                    false => "on another device, not scanned".into(),
+                })
+            } else if below > 0 {
+                let n = thousands(below as u64);
+                Some(match (narrow, below) {
+                    (true, _) => format!("{n} unreadable"),
+                    (false, 1) => "1 folder below unreadable".into(),
+                    (false, _) => format!("{n} folders below unreadable"),
+                })
+            } else {
+                None
+            };
         }
         if view.reclaimable {
-            sizes += &format!(", deletes {}", units.format(row.private));
+            sizes.push(Span::styled("  deletes ", styles.dim));
+            sizes.push(Span::raw(units.format(row.private)));
         }
-        if let Some(l) = row.label {
-            notes.push(format!("{}: {}", l.text, l.why));
+        let label = row.label.map(|l| {
+            let text = match narrow {
+                true => l.text.to_string(),
+                false => format!("{}: {}", l.text, l.short()),
+            };
+            vec![Span::styled(text, styles.label(l.tier))]
+        });
+        // least needed last
+        let mut parts: Vec<Vec<Span>> = vec![vec![Span::styled(name.clone(), name_style)], sizes];
+        parts.extend(warn.map(|w| vec![Span::styled(w, styles.warn)]));
+        parts.extend(label);
+        let fits = |parts: &[Vec<Span>]| {
+            let text: usize = parts.iter().flatten().map(Span::width).sum();
+            text + 3 * (parts.len() - 1) <= width
+        };
+        while !fits(&parts) && parts.len() > 2 {
+            parts.pop();
         }
-        let note = notes.join("  ");
-        // the name gets room first, then the sizes, then the notes
-        let gap = 2;
-        let fixed = width_of(&name) + gap + width_of(&sizes);
-        let mut spans = Vec::new();
-        if fixed > width {
-            spans.extend(cut_middle(&name, width, name_style, styles));
-        } else {
-            spans.push(Span::styled(name, name_style));
-            spans.push(Span::raw(format!("  {sizes}")));
-            let room = width - fixed;
-            if !note.is_empty() && room > gap {
-                spans.push(Span::raw("  "));
-                spans.extend(cut_middle(&note, room - gap, Style::new(), styles));
-            }
+        if !fits(&parts) {
+            // without `own`, then the name cut to what is left
+            parts[1] = vec![size];
+            let room = width.saturating_sub(parts[1][0].width() + 3);
+            parts[0] = cut_middle(&name, room, name_style, styles);
         }
-        Some(Line::from(spans))
+        Some(join_parts(parts, styles))
     }
 
     /// How many denied dirs are below dir `d`, not counting itself.
@@ -1558,6 +1640,8 @@ struct Look {
     /// The change since the session started, when some row of the column
     /// changed.
     changes: bool,
+    /// Each row's share of its dir, on a screen 50 columns wide or more.
+    percent: bool,
     units: Units,
 }
 
@@ -1568,10 +1652,8 @@ fn row_name(row: &Row, name: &[u8], styles: &Styles) -> (Style, String) {
     match row.item {
         Item::File(_) => (Style::new(), name),
         Item::Dir(_) => {
-            let style = match row.label.map(|l| l.tier) {
-                Some(Tier::System) => styles.dir.patch(styles.system),
-                Some(Tier::Cache) => styles.dir.patch(styles.cache),
-                Some(Tier::Known) => styles.dir.patch(styles.known),
+            let style = match row.label {
+                Some(l) => styles.dir.patch(styles.label(l.tier)),
                 None => styles.dir,
             };
             (style, name + "/")
@@ -1612,7 +1694,7 @@ fn line(
         });
     }
     spans.push(Span::raw(" "));
-    if !look.side {
+    if look.percent {
         spans.push(Span::styled(
             percent(row.size, total),
             styles.size(row.size, units),
@@ -1698,6 +1780,18 @@ fn cut_middle(text: &str, width: usize, style: Style, styles: &Styles) -> Vec<Sp
         Span::styled("\u{2026}", styles.dim),
         Span::styled(tail, style),
     ]
+}
+
+/// `parts` on one line, a dim ` | ` between them.
+fn join_parts(parts: Vec<Vec<Span<'static>>>, styles: &Styles) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" | ", styles.dim));
+        }
+        spans.extend(part);
+    }
+    Line::from(spans)
 }
 
 /// `n` with a comma every 3 digits: `48,210`.
@@ -2033,11 +2127,62 @@ mod tests {
             selected.add_modifier(Modifier::BOLD),
         );
         expected.set_line(60, 1, &dir_row("8.0 KiB", None, "x"), 40);
+        let dim = Style::new().fg(Color::DarkGray);
         let status = Line::from_iter([
             Span::styled("a/", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw("  12.0 KiB, own 4.0 KiB"),
+            Span::styled(" | ", dim),
+            Span::styled("12.0 KiB", Style::new().fg(Color::Green)),
+            Span::styled("  own ", dim),
+            Span::raw("4.0 KiB"),
         ]);
         expected.set_line(0, 18, &status, 100);
         assert_eq!(draw(&mut b), expected);
+    }
+
+    /// The top line of a 100-column screen, without the spaces after it.
+    fn title_of(b: &mut Browser) -> String {
+        let drawn = draw(b);
+        let line: String = (0..100).map(|x| drawn[(x, 0)].symbol()).collect();
+        line.trim_end().into()
+    }
+
+    /// A volume reports fewer bytes in use than a scan finds, as it counts
+    /// a cloned file once: then they are no target, and no total.
+    #[test]
+    fn a_scan_past_the_used_bytes_drops_them_as_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = Builder::new(dir.path().as_os_str().as_bytes(), false);
+        let env = Env {
+            desktop: Desktop::None,
+            terminal: "Terminal".into(),
+            cache: None,
+            inotify: true,
+            interval: Duration::ZERO,
+            units: Units::Binary,
+            color: true,
+            home: None,
+        };
+        let record = |parent, own| Record {
+            parent,
+            name: 0,
+            flags: 0,
+            errno: 0,
+            own,
+        };
+        tree.push(record(Record::NO_PARENT, 4096), 0);
+        let mut b = Browser::new(dir.path(), "/vol", env, None, Some(16384), false);
+        b.show(tree.progress().snapshot().unwrap(), Status::Scanning);
+        assert_eq!(
+            title_of(&mut b),
+            "/vol  scanning 4.0 KiB of ~16.0 KiB (25%)"
+        );
+        tree.push(record(0, 28672), 0);
+        b.show(tree.progress().snapshot().unwrap(), Status::Scanning);
+        assert_eq!(title_of(&mut b), "/vol  scanning 32.0 KiB | 2 folders");
+        b.show(tree.progress().snapshot().unwrap(), Status::Done);
+        assert_eq!(
+            title_of(&mut b),
+            "/vol  32.0 KiB | disk reports 16.0 KiB in use"
+        );
     }
 }

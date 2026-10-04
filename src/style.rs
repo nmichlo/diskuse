@@ -2,6 +2,7 @@
 //! table without colours is used: it keeps the modifiers, so the selection
 //! still shows.
 
+use crate::labels::Tier;
 use crate::report::Units;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -32,6 +33,8 @@ pub(crate) struct Styles {
     /// How much a dir grew or shrank since the session started.
     pub grew: Style,
     pub shrank: Style,
+    /// What to know about the row at the cursor: unreadable folders below.
+    pub warn: Style,
 }
 
 const COLOR: Styles = Styles {
@@ -58,6 +61,7 @@ const COLOR: Styles = Styles {
     picked: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     grew: Style::new().fg(Color::Red),
     shrank: Style::new().fg(Color::Green),
+    warn: Style::new().fg(Color::Yellow),
 };
 
 const PLAIN: Styles = Styles {
@@ -75,6 +79,7 @@ const PLAIN: Styles = Styles {
     picked: Style::new().add_modifier(Modifier::BOLD),
     grew: Style::new(),
     shrank: Style::new(),
+    warn: Style::new(),
 };
 
 impl Styles {
@@ -89,6 +94,15 @@ impl Styles {
     /// The style of a size of `bytes`, printed in `units`.
     pub fn size(&self, bytes: u64, units: Units) -> Style {
         self.sizes[units.tier(bytes)]
+    }
+
+    /// The colour of a label of `tier`, and of the name it is on.
+    pub fn label(&self, tier: Tier) -> Style {
+        match tier {
+            Tier::System => self.system,
+            Tier::Cache => self.cache,
+            Tier::Known => self.known,
+        }
     }
 
     /// A line of `key what` pairs, two spaces apart, each key highlighted.

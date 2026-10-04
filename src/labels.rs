@@ -1,6 +1,6 @@
-//! Labels for directories, shown after the name and coloured by how safe
-//! deleting one is: `node_modules/  [cache: npm]`. The selected row's
-//! label is explained in the footer. Only a label: diskuse deletes
+//! Labels for directories: each colours its dir's name by how safe
+//! deleting it is, and the line about the selected row says which label
+//! and why, `cache: npm | npm install rebuilds it`. Only a label: diskuse deletes
 //! nothing, so deleting one is done by hand, after a reveal.
 //!
 //! Three tiers, the first that matches wins:
@@ -32,8 +32,19 @@ pub(crate) struct Label {
     pub tier: Tier,
     /// After the name, in brackets.
     pub text: &'static str,
-    /// What it is and how to clean it up, for the footer.
+    /// What it is and how to clean it up, for the `i` box.
     pub why: &'static str,
+}
+
+impl Label {
+    /// `why` in a few words, for the line about the row at the cursor:
+    /// what to do about it, the part after its colon.
+    pub fn short(&self) -> &'static str {
+        match self.why.rsplit_once(": ") {
+            Some((_, what)) => what,
+            None => self.why,
+        }
+    }
 }
 
 /// What a cache rule needs besides the directory's name.
@@ -277,7 +288,7 @@ const CACHEDIR_TAG: Label = Label {
 const SYSTEM: Label = Label {
     tier: Tier::System,
     text: "system",
-    why: "macOS protects it (System Integrity Protection), so it cannot be deleted",
+    why: "macOS keeps it from being changed or deleted: protected by SIP",
 };
 
 /// `(path, label, why)`: a path below the home dir if it starts with `~/`,
