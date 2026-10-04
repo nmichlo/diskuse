@@ -36,6 +36,10 @@ pub struct Record {
     pub flags: u16,
     /// The errno of a [`Record::DENIED`] directory, else 0.
     pub errno: u16,
+    /// The low 32 bits of its inode number, which tell a dir from another
+    /// that took its name since. In the padding the record had: no bytes
+    /// more.
+    pub ino: u32,
     /// Allocated bytes of the directory itself plus all its non-directory
     /// entries. Hard links count once per scan.
     pub own: u64,

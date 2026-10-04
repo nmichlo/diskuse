@@ -1,0 +1,44 @@
+---
+source: tests/browse.rs
+---
+/fixture  1.5 MiB | 2 folders unreadable (d)
+  20.0 KiB+ b/
+   8.0 KiB  h1
+   8.0 KiB  h2
+   4.0 KiB  f1
+
+
+
+
+
+
+
+
+
+
+
+
+
+b/ | 20.0 KiB  own 8.0 KiB | 1 unreadable
+hjkl move  i info  u units  ? help  q quit
+--- styles ---
+ 0  10..17  BOLD
+ 0  17..20  DarkGray
+ 1   0..49  Indexed(231) on Indexed(25) BOLD
+ 2   0..10  Green
+ 2  10..11  DarkGray
+ 3   0..10  Green
+ 3  10..11  DarkGray
+ 4   0..10  Green
+ 4  10..11  DarkGray
+18   0..2   BOLD
+18   2..5   DarkGray
+18   5..13  Green
+18  13..19  DarkGray
+18  26..29  DarkGray
+18  29..41  Yellow
+19   0..4   Cyan BOLD
+19  11..12  Cyan BOLD
+19  19..20  Cyan BOLD
+19  28..29  Cyan BOLD
+19  36..37  Cyan BOLD

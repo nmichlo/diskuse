@@ -1,0 +1,31 @@
+---
+source: tests/browse.rs
+---
+/one  0 B | 1 folder unreadable (d)
+1 directory could not be read, so its contents are not counted:
+/tmp/du-XXXXXX/locked  permission denied (try sudo)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+arrows/jk scroll  d close  ? help  q quit
+--- styles ---
+ 0   6..9   BOLD
+ 0   9..12  DarkGray
+ 2  23..51  Red
+19   0..9   Cyan BOLD
+19  18..19  Cyan BOLD
+19  27..28  Cyan BOLD
+19  35..36  Cyan BOLD

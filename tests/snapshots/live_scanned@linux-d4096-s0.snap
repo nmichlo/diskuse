@@ -1,0 +1,45 @@
+---
+source: tests/browse.rs
+---
+/live  20.0 KiB | scanned 0 s ago
+  16.0 KiB  80.0% a/                                           8.0 KiB  gone
+                                                               4.0 KiB  keep
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+a/ | 16.0 KiB  own 16.0 KiB
+hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  / filter  ? help  q quit
+--- styles ---
+ 0   7..15  BOLD
+ 0  15..18  DarkGray
+ 1   0..59  Indexed(231) on Indexed(25) BOLD
+ 1  60..70  Green
+ 1  70..71  DarkGray
+ 2  60..70  Green
+ 2  70..71  DarkGray
+18   0..2   BOLD
+18   2..5   DarkGray
+18   5..13  Green
+18  13..19  DarkGray
+19   0..4   Cyan BOLD
+19  11..12  Cyan BOLD
+19  19..20  Cyan BOLD
+19  28..33  Cyan BOLD
+19  40..41  Cyan BOLD
+19  49..50  Cyan BOLD
+19  59..62  Cyan BOLD
+19  71..72  Cyan BOLD
+19  81..82  Cyan BOLD
+19  89..90  Cyan BOLD

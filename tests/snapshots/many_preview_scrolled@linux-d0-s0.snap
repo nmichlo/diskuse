@@ -1,0 +1,75 @@
+---
+source: tests/browse.rs
+---
+/many  1.3 MiB | scanned 0 s ago
+   1.3 MiB   100% many/                                       96.0 KiB  f24
+                                                              92.0 KiB  f23
+                                                              88.0 KiB  f22
+                                                              84.0 KiB  f21
+                                                              80.0 KiB  f20
+                                                              76.0 KiB  f19
+                                                              72.0 KiB  f18
+                                                              68.0 KiB  f17
+                                                              64.0 KiB  f16
+                                                              60.0 KiB  f15
+                                                              56.0 KiB  f14
+                                                              52.0 KiB  f13
+                                                              48.0 KiB  f12
+                                                              44.0 KiB  f11
+                                                              40.0 KiB  f10
+                                                              36.0 KiB  f09
+                                                              32.0 KiB  f08
+many/ | 1.3 MiB  own 1.3 MiB
+hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  / filter  ? help  q quit
+--- styles ---
+ 0   7..14  BOLD
+ 0  14..17  DarkGray
+ 1   0..59  Indexed(231) on Indexed(25) BOLD
+ 1  60..70  Green
+ 1  70..71  DarkGray
+ 2  60..70  Green
+ 2  70..71  DarkGray
+ 3  60..70  Green
+ 3  70..71  DarkGray
+ 4  60..70  Green
+ 4  70..71  DarkGray
+ 5  60..70  Green
+ 5  70..71  DarkGray
+ 6  60..70  Green
+ 6  70..71  DarkGray
+ 7  60..70  Green
+ 7  70..71  DarkGray
+ 8  60..70  Green
+ 8  70..71  DarkGray
+ 9  60..70  Green
+ 9  70..71  DarkGray
+10  60..70  Green
+10  70..71  DarkGray
+11  60..70  Green
+11  70..71  DarkGray
+12  60..70  Green
+12  70..71  DarkGray
+13  60..70  Green
+13  70..71  DarkGray
+14  60..70  Green
+14  70..71  DarkGray
+15  60..70  Green
+15  70..71  DarkGray
+16  60..70  Green
+16  70..71  DarkGray
+17  60..70  Green
+17  70..71  DarkGray
+18   0..5   BOLD
+18   5..8   DarkGray
+18   8..15  Yellow
+18  15..21  DarkGray
+19   0..4   Cyan BOLD
+19  11..12  Cyan BOLD
+19  19..20  Cyan BOLD
+19  28..33  Cyan BOLD
+19  40..41  Cyan BOLD
+19  49..50  Cyan BOLD
+19  59..62  Cyan BOLD
+19  71..72  Cyan BOLD
+19  81..82  Cyan BOLD
+19  89..90  Cyan BOLD

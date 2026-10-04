@@ -9,6 +9,16 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+/// A temp dir at `/tmp/du-XXXXXX`: the same place and length on every
+/// machine, so a screen that shows the path is the same everywhere but for
+/// its 6 random characters.
+pub fn tempdir() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("du-")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
 /// Writes a file of `len` bytes and requires the filesystem to allocate
 /// exactly `len` bytes for it, which the expected sizes below rely on.
 pub fn file(path: &Path, len: usize) {
@@ -63,7 +73,7 @@ pub fn kib(bytes: u64) -> String {
 /// ```
 #[cfg(target_os = "macos")]
 pub fn clones() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path();
     for d in ["orig", "clone", "solo"] {
         fs::create_dir(root.join(d)).unwrap();
@@ -124,7 +134,7 @@ pub struct Fixture {
 /// Both `locked/` dirs are left out when running as root, which can open
 /// anything.
 pub fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path();
     let as_root = rustix::process::geteuid().is_root();
     let locked = match as_root {

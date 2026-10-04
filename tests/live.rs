@@ -63,3 +63,35 @@ fn rescans_keep_the_tree_right_and_its_records_bounded() {
         );
     }
 }
+
+/// A file that grows in place changes no listing: the change is its
+/// folder's own bytes.
+#[test]
+fn a_file_growing_in_place_is_a_change_of_its_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    std::fs::create_dir(&a).unwrap();
+    common::file(&a.join("keep"), 4096);
+    let opts = LiveOptions {
+        interval: Duration::from_millis(50),
+        ..LiveOptions::default()
+    };
+    let mut live = live(dir.path(), opts);
+    loop {
+        if let Event::Ready(_) = next(&mut live) {
+            break;
+        }
+    }
+    // what was allocated, which may be more than was written
+    let grown = common::append(&a.join("keep"), 4096) - 4096;
+    let changes = loop {
+        if let Event::Changed(_, changes) = next(&mut live) {
+            break changes;
+        }
+    };
+    let a = std::fs::canonicalize(&a).unwrap();
+    let changes: Vec<_> = (changes.into_iter())
+        .map(|(path, by)| (std::fs::canonicalize(path).unwrap(), by))
+        .collect();
+    assert_eq!(changes, [(a, grown as i64)]);
+}

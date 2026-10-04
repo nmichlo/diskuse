@@ -1,0 +1,35 @@
+---
+source: tests/browse.rs
+---
+/picks  12.0 KiB | scanned 0 s ago
+2 picked, 12.0 KiB in all:
+   8.0 KiB  a
+   4.0 KiB  g
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+arrows/jk move  r reveal  o open  space unpick  p close  ? help  q quit
+--- styles ---
+ 0   8..16  BOLD
+ 0  16..19  DarkGray
+ 2   0..100 Indexed(231) on Indexed(25) BOLD
+ 3   0..10  Green
+19   0..9   Cyan BOLD
+19  16..17  Cyan BOLD
+19  26..27  Cyan BOLD
+19  34..39  Cyan BOLD
+19  48..49  Cyan BOLD
+19  57..58  Cyan BOLD
+19  65..66  Cyan BOLD

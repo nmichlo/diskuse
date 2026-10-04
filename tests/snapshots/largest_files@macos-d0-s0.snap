@@ -1,0 +1,38 @@
+---
+source: tests/browse.rs
+---
+/fixture  1.5 MiB | 2 folders unreadable (d)
+   1.5 MiB  big/f
+  12.0 KiB  a/b/c/f3
+   8.0 KiB  a/b/f2
+   8.0 KiB  a/h1
+   8.0 KiB  top
+   4.0 KiB  a/f1
+
+
+
+
+
+
+
+
+
+
+
+
+arrows/jk move  r reveal  o open  t close  ? help  q quit
+--- styles ---
+ 0  10..17  BOLD
+ 0  17..20  DarkGray
+ 1   0..100 Indexed(231) on Indexed(25) BOLD
+ 2   0..10  Green
+ 3   0..10  Green
+ 4   0..10  Green
+ 5   0..10  Green
+ 6   0..10  Green
+19   0..9   Cyan BOLD
+19  16..17  Cyan BOLD
+19  26..27  Cyan BOLD
+19  34..35  Cyan BOLD
+19  43..44  Cyan BOLD
+19  51..52  Cyan BOLD

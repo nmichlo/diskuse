@@ -1,0 +1,29 @@
+---
+source: tests/browse.rs
+---
+volumes
+   2.5 MiB used of  100.0 GiB    50.0 GiB free  <0.1%  /tmp/du-XXXXXX
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+arrows/jk move  enter scan  ? help  q quit
+--- styles ---
+ 1   0..100 Indexed(231) on Indexed(25) BOLD
+19   0..9   Cyan BOLD
+19  16..21  Cyan BOLD
+19  28..29  Cyan BOLD
+19  36..37  Cyan BOLD

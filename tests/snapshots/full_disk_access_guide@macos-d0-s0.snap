@@ -1,0 +1,24 @@
+---
+source: tests/browse.rs
+---
+Full Disk Access is off for iTerm
+
+macOS keeps some folders from every app without Full Disk Access: Mail, Messages, Safari, Time
+Machine and other apps' data. The scan lists them as denied, and their sizes are missing. To grant
+it, turn on iTerm in System Settings > Privacy & Security > Full Disk Access, then quit and reopen
+iTerm. diskuse stays read-only either way.
+
+o  open the Full Disk Access settings
+c  continue without
+q  quit
+
+
+
+
+
+
+
+
+
+
+--- styles ---

@@ -1,0 +1,53 @@
+---
+source: tests/browse.rs
+---
+/clones  3.0 MiB
+   1.0 MiB        0 B  33.3% clone/                            1.0 MiB  f
+   1.0 MiB        0 B  33.3% orig/
+   1.0 MiB    1.0 MiB  33.3% solo/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+clone/ | 1.0 MiB  own 1.0 MiB  deletes 0 B
+hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  / filter  ? help  q quit
+--- styles ---
+ 0   9..16  BOLD
+ 1   0..59  Indexed(231) on Indexed(25) BOLD
+ 1  60..70  Yellow
+ 1  70..71  DarkGray
+ 2   0..10  Yellow
+ 2  10..22  DarkGray
+ 2  23..28  Yellow
+ 2  29..34  BOLD
+ 3   0..10  Yellow
+ 3  10..11  DarkGray
+ 3  11..21  Yellow
+ 3  21..22  DarkGray
+ 3  23..28  Yellow
+ 3  29..34  BOLD
+18   0..6   BOLD
+18   6..9   DarkGray
+18   9..16  Yellow
+18  16..22  DarkGray
+18  29..39  DarkGray
+19   0..4   Cyan BOLD
+19  11..12  Cyan BOLD
+19  19..20  Cyan BOLD
+19  28..33  Cyan BOLD
+19  40..41  Cyan BOLD
+19  49..50  Cyan BOLD
+19  59..62  Cyan BOLD
+19  71..72  Cyan BOLD
+19  81..82  Cyan BOLD
+19  89..90  Cyan BOLD

@@ -70,6 +70,8 @@ unicode-width = { version = "0.2.2", optional = true }
 libc = "0.2.189"
 
 [dev-dependencies]
+insta = { version = "1.49.0", features = ["filters"] }
+proptest = "1.11.0"
 tempfile = "3.27.0"
 
 [profile.release]
