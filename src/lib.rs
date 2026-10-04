@@ -47,7 +47,7 @@ mod volume_list;
 #[cfg(feature = "cli")]
 pub use json::json;
 #[cfg(feature = "cli")]
-pub use report::report;
+pub use report::{Units, report};
 #[cfg(feature = "cli")]
 pub use store::{CacheDir, Saved, SavedFile, SavedTree};
 // the command's own parts: public for its tests and the Python console

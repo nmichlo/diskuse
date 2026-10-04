@@ -7,8 +7,10 @@ use std::fmt::Write;
 /// The root's total, then its direct children and its own files, largest
 /// first, ties by name bytes. `reclaimable` adds a second size column, the
 /// bytes not shared with a clone. `top` appends that many of the largest
-/// files. The first line says so if the tree is partial or stopped.
-pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> String {
+/// files. The first line says so if the tree is partial or stopped. Sizes
+/// print in `units`.
+pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>, units: Units) -> String {
+    let format_size = |n| units.format(n);
     let denied = count_denied(tree);
     let sizes = |size: u64, private: u64| match reclaimable {
         true => format!("{:>10}  {:>10}", format_size(size), format_size(private)),
@@ -83,17 +85,59 @@ pub(crate) fn suffix(tree: &impl ReadTree, id: u32) -> String {
     }
 }
 
-/// `n B` below 1 KiB, else one decimal in binary units.
-pub(crate) fn format_size(n: u64) -> String {
-    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
-    if n < 1024 {
-        return format!("{n} B");
+/// How sizes print: in powers of 1024 (KiB, MiB, GiB), as `du` and ncdu,
+/// or of 1000 (kB, MB, GB), as Finder and disk makers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Units {
+    #[default]
+    Binary,
+    Decimal,
+}
+
+impl Units {
+    fn base(self) -> u64 {
+        match self {
+            Self::Binary => 1024,
+            Self::Decimal => 1000,
+        }
     }
-    let mut v = n as f64 / 1024.0;
-    let mut unit = 0;
-    while v >= 1024.0 && unit < UNITS.len() - 1 {
-        v /= 1024.0;
-        unit += 1;
+
+    /// The other units.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Binary => Self::Decimal,
+            Self::Decimal => Self::Binary,
+        }
     }
-    format!("{v:.1} {}", UNITS[unit])
+
+    /// `n B` below 1 KiB (1 kB), else one decimal.
+    pub fn format(self, n: u64) -> String {
+        let units = match self {
+            Self::Binary => ["KiB", "MiB", "GiB", "TiB", "PiB"],
+            Self::Decimal => ["kB", "MB", "GB", "TB", "PB"],
+        };
+        let base = self.base();
+        if n < base {
+            return format!("{n} B");
+        }
+        let mut v = n as f64 / base as f64;
+        let mut unit = 0;
+        while v >= base as f64 && unit < units.len() - 1 {
+            v /= base as f64;
+            unit += 1;
+        }
+        format!("{v:.1} {}", units[unit])
+    }
+
+    /// Which unit `n` prints in: 0 from 1 GiB (GB) on, 1 from 1 MiB, 2
+    /// from 1 KiB, 3 below.
+    pub fn tier(self, n: u64) -> usize {
+        let base = self.base();
+        match n {
+            _ if n >= base.pow(3) => 0,
+            _ if n >= base.pow(2) => 1,
+            _ if n >= base => 2,
+            _ => 3,
+        }
+    }
 }
