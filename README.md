@@ -66,6 +66,7 @@ diskuse scan ~/src --top 10  # also list the 10 largest files
 diskuse scan ~/src --json    # json output for scripts
 diskuse show ~/src           # print the last scan again
 diskuse scan ~/src --si      # sizes in kB, MB, GB (powers of 1000)
+DISKUSE_LOG=/tmp/du.log diskuse ~   # a debug log: scans, and changes the OS missed
 ```
 
 Sizes are allocated bytes like `du -x`. Scans stay on one disk, never follow symlinks, and count hard links once.
@@ -87,10 +88,15 @@ tree.find(Path::new("a/b")); // Some(id)
 tree.largest_files(10); // [(path, bytes), ...]
 tree.files(0, false)?; // the root's files, listed from disk now
 
-for event in diskuse_core::live(path, LiveOptions::default()) {
+// a thread of its own scans and follows; events come to a handler,
+// here a channel
+let (tx, events) = std::sync::mpsc::channel();
+let live = diskuse_core::live(path, LiveOptions::default(), tx);
+for event in events {
     match event? {
         Event::Ready(tree) => {} // the scan finished
         Event::Changed(tree, changes) => {} // [(path, delta_bytes), ...]
+        Event::Missed(reason, path) => live.rescan(0), // the OS missed changes: your call
         _ => {}
     }
 }
@@ -113,12 +119,15 @@ tree.largest_files(10)  # [(path, bytes), ...]
 tree.files(0)  # the root's files, listed from disk now
 pyarrow.table(tree)  # every folder as a row, also polars and duckdb
 
-for event in diskuse.live("~/src"):  # or: async for
-    match event:
-        case diskuse.Event.Ready(tree):
-            ...  # the scan finished
-        case diskuse.Event.Changed(tree, changes):
-            ...  # [(path, delta_bytes), ...]
+with diskuse.live("~/src") as live:
+    for event in live:  # or: async for
+        match event:
+            case diskuse.Event.Ready(tree):
+                ...  # the scan finished
+            case diskuse.Event.Changed(tree, changes):
+                ...  # [(path, delta_bytes), ...]
+            case diskuse.Event.Missed(reason, path):
+                live.rescan(0)  # the OS missed changes: your call
 ```
 
 See [crates/diskuse-python/examples/tui.py](crates/diskuse-python/examples/tui.py) for a small browser written in Python with this API.

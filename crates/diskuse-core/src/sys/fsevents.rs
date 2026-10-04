@@ -275,6 +275,12 @@ extern "C" fn callback(
 
 fn event(flags: u32, path: &[u8]) -> Event {
     if flags & (USER_DROPPED | KERNEL_DROPPED) != 0 {
+        // the kernel's queue overflowed, or this process read too slowly
+        let by = match flags & KERNEL_DROPPED != 0 {
+            true => "KernelDropped",
+            false => "UserDropped",
+        };
+        log::warn!("fsevents: {by} at {}", String::from_utf8_lossy(path));
         Event::Lost(Reason::Dropped)
     } else if flags & EVENT_IDS_WRAPPED != 0 {
         Event::Lost(Reason::IdsWrapped)

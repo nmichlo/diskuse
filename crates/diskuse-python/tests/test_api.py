@@ -190,13 +190,28 @@ def test_cancelling_an_async_wait_stops_it_at_once(root: Path) -> None:
         async for e in live:
             if isinstance(e, diskuse.Event.Ready):
                 break
-        # nothing changes, so the wait is cancelled, and its thread must end
+        # nothing changes, so the wait is cancelled, and nothing is left waiting
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(anext(live), 0.3)
 
     start = time.monotonic()
     asyncio.run(run())
     assert time.monotonic() - start < 2
+
+
+def test_closing_ends_the_loops(root: Path) -> None:
+    with diskuse.live(root, interval=0.2) as live:
+        until_ready(live)
+    assert list(live) == []
+
+    async def run() -> str:
+        live = diskuse.live(root, interval=0.2)
+        async for e in live:
+            if isinstance(e, diskuse.Event.Ready):
+                live.close()
+        return "ended"
+
+    assert asyncio.run(run()) == "ended"
 
 
 def test_a_rescan_reports_the_folder_again(root: Path) -> None:

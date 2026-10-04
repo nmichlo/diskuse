@@ -2,16 +2,24 @@
 //! done, then the changes on disk as they happen, with no UI. The browser
 //! and the Python API's `diskuse.live` both run on it.
 //!
-//! Only changes the OS reports live are applied ([`crate::watch`]); when
-//! it drops some, the tree is scanned again. Where the OS keeps no record
-//! of a whole tree (Linux), only the folders given to [`Live::follow`] are
+//! One worker thread owns the tree. It hands each [`Event`] to a
+//! [`Handler`], and takes [`Live`]'s commands as messages, so no caller
+//! ever waits on a scan or holds a lock.
+//!
+//! Only changes the OS reports are applied ([`crate::watch`]). When it
+//! says it missed some, that is reported ([`Event::Missed`]) and nothing
+//! is scanned: whoever handles the events decides ([`Live::rescan`]).
+//! Where the OS keeps no record of a whole tree and its folders cannot
+//! all be watched (Linux), only those given to [`Live::follow`] are
 //! followed.
 
-use crate::scan::{Applied, ApplyError, ScanError, ScanOptions, Stop, scan_live};
+use crate::scan::{ApplyError, Pool, ScanError, ScanOptions, Stop, walk_root};
 use crate::tree::{Progress, ReadTree, Tree, below};
 use crate::watch::{Changes, DirWatch, Poll, TreeWatch, Watch};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -28,11 +36,12 @@ pub enum Event {
     /// went, with by how many bytes, by path. Empty if only folders of 0
     /// bytes did.
     Changed(Tree, Vec<(PathBuf, i64)>),
-    /// Changes were lost, so the tree is scanned again.
-    Rescanning(Reason),
+    /// Changes at or below this path were missed, so the tree may be out
+    /// of date there, until a [`Live::rescan`]. Later changes still come.
+    Missed(Reason, PathBuf),
 }
 
-/// Why a [`Live`] scans the whole tree again.
+/// Why changes were missed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     /// The OS dropped change events.
@@ -43,8 +52,8 @@ pub enum Reason {
     RootMoved,
     /// macOS did not replay the changes made while scanning within 30 s.
     NoReplay,
-    /// macOS asked for the whole tree to be scanned again.
-    MustScanAll,
+    /// The OS merged the changes below a folder into "scan it again".
+    MustScan,
 }
 
 impl std::fmt::Display for Reason {
@@ -54,7 +63,7 @@ impl std::fmt::Display for Reason {
             Self::IdsWrapped => "macOS event ids wrapped",
             Self::RootMoved => "the scanned dir moved",
             Self::NoReplay => "macOS did not replay the changes made while scanning within 30 s",
-            Self::MustScanAll => "macOS asked to scan all of it again",
+            Self::MustScan => "the OS asked to scan it again",
         })
     }
 }
@@ -90,46 +99,169 @@ impl Default for LiveOptions {
     }
 }
 
-/// A scan on its own thread: a full scan, with snapshots, or a folder
-/// listed again, without.
-struct Job {
-    /// The tree, and for a rescan what changed.
-    thread: JoinHandle<Result<(Tree, Applied), ApplyError>>,
-    progress: Option<Progress>,
-    /// The thread is done, so joining it does not block.
-    exited: bool,
+/// Takes the events of a [`Live`], on its worker thread: a closure, or the
+/// sender of a channel. After an error the tree is followed as before,
+/// unless the scan itself failed: then no event comes again.
+pub trait Handler: Send + 'static {
+    fn handle(&mut self, event: Result<Event, ScanError>);
 }
 
-/// What wakes [`Live::wait`] before its deadline.
-enum Wake {
+impl<F: FnMut(Result<Event, ScanError>) + Send + 'static> Handler for F {
+    fn handle(&mut self, event: Result<Event, ScanError>) {
+        self(event);
+    }
+}
+
+impl Handler for mpsc::Sender<Result<Event, ScanError>> {
+    fn handle(&mut self, event: Result<Event, ScanError>) {
+        // a receiver gone no longer wants them
+        let _ = self.send(event);
+    }
+}
+
+/// What the worker is told: by its [`Live`], and by the scan it runs.
+enum Msg {
+    Follow(Vec<u32>),
+    Relist(Vec<u32>),
+    Rescan(u32),
+    /// Stop, and answer with what a running scan found, if asked.
+    Stop(Option<mpsc::Sender<Option<Tree>>>),
     /// The running scan's progress, for snapshots.
     Started(Progress),
     /// The running scan's thread is done.
     Exited,
-    /// From a [`Waker`].
-    Interrupt,
 }
 
-/// Sends [`Wake::Exited`] when its scan thread is done, even by a panic.
-struct Exit(mpsc::Sender<Wake>);
+/// Sends [`Msg::Exited`] when its scan thread is done, even by a panic.
+struct Exit(mpsc::Sender<Msg>);
 
 impl Drop for Exit {
     fn drop(&mut self) {
-        // the receiver only goes away with the `Live`
-        let _ = self.0.send(Wake::Exited);
+        // the worker is gone only once it has joined this thread
+        let _ = self.0.send(Msg::Exited);
     }
 }
 
-/// Wakes a [`Live::wait`] on another thread, which then returns `None`:
-/// to cancel it, or to take its lock sooner. A wake while none waits makes
-/// the next return at once.
-#[derive(Clone)]
-pub struct Waker(mpsc::Sender<Wake>);
+/// What a [`Live`] reads of its worker without asking it.
+#[derive(Default)]
+struct Shared {
+    stop: AtomicBool,
+    /// The scans asked for and not yet done: the first, and each
+    /// [`Live::rescan`] since.
+    scans: AtomicUsize,
+    follows_all: AtomicBool,
+    done: AtomicBool,
+}
 
-impl Waker {
-    pub fn wake(&self) {
-        let _ = self.0.send(Wake::Interrupt);
+/// A live scan of a folder: see [`live`]. Dropping it stops the scan.
+pub struct Live {
+    tx: mpsc::Sender<Msg>,
+    shared: Arc<Shared>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// Scans `root` and keeps following it, on a thread of its own, which
+/// hands every event to `handler`: a snapshot at most every
+/// [`LiveOptions::interval`] while scanning, `Ready` as soon as the scan
+/// is done, then the changes of each interval as one `Changed`.
+pub fn live(root: &Path, opts: LiveOptions, handler: impl Handler) -> Live {
+    let (tx, rx) = mpsc::channel();
+    let shared = Arc::new(Shared::default());
+    // a scan runs from the start
+    shared.scans.store(1, Ordering::Relaxed);
+    let worker = Worker {
+        root: root.into(),
+        opts,
+        handler: Box::new(handler),
+        shared: Arc::clone(&shared),
+        tx: tx.clone(),
+        rx,
+        pool: None,
+        state: State::Done,
+    };
+    Live {
+        tx,
+        shared,
+        worker: Some(thread::spawn(move || worker.run())),
     }
+}
+
+impl Live {
+    fn send(&self, msg: Msg) {
+        // a worker gone has nothing left to do
+        let _ = self.tx.send(msg);
+    }
+
+    /// Where the OS keeps no record of a whole tree and not every folder
+    /// is watched, follows only the folders `dirs` of the latest tree,
+    /// from now on. Ignored otherwise.
+    pub fn follow(&self, dirs: &[u32]) {
+        self.send(Msg::Follow(dirs.into()));
+    }
+
+    /// Lists the folders `dirs` of the latest tree again, and reports what
+    /// changed in them: for a folder looked at after changes were missed.
+    /// What is below their subfolders stays as scanned.
+    pub fn relist(&self, dirs: &[u32]) {
+        self.send(Msg::Relist(dirs.into()));
+    }
+
+    /// Scans folder `dir` of the latest tree again, then reports it as
+    /// `Changed`; the root is scanned all over, with snapshots. Ignored
+    /// while a scan runs.
+    pub fn rescan(&self, dir: u32) {
+        self.shared.scans.fetch_add(1, Ordering::Relaxed);
+        self.send(Msg::Rescan(dir));
+    }
+
+    /// A scan runs or waits its turn: the first, or a [`Live::rescan`].
+    /// False only once its events were handed over.
+    pub fn busy(&self) -> bool {
+        self.shared.scans.load(Ordering::Relaxed) > 0
+    }
+
+    /// Every change below the root is followed, not only those in the
+    /// folders given to [`Live::follow`].
+    pub fn follows_all(&self) -> bool {
+        self.shared.follows_all.load(Ordering::Relaxed)
+    }
+
+    /// The scan failed, so no event comes again.
+    pub fn is_done(&self) -> bool {
+        self.shared.done.load(Ordering::Relaxed)
+    }
+
+    /// Stops, and returns what a running scan of the whole tree found.
+    pub fn stop(mut self) -> Option<Tree> {
+        let (tx, found) = mpsc::channel();
+        self.end(Some(tx));
+        found.recv().ok().flatten()
+    }
+
+    fn end(&mut self, reply: Option<mpsc::Sender<Option<Tree>>>) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.send(Msg::Stop(reply));
+        if let Some(worker) = self.worker.take() {
+            // a handler that panicked took the worker with it
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            self.end(None);
+        }
+    }
+}
+
+/// A scan of the whole tree on its own thread, so the worker goes on
+/// taking snapshots and commands.
+struct Job {
+    thread: JoinHandle<Result<Tree, ScanError>>,
+    progress: Option<Progress>,
+    started: Instant,
 }
 
 enum Follow {
@@ -141,247 +273,241 @@ enum Follow {
     Shown(DirWatch),
 }
 
-impl Follow {
-    /// Follows `tree` after [`Tree::apply`]: falls back to following only
-    /// the folders given to [`Live::follow`] once watches run out.
-    fn applied(&mut self, tree: &Tree, applied: &Applied, inotify: bool) {
-        if let Follow::Every(watch) = self
-            && !watch.applied(tree, applied)
-        {
-            *self = Follow::Shown(DirWatch::new(inotify));
-        }
-    }
-}
-
 enum State {
     Scanning(Job),
     Following {
         tree: Box<Tree>,
         follow: Box<Follow>,
-        /// A [`Live::rescan`] of one folder; changes wait meanwhile.
-        rescan: Option<Job>,
     },
     Done,
 }
 
-/// A live scan of a folder: see [`live`]. Dropping it stops the scan.
-pub struct Live {
+struct Worker {
     root: PathBuf,
     opts: LiveOptions,
-    stop: Arc<AtomicBool>,
+    handler: Box<dyn Handler>,
+    shared: Arc<Shared>,
+    /// For the scan thread to report to `rx`.
+    tx: mpsc::Sender<Msg>,
+    rx: mpsc::Receiver<Msg>,
+    /// The threads of every scan and update, once they could be started.
+    pool: Option<Arc<Pool>>,
     state: State,
-    /// When the next snapshot or check for changes is due.
-    due: Instant,
-    tx: mpsc::Sender<Wake>,
-    rx: mpsc::Receiver<Wake>,
 }
 
-/// Scans `root` and keeps following it: the events come from
-/// [`Live::wait`], or from iterating, which waits as long as it takes.
-pub fn live(root: &Path, opts: LiveOptions) -> Live {
-    let (tx, rx) = mpsc::channel();
-    let mut live = Live {
-        root: root.into(),
-        opts,
-        stop: Arc::default(),
-        state: State::Done,
-        due: Instant::now(),
-        tx,
-        rx,
-    };
-    live.start();
-    live
-}
+impl Worker {
+    fn run(mut self) {
+        match Pool::new(&self.opts.scan) {
+            Ok(pool) => self.pool = Some(Arc::new(pool)),
+            Err(e) => return self.fail(ScanError::ThreadPool(e)),
+        }
+        self.start();
+        // a tick takes a snapshot, or checks for changes
+        let interval = self.opts.interval.max(Duration::from_millis(1));
+        let mut due = Instant::now() + interval;
+        loop {
+            let now = Instant::now();
+            if now >= due {
+                due = now + interval;
+                self.tick();
+            }
+            match self.rx.recv_timeout(due.saturating_duration_since(now)) {
+                Ok(Msg::Stop(reply)) => return self.stop(reply),
+                Ok(msg) => self.on(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // the `Live` always says stop first
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
 
-impl Live {
+    fn emit(&mut self, event: Result<Event, ScanError>) {
+        self.handler.handle(event);
+    }
+
+    /// The scan cannot go on: says why, and that nothing comes after.
+    fn fail(&mut self, e: ScanError) {
+        log::warn!("live: {}: {e}", self.root.display());
+        self.state = State::Done;
+        self.emit(Err(e));
+        self.shared.done.store(true, Ordering::Relaxed);
+        self.scanned();
+    }
+
+    /// A scan asked for is done, or will not be: after its events.
+    fn scanned(&self) {
+        self.shared.scans.fetch_sub(1, Ordering::Relaxed);
+    }
+
     fn options(&self) -> ScanOptions {
-        let stop = Arc::clone(&self.stop);
+        let shared = Arc::clone(&self.shared);
         ScanOptions {
-            stop: Stop::new(move || stop.load(Ordering::Relaxed)),
+            stop: Stop::new(move || shared.stop.load(Ordering::Relaxed)),
             ..self.opts.scan.clone()
         }
     }
 
-    /// Runs `scan` on its own thread, which wakes [`Live::wait`] with its
-    /// progress and once done.
-    fn spawn(
-        &self,
-        scan: impl FnOnce(&dyn Fn(Progress)) -> Result<(Tree, Applied), ApplyError> + Send + 'static,
-    ) -> Job {
-        let tx = self.tx.clone();
-        let thread = thread::spawn(move || {
-            let exit = Exit(tx);
-            scan(&|p| {
-                let _ = exit.0.send(Wake::Started(p));
-            })
-        });
-        Job {
-            thread,
-            progress: None,
-            exited: false,
-        }
-    }
-
+    /// Scans the whole tree on a thread of its own.
     fn start(&mut self) {
         let (root, opts) = (self.root.clone(), self.options());
-        self.state = State::Scanning(self.spawn(move |progress| {
-            let tree = scan_live(&root, &opts, progress).map_err(ApplyError::Scan)?;
-            Ok((tree, Applied::default()))
-        }));
+        let pool = Arc::clone(self.pool.as_ref().unwrap());
+        let tx = self.tx.clone();
+        log::info!("live: scanning {}", root.display());
+        let thread = thread::spawn(move || {
+            let exit = Exit(tx);
+            walk_root(&pool, &root, &opts, true, |p| {
+                let _ = exit.0.send(Msg::Started(p));
+            })
+        });
+        self.shared.follows_all.store(false, Ordering::Relaxed);
+        self.state = State::Scanning(Job {
+            thread,
+            progress: None,
+            started: Instant::now(),
+        });
     }
 
-    /// Wakes a [`Live::wait`] from another thread.
-    pub fn waker(&self) -> Waker {
-        Waker(self.tx.clone())
-    }
-
-    /// Takes in what woke [`Live::wait`] without waiting; whether it was a
-    /// [`Waker`].
-    fn take(&mut self, mut wake: Option<Wake>) -> bool {
-        let mut interrupted = false;
-        while let Some(w) = wake.or_else(|| self.rx.try_recv().ok()) {
-            let job = match &mut self.state {
-                State::Scanning(job)
-                | State::Following {
-                    rescan: Some(job), ..
-                } => Some(job),
-                _ => None,
-            };
-            match (w, job) {
-                (Wake::Interrupt, _) => interrupted = true,
-                (Wake::Started(p), Some(job)) => job.progress = Some(p),
-                (Wake::Exited, Some(job)) => job.exited = true,
-                // each scan is joined after its last wake, before the next starts
-                (_, None) => unreachable!("a wake with no scan running"),
-            }
-            wake = None;
-        }
-        interrupted
-    }
-
-    /// The next event within `timeout`, or `None`. A snapshot comes at
-    /// most every [`LiveOptions::interval`] while scanning, `Ready` as
-    /// soon as the scan is done, then the changes of each interval as one
-    /// `Changed`. After an error the tree is followed as before, unless
-    /// the scan itself failed: then [`Live::is_done`].
-    /// Returns `None` early when woken by a [`Waker`].
-    pub fn wait(&mut self, timeout: Duration) -> Option<Result<Event, ScanError>> {
-        let until = Instant::now().checked_add(timeout);
-        let mut wake = None;
-        loop {
-            if self.take(wake.take()) {
-                return None;
-            }
-            let now = Instant::now();
-            let due = now >= self.due;
-            if due {
-                self.due = now + self.opts.interval;
-            }
-            if let Some(event) = self.step(due) {
-                return Some(event);
-            }
-            let now = Instant::now();
-            if self.is_done() || until.is_some_and(|u| now >= u) {
-                return None;
-            }
-            let next = until.map_or(self.due, |u| u.min(self.due));
-            match self.rx.recv_timeout(next.saturating_duration_since(now)) {
-                Ok(w) => wake = Some(w),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!("`Live` holds a sender"),
-            }
-        }
-    }
-
-    fn step(&mut self, due: bool) -> Option<Result<Event, ScanError>> {
-        match &mut self.state {
-            State::Done => None,
-            State::Scanning(job) => {
-                if job.exited {
-                    let State::Scanning(job) = std::mem::replace(&mut self.state, State::Done)
-                    else {
-                        unreachable!()
-                    };
-                    return Some(self.finish(job));
-                }
-                let snapshot = due.then(|| job.progress.as_ref()?.snapshot()).flatten();
-                snapshot.map(|tree| Ok(Event::Scanning(tree)))
-            }
-            State::Following {
-                tree,
-                follow,
-                rescan: rescan @ Some(_),
-            } => {
-                if !rescan.as_ref().unwrap().exited {
-                    return None;
-                }
-                match join(rescan.take().unwrap()) {
-                    Ok((new, applied)) => {
-                        **tree = new;
-                        follow.applied(tree, &applied, self.opts.inotify);
-                        let changes = applied.deltas.unwrap_or_default();
-                        Some(Ok(Event::Changed(shared(tree), changes)))
-                    }
-                    Err(e) => Some(self.failed(e)),
-                }
-            }
-            State::Following { .. } if !due => None,
-            State::Following {
-                tree,
-                follow,
-                rescan: None,
-            } => {
-                let poll = match &mut **follow {
-                    Follow::All(watch) => watch.poll(),
-                    Follow::Every(watch) => watch.poll(tree),
-                    Follow::Shown(dirs) => dirs.poll(tree),
-                };
-                let changes = match poll {
-                    Poll::Wait => return None,
-                    Poll::Changes(c) if c.is_empty() => return None,
-                    Poll::Changes(c) => c,
-                    Poll::Lost(why) => {
-                        self.start();
-                        return Some(Ok(Event::Rescanning(why)));
-                    }
-                };
-                let started = Instant::now();
-                let opts = self.options();
-                let State::Following { tree, follow, .. } = &mut self.state else {
-                    unreachable!()
-                };
-                let applied = tree.apply(&changes, &opts);
-                if let Follow::Shown(dirs) = &mut **follow {
-                    dirs.listed(started.elapsed());
-                }
-                match applied {
-                    Ok(applied) => {
-                        follow.applied(tree, &applied, self.opts.inotify);
-                        Some(Ok(Event::Changed(shared(tree), applied.deltas?)))
-                    }
-                    Err(e) => Some(self.failed(e)),
-                }
-            }
-        }
-    }
-
-    /// A full scan when only that brings the tree up to date, or the error.
-    fn failed(&mut self, e: ApplyError) -> Result<Event, ScanError> {
-        match e {
-            ApplyError::FullScan => {
-                self.start();
-                Ok(Event::Rescanning(Reason::MustScanAll))
-            }
-            ApplyError::Scan(e) => Err(e),
-        }
-    }
-
-    /// `Ready`, and the tree followed from then, or the scan's error.
-    fn finish(&mut self, job: Job) -> Result<Event, ScanError> {
-        let tree = match join(job) {
-            Ok((tree, _)) => tree,
-            Err(e) => return self.failed(e),
+    fn stop(self, reply: Option<mpsc::Sender<Option<Tree>>>) {
+        let found = match self.state {
+            State::Scanning(job) => join(job).ok(),
+            _ => None,
         };
+        if let Some(reply) = reply {
+            let _ = reply.send(found);
+        }
+    }
+
+    fn on(&mut self, msg: Msg) {
+        // ids of an earlier tree may be past this one's end
+        let there = |tree: &Tree, d: &u32| (*d as usize) < tree.len() && !tree.gone(*d);
+        match (msg, &mut self.state) {
+            (Msg::Started(progress), State::Scanning(job)) => job.progress = Some(progress),
+            (Msg::Exited, State::Scanning(_)) => self.finish(),
+            (Msg::Follow(mut dirs), State::Following { tree, follow }) => {
+                dirs.retain(|d| there(tree, d));
+                if let Follow::Shown(watch) = &mut **follow {
+                    watch.show(tree, &dirs);
+                }
+            }
+            (Msg::Relist(mut dirs), State::Following { tree, .. }) => {
+                dirs.retain(|d| there(tree, d));
+                let changes = Changes {
+                    dirs,
+                    ..Changes::default()
+                };
+                self.apply(&changes, false);
+            }
+            // its own scan, done when its thread is
+            (Msg::Rescan(0), State::Following { .. }) => self.start(),
+            (Msg::Rescan(dir), State::Following { tree, .. }) if there(tree, &dir) => {
+                let changes = Changes {
+                    rescan: vec![below(&**tree, dir).into()],
+                    ..Changes::default()
+                };
+                log::info!("live: scanning {} again", tree.path(dir).display());
+                self.apply(&changes, true);
+                self.scanned();
+            }
+            // while a scan runs, after one failed, or of a folder gone
+            (Msg::Rescan(_), _) => self.scanned(),
+            // nothing to follow or list then either. A scan thread's last
+            // words come before the next one starts
+            _ => {}
+        }
+    }
+
+    /// A snapshot of the running scan, or the changes on disk since the
+    /// last one.
+    fn tick(&mut self) {
+        let poll = match &mut self.state {
+            State::Done => return,
+            State::Scanning(job) => {
+                let snapshot = job.progress.as_ref().and_then(Progress::snapshot);
+                if let Some(tree) = snapshot {
+                    self.emit(Ok(Event::Scanning(tree)));
+                }
+                return;
+            }
+            State::Following { tree, follow } => match &mut **follow {
+                Follow::All(watch) => watch.poll(),
+                Follow::Every(watch) => watch.poll(tree),
+                Follow::Shown(dirs) => dirs.poll(tree),
+            },
+        };
+        match poll {
+            Poll::Wait => {}
+            Poll::Lost(why) => self.missed(why, self.root.clone()),
+            Poll::Changes(mut changes) => {
+                // not scanned again by itself: whoever listens decides
+                for path in std::mem::take(&mut changes.rescan) {
+                    let below = Path::new(OsStr::from_bytes(&path));
+                    self.missed(Reason::MustScan, self.root.join(below));
+                }
+                if !changes.is_empty() {
+                    self.apply(&changes, false);
+                }
+            }
+        }
+    }
+
+    fn missed(&mut self, why: Reason, path: PathBuf) {
+        log::warn!("live: missed changes at {}: {why}", path.display());
+        self.emit(Ok(Event::Missed(why, path)));
+    }
+
+    /// Brings the tree up to date with `changes`, and reports what changed
+    /// if anything did, or if `always`.
+    fn apply(&mut self, changes: &Changes, always: bool) {
+        let opts = self.options();
+        let pool = Arc::clone(self.pool.as_ref().unwrap());
+        let State::Following { tree, follow } = &mut self.state else {
+            return;
+        };
+        let started = Instant::now();
+        let applied = tree.apply(changes, &opts, &pool);
+        if let Follow::Shown(dirs) = &mut **follow {
+            dirs.listed(started.elapsed());
+        }
+        match applied {
+            Ok(applied) => {
+                // out of watches: only the folders given to `follow`, then
+                if let Follow::Every(watch) = &mut **follow
+                    && !watch.applied(tree, &applied)
+                {
+                    log::warn!("live: out of inotify watches, following the folders shown");
+                    **follow = Follow::Shown(DirWatch::new(self.opts.inotify));
+                    self.shared.follows_all.store(false, Ordering::Relaxed);
+                }
+                if always || applied.deltas.is_some() {
+                    let event = Event::Changed(shared(tree), applied.deltas.unwrap_or_default());
+                    self.emit(Ok(event));
+                }
+            }
+            // the changes reach the root: reported, like every scan that
+            // only a caller starts
+            Err(ApplyError::FullScan) => self.missed(Reason::MustScan, self.root.clone()),
+            Err(ApplyError::Scan(e)) => self.emit(Err(e)),
+        }
+    }
+
+    /// The scan thread is done: `Ready`, and the tree followed from then,
+    /// or its error.
+    fn finish(&mut self) {
+        let State::Scanning(job) = std::mem::replace(&mut self.state, State::Done) else {
+            unreachable!("only a scan exits");
+        };
+        let took = job.started.elapsed();
+        let tree = match join(job) {
+            Ok(tree) => tree,
+            Err(e) => return self.fail(e),
+        };
+        log::info!(
+            "live: scanned {} in {:.1} s: {} folders, {} bytes",
+            self.root.display(),
+            took.as_secs_f64(),
+            tree.len(),
+            tree.size(0)
+        );
         let ignore = self.opts.ignore.as_deref();
         let every = || match self.opts.inotify && !self.opts.shown_only {
             true => TreeWatch::start(&tree),
@@ -394,118 +520,20 @@ impl Live {
                 None => Follow::Shown(DirWatch::new(self.opts.inotify)),
             },
         });
+        let all = !matches!(*follow, Follow::Shown(_));
+        self.shared.follows_all.store(all, Ordering::Relaxed);
         let event = Event::Ready(shared(&tree));
         self.state = State::Following {
             tree: Box::new(tree),
             follow,
-            rescan: None,
         };
-        Ok(event)
-    }
-
-    /// Where the OS keeps no record of a whole tree, follows only the
-    /// folders `dirs` of the latest tree, from now on. Ignored otherwise.
-    pub fn follow(&mut self, dirs: &[u32]) {
-        if let State::Following { tree, follow, .. } = &mut self.state
-            && let Follow::Shown(watch) = &mut **follow
-        {
-            watch.show(tree, dirs);
-        }
-    }
-
-    /// Scans folder `dir` of the latest tree again on another thread,
-    /// then reports it as `Changed`; the root is scanned all over, with
-    /// snapshots. Ignored while a scan runs.
-    pub fn rescan(&mut self, dir: u32) {
-        let opts = self.options();
-        let State::Following {
-            tree, rescan: None, ..
-        } = &mut self.state
-        else {
-            return;
-        };
-        if dir == 0 {
-            return self.start();
-        }
-        let changes = Changes {
-            rescan: vec![below(&**tree, dir).into()],
-            ..Changes::default()
-        };
-        let mut tree = (**tree).clone();
-        let job = self.spawn(move |_| {
-            let deltas = tree.apply(&changes, &opts)?;
-            Ok((tree, deltas))
-        });
-        if let State::Following { rescan, .. } = &mut self.state {
-            *rescan = Some(job);
-        }
-    }
-
-    /// A scan runs: the first, a [`Live::rescan`], or after lost changes.
-    pub fn busy(&self) -> bool {
-        match &self.state {
-            State::Scanning(_) => true,
-            State::Following { rescan, .. } => rescan.is_some(),
-            State::Done => false,
-        }
-    }
-
-    /// Every change below the root is followed, not only those in the
-    /// folders given to [`Live::follow`].
-    pub fn follows_all(&self) -> bool {
-        match &self.state {
-            State::Following { follow, .. } => !matches!(**follow, Follow::Shown(_)),
-            _ => false,
-        }
-    }
-
-    /// The scan failed, so no event comes again.
-    pub fn is_done(&self) -> bool {
-        matches!(self.state, State::Done)
-    }
-
-    /// Stops a running scan, and returns what it found, if it was one.
-    pub fn stop(mut self) -> Option<Tree> {
-        self.stop.store(true, Ordering::Relaxed);
-        match std::mem::replace(&mut self.state, State::Done) {
-            State::Scanning(job)
-            | State::Following {
-                rescan: Some(job), ..
-            } => join(job).ok().map(|(tree, _)| tree),
-            _ => None,
-        }
+        // told first, so whoever sees no scan running has the tree
+        self.emit(Ok(event));
+        self.scanned();
     }
 }
 
-impl Iterator for Live {
-    type Item = Result<Event, ScanError>;
-
-    /// The next event, however long it takes; `None` once
-    /// [`Live::is_done`].
-    fn next(&mut self) -> Option<Self::Item> {
-        while !self.is_done() {
-            if let Some(event) = self.wait(Duration::MAX) {
-                return Some(event);
-            }
-        }
-        None
-    }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        match std::mem::replace(&mut self.state, State::Done) {
-            State::Scanning(job)
-            | State::Following {
-                rescan: Some(job), ..
-            } => drop(join(job)),
-            _ => {}
-        }
-    }
-}
-
-fn join(job: Job) -> Result<(Tree, Applied), ApplyError> {
+fn join(job: Job) -> Result<Tree, ScanError> {
     match job.thread.join() {
         Ok(done) => done,
         Err(panic) => std::panic::resume_unwind(panic),

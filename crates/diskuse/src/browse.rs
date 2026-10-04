@@ -20,7 +20,7 @@ use crate::reveal::Desktop;
 use crate::style::Styles;
 use diskuse_core::{
     CacheDir, Event, File, LARGEST, Label, Labels, Live, LiveOptions, ReadTree, Reason, Saved,
-    ScanOptions, Tree, Units, Waker, largest_first, live,
+    ScanError, ScanOptions, Tree, Units, largest_first, live,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -30,12 +30,13 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
 
 /// The browser's keys, most useful first: on a narrow screen [`fit_keys`]
@@ -98,6 +99,9 @@ pub struct Env {
     pub interval: Duration,
     /// How sizes print, switched with `u`.
     pub units: Units,
+    /// Called, from another thread, when a scan has something new for
+    /// [`Browser::poll`]: the terminal loop waits on it and on the keys.
+    pub wake: Option<Wake>,
     /// Draw in colour. Off when `NO_COLOR` is set and not empty.
     pub color: bool,
     /// The home dir, for the labels of known folders in it.
@@ -114,10 +118,28 @@ impl Env {
             inotify: true,
             interval: Duration::from_secs(1),
             units: Units::Binary,
+            wake: None,
             color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
             home: std::env::var_os("HOME").map(PathBuf::from),
         }
     }
+}
+
+/// What [`Env::wake`] calls.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// What a scan sends the browser.
+type Events = mpsc::Receiver<Result<Event, ScanError>>;
+
+/// Changes were missed, so the tree may be out of date: said in the title
+/// until all of it is scanned again, and each dir is listed again when
+/// first shown since.
+struct Stale {
+    since: SystemTime,
+    /// The scanned dir itself moved: no scan of its old path finds it.
+    moved: bool,
+    /// The dirs listed again since, by path below the root.
+    listed: HashSet<Vec<u8>>,
 }
 
 /// The state of the browser. Driven by [`Browser::key`] and
@@ -135,10 +157,12 @@ pub struct Browser {
     reclaimable: bool,
     /// `None` until the running scan has listed the root.
     view: Option<View>,
-    /// The scan, then the changes on disk, from [`Browser::scan`] on.
+    /// The scan, then the changes on disk, from [`Browser::scan`] on, and
+    /// what it reports, taken by [`Browser::poll`].
     live: Option<Live>,
-    /// Why a scan started by itself, until it is done.
-    why: Option<Reason>,
+    events: Option<Events>,
+    /// Changes the OS missed, until everything is scanned again.
+    stale: Option<Stale>,
     /// The dir scanned again, by its path below the root, while the tree
     /// shown stays.
     rescanning: Option<Vec<u8>>,
@@ -395,7 +419,8 @@ impl Browser {
             reclaimable,
             view: None,
             live: None,
-            why: None,
+            events: None,
+            stale: None,
             rescanning: None,
             scanned: SystemTime::UNIX_EPOCH,
             files: HashMap::new(),
@@ -439,7 +464,7 @@ impl Browser {
     /// Scans the root on another thread, then follows the changes on disk.
     pub fn scan(&mut self) {
         self.keep_baseline();
-        self.why = None;
+        self.stale = None;
         self.rescanning = None;
         (self.progress, self.started) = (None, None);
         let opts = LiveOptions {
@@ -454,7 +479,19 @@ impl Browser {
             // memory and seconds on a large tree
             shown_only: true,
         };
-        self.live = Some(live(&self.root, opts));
+        // the scan before stops first, and what it sent goes with it
+        self.live = None;
+        let (tx, events) = mpsc::channel();
+        let wake = self.env.wake.clone();
+        let handler = move |event| {
+            if tx.send(event).is_ok()
+                && let Some(wake) = &wake
+            {
+                wake();
+            }
+        };
+        self.live = Some(live(&self.root, opts, handler));
+        self.events = Some(events);
     }
 
     /// What the session's changes are counted against, until the full
@@ -468,7 +505,7 @@ impl Browser {
         }
     }
 
-    /// A scan runs: the first, after lost changes, or of one dir.
+    /// A scan runs: the first, or one asked for with `s` or `S`.
     fn busy(&self) -> bool {
         self.live.as_ref().is_some_and(Live::busy)
     }
@@ -476,12 +513,6 @@ impl Browser {
     /// Prints sizes in `units` from now on.
     pub fn set_units(&mut self, units: Units) {
         self.env.units = units;
-    }
-
-    /// Wakes a [`Browser::poll`] waiting on another thread. `None` if it
-    /// would not wait, with no scan to wait on.
-    pub fn waker(&self) -> Option<Waker> {
-        self.live.as_ref().filter(|l| !l.is_done()).map(Live::waker)
     }
 
     /// Scans the dir at the cursor again, or at a file the current dir, on
@@ -501,7 +532,7 @@ impl Browser {
             return self.rescan_all();
         }
         self.rescanning = Some(below(&view.tree, d));
-        if let Some(live) = &mut self.live {
+        if let Some(live) = &self.live {
             live.rescan(d);
         }
     }
@@ -527,26 +558,32 @@ impl Browser {
         }
     }
 
-    /// Catches up with the scan: shows a snapshot of it, unless a saved
-    /// scan is shown, or once it is done, its tree, and saves that. Then
-    /// shows the changes on disk since the last poll. Waits up to `timeout`
-    /// for one of those, or until woken ([`Browser::waker`]). Returns
-    /// whether a scan still runs.
-    pub fn poll(&mut self, now: SystemTime, timeout: Duration) -> bool {
-        let Some(live) = &mut self.live else {
-            return false;
-        };
-        if live.busy() && self.started.is_none() {
+    /// Catches up with the scan, taking everything it has sent: shows a
+    /// snapshot of it, unless a saved scan is shown, or once it is done,
+    /// its tree, and saves that. Then shows the changes on disk since.
+    /// Never waits: [`Env::wake`] says when there is more. Returns whether
+    /// a scan still runs.
+    pub fn poll(&mut self, now: SystemTime) -> bool {
+        if self.busy() && self.started.is_none() {
             self.started = Some(now);
         }
-        match live.wait(timeout) {
-            None => {}
-            Some(Err(e)) => {
+        // read before the events, so a scan seen as done has sent its tree
+        let busy = self.busy();
+        let events: Vec<_> = self.events.iter().flat_map(Events::try_iter).collect();
+        for event in events {
+            self.on_event(event, now);
+        }
+        busy
+    }
+
+    fn on_event(&mut self, event: Result<Event, ScanError>, now: SystemTime) {
+        match event {
+            Err(e) => {
                 self.rescanning = None;
                 self.message = Some(format!("cannot scan: {e}"));
             }
             // a saved scan shows until the scan is done
-            Some(Ok(Event::Scanning(tree))) => {
+            Ok(Event::Scanning(tree)) => {
                 self.progress = Some((tree.size(0), tree.len()));
                 if !matches!(
                     self.view.as_ref().map(|v| v.status),
@@ -555,8 +592,7 @@ impl Browser {
                     self.show(tree, Status::Scanning);
                 }
             }
-            Some(Ok(Event::Ready(tree))) => {
-                self.why = None;
+            Ok(Event::Ready(tree)) => {
                 (self.progress, self.started) = (None, None);
                 self.scanned = now;
                 self.save(&tree);
@@ -576,7 +612,7 @@ impl Browser {
                 }
                 self.show(tree, Status::Done);
             }
-            Some(Ok(Event::Changed(tree, _))) => {
+            Ok(Event::Changed(tree, _)) => {
                 // new records, or all of them numbered again
                 if let (Some(base), Some(old)) = (&mut self.baseline, &self.view) {
                     base.carry(&old.tree, &tree, moved_from(&tree, &old.tree) as usize);
@@ -586,12 +622,18 @@ impl Browser {
                 }
                 self.show(tree, Status::Done);
             }
-            Some(Ok(Event::Rescanning(why))) => {
-                self.keep_baseline();
-                self.why = Some(why);
+            // nothing is scanned again unless asked: the title says so, and
+            // the dirs shown are listed again
+            Ok(Event::Missed(why, _)) => {
+                let stale = self.stale.get_or_insert_with(|| Stale {
+                    since: now,
+                    moved: false,
+                    listed: HashSet::new(),
+                });
+                stale.moved |= why == Reason::RootMoved;
+                self.refresh();
             }
         }
-        self.busy()
     }
 
     /// Handles a key. Reveal and open go through `run`, given a program and
@@ -1103,8 +1145,17 @@ impl Browser {
             self.ensure(k);
             shown.push(k);
         }
-        if let Some(live) = &mut self.live {
+        if let Some(live) = &self.live {
             live.follow(&shown);
+            // after missed changes, each dir is listed again when first shown
+            if let Some(stale) = &mut self.stale {
+                let view = self.view.as_ref().unwrap();
+                let fresh = |d: &u32| stale.listed.insert(below(&view.tree, *d));
+                let again: Vec<u32> = shown.iter().copied().filter(fresh).collect();
+                if !again.is_empty() {
+                    live.relist(&again);
+                }
+            }
         }
     }
 
@@ -1352,6 +1403,17 @@ impl Browser {
                 "showing the scan saved {age} ago{incomplete}"
             )));
         }
+        // first after the total: what all the sizes are worth
+        if let Some(stale) = &self.stale {
+            let age = age(now.duration_since(stale.since).unwrap_or_default());
+            parts.push(Span::styled(
+                match stale.moved {
+                    true => format!("the scanned folder moved {age} ago"),
+                    false => format!("changes missed {age} ago (S rescans)"),
+                },
+                styles.warn,
+            ));
+        }
         if let Some(view) = &self.view {
             // how much the root grew or shrank since the session started
             if let Some(base) = self
@@ -1390,10 +1452,6 @@ impl Browser {
                 "rescanning {}/...",
                 String::from_utf8_lossy(dir)
             )));
-        }
-        // why a scan started by itself
-        if let Some(why) = self.why {
-            parts.push(Span::raw(format!("scanning again: {why}")));
         }
         // on a narrow screen the last parts go, down to the first
         let room = width.saturating_sub(width_of(&self.display) + 2);
@@ -2034,6 +2092,7 @@ mod tests {
             inotify: true,
             interval: Duration::ZERO,
             units: Units::Binary,
+            wake: None,
             color: true,
             home: None,
         }
@@ -2171,5 +2230,63 @@ mod tests {
             fmt(total / 2)
         );
         assert_eq!(title_of(&mut b), title);
+    }
+
+    /// The OS says it missed changes: nothing is scanned again, the title
+    /// says so until `S` scans everything, and the dir shown is listed
+    /// again, so a file made since shows.
+    #[test]
+    fn missed_changes_mark_the_tree_stale_until_a_full_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("f"), vec![0; 4096]).unwrap();
+        let env = Env {
+            interval: Duration::from_millis(5),
+            ..env()
+        };
+        let mut b = Browser::new(root, "/s", env, None, None, false);
+        let now = SystemTime::now();
+        let finish = |b: &mut Browser| {
+            while b.poll(now) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        b.scan();
+        finish(&mut b);
+        let fmt = |n| Units::Binary.format(n);
+        let total = b.view.as_ref().unwrap().tree.size(0);
+        // where only the dirs shown are followed (Linux), the scan's age
+        let scanned = match cfg!(target_os = "macos") {
+            true => "",
+            false => " | scanned 0 s ago",
+        };
+        assert_eq!(title_of(&mut b), format!("/s  {}{scanned}", fmt(total)));
+
+        // made while the OS was not telling
+        std::fs::write(root.join("g"), vec![0; 8192]).unwrap();
+        b.on_event(Ok(Event::Missed(Reason::Dropped, root.into())), now);
+        assert!(!b.busy(), "nothing is scanned again by itself");
+        let stale = "changes missed 0 s ago (S rescans)";
+        // the root, shown, is listed again (and followed as before)
+        let listed = |b: &Browser| b.view.as_ref().unwrap().tree.size(0) == total + 8192;
+        while !listed(&b) {
+            b.poll(now);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let grown = format!(
+            "/s  {} | +8.0 KiB since opened 0 s ago{scanned}",
+            fmt(total + 8192)
+        );
+        assert_eq!(
+            title_of(&mut b),
+            grown.replacen(" | ", &format!(" | {stale} | "), 1)
+        );
+
+        assert!(
+            b.key(KeyEvent::from(KeyCode::Char('S')), &mut |_, _| Ok(()))
+                .is_continue()
+        );
+        finish(&mut b);
+        assert_eq!(title_of(&mut b), grown);
     }
 }

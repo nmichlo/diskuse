@@ -119,7 +119,8 @@ pub(crate) struct Applied {
 /// limit, since the walk holds many directory fds open at once, and on macOS
 /// it stops iCloud placeholder files from downloading.
 pub fn scan(root: &Path, opts: &ScanOptions) -> Result<Tree, ScanError> {
-    walk_root(root, opts, false, |_| {})
+    let pool = Pool::new(opts).map_err(ScanError::ThreadPool)?;
+    walk_root(&pool, root, opts, false, |_| {})
 }
 
 /// [`scan`], first handing `progress` a [`Progress`] that reads the tree
@@ -130,12 +131,15 @@ pub fn scan_live(
     opts: &ScanOptions,
     progress: impl FnOnce(Progress),
 ) -> Result<Tree, ScanError> {
-    walk_root(root, opts, true, progress)
+    let pool = Pool::new(opts).map_err(ScanError::ThreadPool)?;
+    walk_root(&pool, root, opts, true, progress)
 }
 
-/// [`scan_live`], taking the OS's event id to watch from only if `watch`,
-/// as that loads the frameworks for it on macOS.
-fn walk_root(
+/// [`scan_live`] on the threads of `pool`, taking the OS's event id to
+/// watch from only if `watch`, as that loads the frameworks for it on
+/// macOS.
+pub(crate) fn walk_root(
+    pool: &Pool,
     root: &Path,
     opts: &ScanOptions,
     watch: bool,
@@ -149,12 +153,12 @@ fn walk_root(
     // taken first, so a watch from here also sees the changes made while
     // the walk runs
     let since = if watch { sys::event_id() } else { 0 };
-    let (pool, gate) = pool(opts).map_err(ScanError::ThreadPool)?;
+    let gate = pool.gate();
     let tree = Builder::new(root.as_os_str().as_bytes(), opts.reclaimable);
     let walk = Walk::new(tree, Links::new(), st.dev, lister, opts.stop.clone(), gate);
     let own = Own::of(&st, opts.reclaimable);
     progress(walk.tree.progress());
-    walk.run(&pool, |s| {
+    walk.run(&pool.threads, |s| {
         walk.list(s, fd, Record::NO_PARENT, 0, st.ino, own);
     });
     Ok(walk.finish(since, false))
@@ -168,18 +172,35 @@ fn lister(fd: &OwnedFd, opts: &ScanOptions) -> rustix::io::Result<sys::Lister> {
     }
 }
 
-/// A pool of `--threads` threads, or of every core with a [`Gate`] that
-/// lets only some of them list dirs at once.
-fn pool(opts: &ScanOptions) -> Result<(ThreadPool, Gate), rayon::ThreadPoolBuildError> {
-    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let (threads, gate) = match opts.threads {
-        Some(n) => (n.get(), Gate::fixed(n.get())),
-        None => (cores, Gate::adaptive(cores)),
-    };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()?;
-    Ok((pool, gate))
+/// The threads walks run on: `--threads` of them, or one per core, of
+/// which a [`Gate`] lets only some list dirs at once. A live scan keeps
+/// one for its scans and its updates, rather than starting threads for
+/// each.
+pub(crate) struct Pool {
+    threads: ThreadPool,
+    /// `--threads`, if given.
+    fixed: Option<usize>,
+}
+
+impl Pool {
+    pub fn new(opts: &ScanOptions) -> Result<Self, rayon::ThreadPoolBuildError> {
+        let fixed = opts.threads.map(NonZeroUsize::get);
+        let n = fixed.unwrap_or_else(cores);
+        let threads = rayon::ThreadPoolBuilder::new().num_threads(n).build()?;
+        Ok(Self { threads, fixed })
+    }
+
+    /// The gate of one walk on these threads.
+    fn gate(&self) -> Gate {
+        match self.fixed {
+            Some(n) => Gate::fixed(n),
+            None => Gate::adaptive(cores()),
+        }
+    }
+}
+
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, NonZeroUsize::get)
 }
 
 /// How many of the pool's threads list dirs at once: those with an index
@@ -597,12 +618,13 @@ impl Walk {
 impl Tree {
     /// Brings the tree up to date with `changes`: lists each dir the
     /// changes touched again, one bulk read each, then scans the
-    /// subdirectories new in them in one walk. Returns what changed. On an
-    /// error the tree is left as it was.
+    /// subdirectories new in them in one walk on `pool`. Returns what
+    /// changed. On an error the tree is left as it was.
     pub(crate) fn apply(
         &mut self,
         changes: &Changes,
         opts: &ScanOptions,
+        pool: &Pool,
     ) -> Result<Applied, ApplyError> {
         if changes.is_empty() {
             return Ok(Applied {
@@ -621,7 +643,6 @@ impl Tree {
         let root = sys::open_root(Path::new(OsStr::from_bytes(self.name(0)))).map_err(root_err)?;
         let dev = sys::dir_stat(root.as_fd()).map_err(root_err)?.dev;
         let lister = lister(&root, opts).map_err(root_err)?;
-        let (pool, gate) = pool(opts).map_err(|e| ApplyError::Scan(ScanError::ThreadPool(e)))?;
         sys::raise_fd_limit();
         sys::keep_placeholders_remote();
         // listed afresh: everything below them goes, and comes back as new
@@ -648,7 +669,7 @@ impl Tree {
         }
         self.prune();
         if !new.is_empty() {
-            self.scan_new(&root, new, dev, lister, &pool, gate, opts);
+            self.scan_new(&root, new, dev, lister, pool, opts);
         }
         let n = index.size.len();
         let deltas = self.deltas(&index);
@@ -666,15 +687,13 @@ impl Tree {
 
     /// Scans `new`, the subdirectories new in dirs listed again, in one
     /// walk appending to the tree.
-    #[allow(clippy::too_many_arguments)]
     fn scan_new(
         &mut self,
         root: &OwnedFd,
         new: Vec<(Vec<CString>, u32, Vec<Child>)>,
         dev: u64,
         lister: sys::Lister,
-        pool: &ThreadPool,
-        gate: Gate,
+        pool: &Pool,
         opts: &ScanOptions,
     ) {
         let links = std::mem::take(&mut self.links);
@@ -684,11 +703,11 @@ impl Tree {
             dev,
             lister,
             opts.stop.clone(),
-            gate,
+            pool.gate(),
         );
         // each parent is opened again from the root, rather than kept open
         // since its listing, so no more dirs are open at once than in a scan
-        walk.run(pool, |s| {
+        walk.run(&pool.threads, |s| {
             for (names, d, kids) in new {
                 let walk = &walk;
                 s.spawn(move |s| walk.adopt(s, root, &names, d, kids));
@@ -1103,6 +1122,7 @@ mod tests {
         fs::create_dir(root.join("empty")).unwrap();
         fs::create_dir(root.join("full")).unwrap();
         fs::write(root.join("full/f"), vec![7; 8192]).unwrap();
+        let pool = Pool::new(&opts).unwrap();
         let mut tree = scan(root, &opts).unwrap();
         fs::remove_dir(root.join("empty")).unwrap();
         fs::rename(root.join("full"), root.join("empty")).unwrap();
@@ -1110,7 +1130,7 @@ mod tests {
             changed: vec![Box::default()],
             ..Changes::default()
         };
-        tree.apply(&changes, &opts).unwrap();
+        tree.apply(&changes, &opts, &pool).unwrap();
         assert_eq!(folders(&tree), folders(&scan(root, &opts).unwrap()));
     }
 
@@ -1123,6 +1143,7 @@ mod tests {
             threads: NonZeroUsize::new(2),
             ..ScanOptions::default()
         };
+        let pool = Pool::new(&opts).unwrap();
         let ops = proptest::collection::vec(proptest::collection::vec(op(), 1..6), 1..6);
         // the same cases every run
         let mut runner = TestRunner::new_with_rng(
@@ -1146,7 +1167,7 @@ mod tests {
                     changed: touched.map(|p| p.as_os_str().as_bytes().into()).collect(),
                     ..Changes::default()
                 };
-                let applied = tree.apply(&changes, &opts).unwrap();
+                let applied = tree.apply(&changes, &opts, &pool).unwrap();
                 prop_assert_eq!(folders(&tree), folders(&scan(root, &opts).unwrap()));
                 let deltas: i64 = applied.deltas.iter().flatten().map(|&(_, d)| d).sum();
                 prop_assert_eq!(deltas, tree.size(0) as i64 - before);

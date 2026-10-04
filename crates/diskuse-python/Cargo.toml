@@ -20,3 +20,4 @@ diskuse.workspace = true
 pyo3 = { version = "0.29.3", features = ["abi3-py39"] }
 # Tree.__arrow_c_stream__: the Arrow C stream interface, no pyarrow needed
 arrow-array = { version = "60", default-features = false, features = ["ffi"] }
+pyo3-log = "0.13.4"

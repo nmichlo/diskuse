@@ -4,8 +4,9 @@
 
 mod common;
 
-use diskuse_core::{Event, LiveOptions, ReadTree, ScanOptions, Tree, live, scan};
+use diskuse_core::{Event, LiveOptions, ReadTree, ScanError, ScanOptions, Tree, live, scan};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 /// Every folder by path, with its size and own bytes, sorted.
@@ -20,10 +21,11 @@ fn folders(t: &Tree) -> Vec<(PathBuf, u64, u64)> {
     out
 }
 
-fn next(live: &mut diskuse_core::Live) -> Event {
-    live.wait(Duration::from_secs(30))
-        .expect("an event")
-        .expect("no error")
+type Events = Receiver<Result<Event, ScanError>>;
+
+fn next(events: &Events) -> Event {
+    let event = events.recv_timeout(Duration::from_secs(30));
+    event.expect("an event").expect("no error")
 }
 
 #[test]
@@ -40,9 +42,10 @@ fn rescans_keep_the_tree_right_and_its_records_bounded() {
         interval: Duration::from_millis(50),
         ..LiveOptions::default()
     };
-    let mut live = live(dir.path(), opts);
+    let (tx, events) = mpsc::channel();
+    let live = live(dir.path(), opts, tx);
     let mut tree = loop {
-        if let Event::Ready(t) = next(&mut live) {
+        if let Event::Ready(t) = next(&events) {
             break t;
         }
     };
@@ -51,7 +54,7 @@ fn rescans_keep_the_tree_right_and_its_records_bounded() {
         // each rescan replaces the 20 folders below `a`
         live.rescan(tree.find(Path::new("a")).unwrap());
         tree = loop {
-            if let Event::Changed(t, _) = next(&mut live) {
+            if let Event::Changed(t, _) = next(&events) {
                 break t;
             }
         };
@@ -76,16 +79,17 @@ fn a_file_growing_in_place_is_a_change_of_its_folder() {
         interval: Duration::from_millis(50),
         ..LiveOptions::default()
     };
-    let mut live = live(dir.path(), opts);
+    let (tx, events) = mpsc::channel();
+    let _live = live(dir.path(), opts, tx);
     loop {
-        if let Event::Ready(_) = next(&mut live) {
+        if let Event::Ready(_) = next(&events) {
             break;
         }
     }
     // what was allocated, which may be more than was written
     let grown = common::append(&a.join("keep"), 4096) - 4096;
     let changes = loop {
-        if let Event::Changed(_, changes) = next(&mut live) {
+        if let Event::Changed(_, changes) = next(&events) {
             break changes;
         }
     };
@@ -94,4 +98,38 @@ fn a_file_growing_in_place_is_a_change_of_its_folder() {
         .map(|(path, by)| (std::fs::canonicalize(path).unwrap(), by))
         .collect();
     assert_eq!(changes, [(a, grown as i64)]);
+}
+
+/// `relist` lists a folder again when asked, as after missed changes.
+/// With only the folders given to `follow` followed, and none given, that
+/// is the one way a change shows (Linux; macOS follows everything anyway).
+#[test]
+fn relist_lists_a_folder_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    std::fs::create_dir(&a).unwrap();
+    common::file(&a.join("f"), 4096);
+    let opts = LiveOptions {
+        interval: Duration::from_millis(50),
+        shown_only: true,
+        ..LiveOptions::default()
+    };
+    let (tx, events) = mpsc::channel();
+    let live = live(dir.path(), opts, tx);
+    let tree = loop {
+        if let Event::Ready(t) = next(&events) {
+            break t;
+        }
+    };
+    common::file(&a.join("g"), 8192);
+    live.relist(&[tree.find(Path::new("a")).unwrap()]);
+    let changes = loop {
+        if let Event::Changed(_, changes) = next(&events) {
+            break changes;
+        }
+    };
+    let changes: Vec<_> = (changes.into_iter())
+        .map(|(path, by)| (std::fs::canonicalize(path).unwrap(), by))
+        .collect();
+    assert_eq!(changes, [(std::fs::canonicalize(&a).unwrap(), 8192)]);
 }

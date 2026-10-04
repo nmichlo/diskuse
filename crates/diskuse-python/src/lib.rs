@@ -8,17 +8,19 @@ use arrow_array::{
     ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, RecordBatch, RecordBatchIterator,
     UInt32Array, UInt64Array,
 };
-use diskuse_core::{
-    Event, LiveOptions, ReadTree, Reason, Record, ScanError, ScanOptions, Tree, Waker,
+use diskuse_core::{Event, LiveOptions, ReadTree, Reason, Record, ScanError, ScanOptions, Tree};
+use pyo3::exceptions::{
+    PyBaseException, PyIndexError, PyOSError, PyStopAsyncIteration, PyStopIteration,
 };
-use pyo3::exceptions::{PyIndexError, PyOSError, PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyCapsule, PyTuple};
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::Duration;
 
 /// How often a sync `for` over a live scan checks for Ctrl-C: Python only
@@ -57,11 +59,21 @@ fn os_error(py: Python<'_>, e: ScanError, root: &Path) -> PyErr {
     }
 }
 
+/// Sends what the library logs to Python's `logging`, as `diskuse_core.*`.
+/// From the first scan, not on import: the console script logs to a file
+/// instead (`DISKUSE_LOG`).
+fn log_to_python() {
+    static ONCE: Once = Once::new();
+    // a logger set before, by another extension, stays
+    ONCE.call_once(|| drop(pyo3_log::try_init()));
+}
+
 /// Scans `path` with `threads` threads, or as many as help, with the GIL
 /// released.
 #[pyfunction]
 #[pyo3(signature = (path, threads = None))]
 fn scan(py: Python<'_>, path: PathBuf, threads: Option<usize>) -> PyResult<PyTree> {
+    log_to_python();
     let path = expand(py, path)?;
     let tree = py.detach(|| diskuse_core::scan(&path, &options(threads)));
     let tree = tree.map_err(|e| os_error(py, e, &path))?;
@@ -213,7 +225,7 @@ fn batch(tree: &Tree) -> RecordBatch {
     .unwrap()
 }
 
-/// Why a live scan scans the whole tree again, as in Rust. `str()` says it
+/// Why changes were missed, as in Rust. `str()` says it
 /// in words.
 #[pyclass(frozen, eq, from_py_object, name = "Reason", module = "diskuse")]
 #[derive(Clone, Copy, PartialEq)]
@@ -222,7 +234,7 @@ enum PyReason {
     IdsWrapped,
     RootMoved,
     NoReplay,
-    MustScanAll,
+    MustScan,
 }
 
 impl From<Reason> for PyReason {
@@ -232,7 +244,7 @@ impl From<Reason> for PyReason {
             Reason::IdsWrapped => Self::IdsWrapped,
             Reason::RootMoved => Self::RootMoved,
             Reason::NoReplay => Self::NoReplay,
-            Reason::MustScanAll => Self::MustScanAll,
+            Reason::MustScan => Self::MustScan,
         }
     }
 }
@@ -244,7 +256,7 @@ impl From<PyReason> for Reason {
             PyReason::IdsWrapped => Self::IdsWrapped,
             PyReason::RootMoved => Self::RootMoved,
             PyReason::NoReplay => Self::NoReplay,
-            PyReason::MustScanAll => Self::MustScanAll,
+            PyReason::MustScan => Self::MustScan,
         }
     }
 }
@@ -269,8 +281,9 @@ enum PyEvent {
         tree: PyTree,
         changes: Vec<(PathBuf, i64)>,
     },
-    Rescanning {
+    Missed {
         reason: PyReason,
+        path: PathBuf,
     },
 }
 
@@ -287,36 +300,72 @@ impl From<Event> for PyEvent {
                 tree: PyTree::new(tree),
                 changes,
             },
-            Event::Rescanning(reason) => Self::Rescanning {
+            Event::Missed(reason, path) => Self::Missed {
                 reason: reason.into(),
+                path,
             },
         }
     }
 }
 
-/// A live scan: iterate it, sync or async. Leaving the loop stops it.
+/// What a live scan has reported and no loop has taken yet.
+#[derive(Default)]
+struct Inbox {
+    events: Mutex<VecDeque<Result<Event, ScanError>>>,
+    ready: Condvar,
+}
+
+/// The asyncio loop an `async for` runs on, and the callback that hands it
+/// the [`Inbox`]. Only locked with the GIL held.
+type Wake = Mutex<Option<(Py<PyAny>, Py<PyAny>)>>;
+
+/// A live scan: iterate it, sync or async, and `close()` it, or use it as
+/// a context manager.
 #[pyclass(frozen, name = "Live", module = "diskuse")]
 struct PyLive {
     root: PathBuf,
-    live: Mutex<diskuse_core::Live>,
-    /// Wakes the wait holding `live`, which needs no lock.
-    waker: Waker,
+    /// `None` once closed.
+    live: Mutex<Option<diskuse_core::Live>>,
+    inbox: Arc<Inbox>,
+    /// Set by the first `async for`: events then also wake its loop.
+    wake: Arc<Wake>,
+    is_async: Arc<AtomicBool>,
+    /// The `asyncio.Queue` an `async for` takes them from.
+    queue: Mutex<Option<Py<PyAny>>>,
 }
 
 impl PyLive {
-    /// The next event, waiting at most `timeout` without the GIL, or until
-    /// woken. `Err(None)` once the scan failed and nothing comes again.
-    fn wait(&self, py: Python<'_>, timeout: Duration) -> Result<Option<PyEvent>, Option<PyErr>> {
-        let (event, done) = py.detach(|| {
-            let mut live = self.live.lock().unwrap();
-            (live.wait(timeout), live.is_done())
-        });
+    /// `f` of the scan, unless closed. Never waits on it.
+    fn with<T>(&self, f: impl FnOnce(&diskuse_core::Live) -> T) -> Option<T> {
+        self.live.lock().unwrap().as_ref().map(f)
+    }
+
+    /// No event comes again: closed, or the scan failed.
+    fn ended(&self) -> bool {
+        self.with(diskuse_core::Live::is_done).unwrap_or(true)
+    }
+
+    /// `event` as a Python object: an `Event`, or the exception to raise.
+    fn object(&self, py: Python<'_>, event: Result<Event, ScanError>) -> PyResult<Py<PyAny>> {
         match event {
-            Some(Ok(event)) => Ok(Some(event.into())),
-            Some(Err(e)) => Err(Some(os_error(py, e, &self.root))),
-            None if done => Err(None),
-            None => Ok(None),
+            // not `Py::new`, which makes the base class, not the variant's
+            Ok(event) => Ok(PyEvent::from(event).into_pyobject(py)?.into_any().unbind()),
+            Err(e) => Ok(os_error(py, e, &self.root).into_value(py).into_any()),
         }
+    }
+
+    /// Hands the loop of an `async for` everything in the inbox. Called on
+    /// that loop.
+    fn deliver(&self, py: Python<'_>) -> PyResult<()> {
+        let events: Vec<_> = self.inbox.events.lock().unwrap().drain(..).collect();
+        if let Some(queue) = &*self.queue.lock().unwrap() {
+            for event in events {
+                queue
+                    .bind(py)
+                    .call_method1("put_nowait", (self.object(py, event)?,))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -332,6 +381,7 @@ fn live(
     threads: Option<usize>,
     shown_only: bool,
 ) -> PyResult<PyLive> {
+    log_to_python();
     let path = expand(py, path)?;
     let opts = LiveOptions {
         scan: options(threads),
@@ -340,11 +390,45 @@ fn live(
         shown_only,
         ..LiveOptions::default()
     };
-    let live = py.detach(|| diskuse_core::live(&path, opts));
+    let inbox = Arc::new(Inbox::default());
+    let wake = Arc::new(Wake::default());
+    let is_async = Arc::new(AtomicBool::new(false));
+    // on the scan's own thread: never with the GIL, unless a loop waits
+    let handler = {
+        let (inbox, wake, is_async) = (inbox.clone(), wake.clone(), is_async.clone());
+        move |event| {
+            {
+                let mut events = inbox.events.lock().unwrap();
+                // a loop slower than the scan gets the latest snapshot, not
+                // a queue of them: each is a copy of the whole tree
+                if let (Ok(Event::Scanning(_)), Some(Ok(Event::Scanning(_)))) =
+                    (&event, events.back())
+                {
+                    events.pop_back();
+                }
+                events.push_back(event);
+            }
+            inbox.ready.notify_all();
+            if is_async.load(Ordering::Relaxed) {
+                Python::attach(|py| {
+                    if let Some((event_loop, deliver)) = &*wake.lock().unwrap() {
+                        // a loop closed since takes no more
+                        let _ = event_loop
+                            .bind(py)
+                            .call_method1("call_soon_threadsafe", (deliver,));
+                    }
+                });
+            }
+        }
+    };
+    let live = diskuse_core::live(&path, opts, handler);
     Ok(PyLive {
         root: path,
-        waker: live.waker(),
-        live: Mutex::new(live),
+        live: Mutex::new(Some(live)),
+        inbox,
+        wake,
+        is_async,
+        queue: Mutex::new(None),
     })
 }
 
@@ -356,11 +440,21 @@ impl PyLive {
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyEvent>> {
         loop {
-            match self.wait(py, SIGNALS) {
-                Ok(Some(event)) => return Ok(Some(event)),
-                Ok(None) => py.check_signals()?,
-                Err(None) => return Ok(None),
-                Err(Some(e)) => return Err(e),
+            // waits without the GIL, a little at a time: Python only
+            // handles Ctrl-C when the wait returns to it
+            let event = py.detach(|| {
+                let events = self.inbox.events.lock().unwrap();
+                let wait = self
+                    .inbox
+                    .ready
+                    .wait_timeout_while(events, SIGNALS, |e| e.is_empty());
+                wait.unwrap().0.pop_front()
+            });
+            match event {
+                Some(Ok(event)) => return Ok(Some(event.into())),
+                Some(Err(e)) => return Err(os_error(py, e, &self.root)),
+                None if self.ended() => return Ok(None),
+                None => py.check_signals()?,
             }
         }
     }
@@ -369,43 +463,119 @@ impl PyLive {
         slf
     }
 
-    fn __anext__(slf: Py<Self>) -> Next {
-        Next {
-            live: slf,
-            step: None,
+    fn __anext__(slf: Bound<'_, Self>) -> PyResult<Next> {
+        let (py, this) = (slf.py(), slf.get());
+        let queue = {
+            let mut queue = this.queue.lock().unwrap();
+            if queue.is_none() {
+                // the first time: from now on events also wake this loop
+                let asyncio = py.import("asyncio")?;
+                *queue = Some(asyncio.call_method0("Queue")?.unbind());
+                let live = slf.clone().unbind();
+                let deliver = PyCFunction::new_closure(
+                    py,
+                    None,
+                    None,
+                    move |args: &Bound<'_, PyTuple>, _| live.get().deliver(args.py()),
+                )?;
+                let event_loop = asyncio.call_method0("get_running_loop")?;
+                let wake = (event_loop.unbind(), deliver.into_any().unbind());
+                *this.wake.lock().unwrap() = Some(wake);
+                this.is_async.store(true, Ordering::Relaxed);
+            }
+            queue.as_ref().unwrap().bind(py).clone()
+        };
+        // what came before the loop was told of
+        this.deliver(py)?;
+        if this.ended() && queue.call_method0("empty")?.extract()? {
+            return Err(PyStopAsyncIteration::new_err(()));
         }
+        let get = queue.call_method0("get")?.call_method0("__await__")?;
+        Ok(Next { get: get.unbind() })
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyTuple>) -> PyResult<()> {
+        self.close(py)
+    }
+
+    /// Stops the scan and ends every loop over it. Safe to call again.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let live = self.live.lock().unwrap().take();
+        // without the GIL: its thread may be waiting for it, to wake a loop
+        py.detach(|| drop(live));
+        self.inbox.ready.notify_all();
+        // what an `async for` waits on: `None` ends it
+        if let Some(queue) = &*self.queue.lock().unwrap() {
+            queue.bind(py).call_method1("put_nowait", (py.None(),))?;
+        }
+        Ok(())
+    }
+
+    /// Every change below the root is followed, not only those in the
+    /// folders given to `follow`.
+    fn follows_all(&self) -> bool {
+        self.with(diskuse_core::Live::follows_all).unwrap_or(false)
     }
 
     /// With `shown_only`, or once inotify watches run out (Linux), follows
     /// only the folders `ids` of the latest tree. Ignored otherwise.
-    /// Every change below the root is followed, not only those in the
-    /// folders given to `follow`.
-    fn follows_all(&self, py: Python<'_>) -> bool {
-        self.waker.wake();
-        py.detach(|| self.live.lock().unwrap().follows_all())
+    fn follow(&self, ids: Vec<u32>) {
+        self.with(|live| live.follow(&ids));
     }
 
-    fn follow(&self, py: Python<'_>, ids: Vec<u32>) {
-        self.waker.wake();
-        py.detach(|| self.live.lock().unwrap().follow(&ids));
+    /// Lists the folders `ids` of the latest tree again, and reports what
+    /// changed in them: for folders looked at after `Missed`.
+    fn relist(&self, ids: Vec<u32>) {
+        self.with(|live| live.relist(&ids));
     }
 
     /// Scans folder `id` of the latest tree again, then reports `Changed`;
     /// 0 scans it all again.
-    fn rescan(&self, py: Python<'_>, id: u32) {
-        self.waker.wake();
-        py.detach(|| self.live.lock().unwrap().rescan(id));
+    fn rescan(&self, id: u32) {
+        self.with(|live| live.rescan(id));
     }
 }
 
-/// The awaitable `__anext__` returns: a wait on a worker thread
-/// (`asyncio.to_thread`), again after each wake, until one brings an
-/// event. Cancelling it wakes the wait, so no thread is left waiting.
+impl Drop for PyLive {
+    fn drop(&mut self) {
+        let live = self.live.get_mut().unwrap().take();
+        // as `close`: never join the scan's thread with the GIL held
+        Python::attach(|py| py.detach(|| drop(live)));
+    }
+}
+
+/// The awaitable `__anext__` returns: the `asyncio.Queue.get()` of the
+/// next event, so waiting and cancelling are asyncio's own. What comes out
+/// is the event, an exception to raise, or `None` once closed.
 #[pyclass(module = "diskuse")]
 struct Next {
-    live: Py<PyLive>,
-    /// The `__await__` iterator of the running wait.
-    step: Option<Py<PyAny>>,
+    /// The `__await__` iterator of the `get()`.
+    get: Py<PyAny>,
+}
+
+impl Next {
+    /// What a step of `get` gave: a future to wait on, or its result.
+    fn step(py: Python<'_>, step: PyResult<Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        match step {
+            Ok(future) => Ok(future.unbind()),
+            Err(e) if e.is_instance_of::<PyStopIteration>(py) => {
+                let event = e.value(py).getattr("value")?;
+                if event.is_none() {
+                    Err(PyStopAsyncIteration::new_err(()))
+                } else if event.is_instance_of::<PyBaseException>() {
+                    Err(PyErr::from_value(event))
+                } else {
+                    Err(PyStopIteration::new_err((event.unbind(),)))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[pymethods]
@@ -414,70 +584,30 @@ impl Next {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        loop {
-            let step = match &self.step {
-                Some(step) => step.bind(py).clone(),
-                None => {
-                    let live = self.live.clone_ref(py);
-                    let wait = PyCFunction::new_closure(
-                        py,
-                        None,
-                        None,
-                        move |args: &Bound<'_, PyTuple>, _| match live
-                            .get()
-                            .wait(args.py(), Duration::MAX)
-                        {
-                            Ok(event) => Ok(event),
-                            Err(None) => Err(PyStopAsyncIteration::new_err(())),
-                            Err(Some(e)) => Err(e),
-                        },
-                    )?;
-                    let coro = py.import("asyncio")?.call_method1("to_thread", (wait,))?;
-                    let step = coro.call_method0("__await__")?;
-                    self.step = Some(step.clone().unbind());
-                    step
-                }
-            };
-            match step.call_method0("__next__") {
-                // a future to wait on, for the event loop
-                Ok(future) => return Ok(future.unbind()),
-                Err(e) if e.is_instance_of::<PyStopIteration>(py) => {
-                    self.step = None;
-                    let event = e.value(py).getattr("value")?;
-                    if !event.is_none() {
-                        return Err(PyStopIteration::new_err((event.unbind(),)));
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
+    fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Self::step(py, self.get.bind(py).call_method0("__next__"))
     }
 
-    /// Cancelling: wakes the wait, then passes the error to it.
+    fn send(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        Self::step(py, self.get.bind(py).call_method1("send", (value,)))
+    }
+
+    /// Cancelling, as asyncio does it: passed on to the `get()`.
     #[pyo3(signature = (typ, val = None, _tb = None))]
     fn throw(
-        &mut self,
+        &self,
         py: Python<'_>,
         typ: Py<PyAny>,
         val: Option<Py<PyAny>>,
         _tb: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        self.live.get().waker.wake();
         // the single-argument form: the others are deprecated
         let exc = val.unwrap_or(typ);
-        match self.step.take() {
-            Some(step) => Ok(step.bind(py).call_method1("throw", (exc,))?.unbind()),
-            None => Err(PyErr::from_value(exc.into_bound(py))),
-        }
+        Self::step(py, self.get.bind(py).call_method1("throw", (exc,)))
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        self.live.get().waker.wake();
-        match self.step.take() {
-            Some(step) => step.bind(py).call_method0("close").map(drop),
-            None => Ok(()),
-        }
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.get.bind(py).call_method0("close").map(drop)
     }
 }
 
