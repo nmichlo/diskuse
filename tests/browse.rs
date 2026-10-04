@@ -1765,12 +1765,15 @@ fn rescans_over_a_stopped_saved_scan() {
     );
     b.scan();
     let d = common::own_bytes(root);
-    // the saved scan found nothing to head for
-    let title =
-        "/stopped  scanning 0 B | 0 folders | 0 s | showing the scan saved 0 s ago, incomplete";
+    // the saved scan's total is what it heads for, unless 0 B (APFS dirs)
+    let saved = "showing the scan saved 0 s ago, incomplete";
+    let title = match d {
+        0 => format!("/stopped  scanning 0 B | 0 folders | 0 s | {saved}"),
+        _ => format!("/stopped  scanning 0 B of ~{} (0%) | {saved}", kib(d)),
+    };
     assert_eq!(
         draw(&mut b, now()),
-        screen(title, [&[], &[], &[]], None, 0, HELP)
+        screen(&title, [&[], &[], &[]], None, 0, HELP)
     );
 
     while b.poll(now(), Duration::ZERO) {
