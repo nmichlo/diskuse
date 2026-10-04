@@ -17,14 +17,14 @@
 
 use crate::access::{reason, terminal_app};
 use crate::labels::{self, Label, Tier};
-use crate::report::{format_size, largest_files, largest_first, suffix};
+use crate::live::{Event, Live, LiveOptions, live};
+use crate::report::{format_size, largest_first};
 use crate::reveal::Desktop;
-use crate::scan::{ScanError, ScanOptions, Stop, scan_live};
+use crate::scan::ScanOptions;
 use crate::store::{CacheDir, Saved};
 use crate::style::Styles;
 use crate::sys::{self, Kind};
-use crate::tree::{ChildIndex, LARGEST, Progress, ReadTree, Record, Totals, Tree, join};
-use crate::watch::{Changes, DirWatch, Poll, Watch};
+use crate::tree::{LARGEST, ReadTree, Record, Tree, below, dir_path, join};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
@@ -39,10 +39,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 const HELP: &str = "hjkl move  r reveal  o open  space pick  p picks  s/S rescan  / filter  t top  \
                     ? help  q quit";
@@ -110,13 +107,15 @@ pub struct Browser {
     reclaimable: bool,
     /// `None` until the running scan has listed the root.
     view: Option<View>,
-    scan: Option<Scan>,
-    /// Set on quitting, to stop the running scan.
-    stop: Arc<AtomicBool>,
-    /// Changes on disk below the root, since the tree shown.
-    watch: Option<Watch>,
-    /// Without `watch`, changes in the dirs shown.
-    dir_watch: Option<DirWatch>,
+    /// The scan, then the changes on disk, from [`Browser::scan`] on.
+    live: Option<Live>,
+    /// Why a scan started by itself, until it is done.
+    why: Option<&'static str>,
+    /// The dir scanned again, by its path below the root, while the tree
+    /// shown stays.
+    rescanning: Option<Vec<u8>>,
+    /// When the tree shown was scanned, as the dirs not followed stand.
+    scanned: SystemTime,
     /// Listings by record id, kept until another scan's tree is shown.
     files: HashMap<u32, Files>,
     /// Sorted rows by record id, for the view shown.
@@ -195,10 +194,10 @@ impl Baseline {
     }
 
     /// Gives each record of `new` from id `from` on the start size of the
-    /// dir at the same path in `old`, an earlier tree of the same root
-    /// whose children are `old_index`. A dir listed afresh comes back as a
+    /// dir at the same path in `old`, an earlier tree of the same root. A
+    /// dir listed afresh comes back as a
     /// new record, and a full scan numbers every dir anew (`from` 0).
-    fn carry(&mut self, old: &Tree, old_index: &ChildIndex, new: &Tree, from: usize) {
+    fn carry(&mut self, old: &Tree, new: &Tree, from: usize) {
         let mut sizes = self.sizes.clone();
         sizes.resize(new.len(), 0);
         // the dir of `old` each record of `new` from `from` is at
@@ -217,11 +216,11 @@ impl Baseline {
                     };
                     parent.and_then(|p| {
                         let named = kids.entry(p).or_insert_with(|| {
-                            (old_index.children(p).iter())
-                                .map(|&c| (old.name(old.record(c).name), c))
+                            (old.children(p).iter())
+                                .map(|&c| (old.name(c), c))
                                 .collect()
                         });
-                        named.get(new.name(r.name)).copied()
+                        named.get(new.name(k)).copied()
                     })
                 }
             };
@@ -237,8 +236,6 @@ impl Baseline {
 /// A tree as shown, with what drawing it needs.
 struct View {
     tree: Tree,
-    totals: Totals,
-    index: ChildIndex,
     /// Path and record id of every denied dir, by path.
     denied: Vec<(Vec<u8>, u32)>,
     /// `(bytes, path)` of the largest files, largest first.
@@ -264,32 +261,19 @@ impl View {
     fn new(tree: Tree, status: Status, reclaimable: bool) -> Self {
         let ids = 0..tree.len() as u32;
         let mut denied: Vec<_> = (ids.filter(|&i| tree.record(i).flags & Record::DENIED != 0))
-            .map(|i| (tree.dir_path(i), i))
+            .map(|i| (dir_path(&tree, i), i))
             .collect();
         denied.sort_unstable();
-        let index = tree.child_index();
         Self {
-            totals: tree.totals(),
-            index,
             denied,
-            largest: largest_files(&tree, LARGEST),
+            largest: (tree.largest_files(LARGEST).into_iter())
+                .map(|(path, bytes)| (bytes, path.into_os_string().into_vec()))
+                .collect(),
             tree,
             status,
             reclaimable,
         }
     }
-}
-
-/// A scan running on its own thread.
-struct Scan {
-    started: mpsc::Receiver<Progress>,
-    progress: Option<Progress>,
-    thread: JoinHandle<Result<Tree, ScanError>>,
-    /// The dir scanned again, by its path below the root, while the tree
-    /// shown stays. `None` for a full scan.
-    dir: Option<Vec<u8>>,
-    /// Why a full scan started without being asked for, for the title.
-    why: Option<&'static str>,
 }
 
 /// The files of a dir, `(name, allocated bytes, reclaimable bytes)`:
@@ -363,10 +347,10 @@ impl Browser {
             used,
             reclaimable,
             view: None,
-            scan: None,
-            stop: Arc::default(),
-            watch: None,
-            dir_watch: None,
+            live: None,
+            why: None,
+            rescanning: None,
+            scanned: SystemTime::UNIX_EPOCH,
             files: HashMap::new(),
             rows: HashMap::new(),
             trail: Vec::new(),
@@ -402,42 +386,38 @@ impl Browser {
         b
     }
 
-    /// Scans the root on another thread.
+    /// Scans the root on another thread, then follows the changes on disk.
     pub fn scan(&mut self) {
-        // what the session's changes are counted against, until the scan
-        // is done
+        self.keep_baseline();
+        self.why = None;
+        self.rescanning = None;
+        let opts = LiveOptions {
+            scan: ScanOptions {
+                reclaimable: self.reclaimable,
+                ..ScanOptions::default()
+            },
+            // every poll takes a snapshot, or checks for changes
+            interval: Duration::ZERO,
+            ignore: self.env.cache.as_ref().map(|c| c.path().into()),
+            inotify: self.env.inotify,
+        };
+        self.live = Some(live(&self.root, opts));
+    }
+
+    /// What the session's changes are counted against, until the full
+    /// scan starting now, whose ids differ, is done.
+    fn keep_baseline(&mut self) {
         if let (Some(base), Some(view)) = (&mut self.baseline, &self.view)
             && view.status == Status::Done
             && base.of.is_none()
         {
             base.of = Some(view.tree.clone());
         }
-        self.watch = None;
-        self.dir_watch = None;
-        let (tx, started) = mpsc::channel();
-        let root = self.root.clone();
-        let opts = self.options();
-        let thread = thread::spawn(move || {
-            // the receiver only goes away with the browser
-            scan_live(&root, &opts, |p| {
-                let _ = tx.send(p);
-            })
-        });
-        self.scan = Some(Scan {
-            started,
-            progress: None,
-            thread,
-            dir: None,
-            why: None,
-        });
     }
 
-    /// [`Browser::scan`], started without being asked for, for `why`.
-    fn rescan_because(&mut self, why: &'static str) {
-        self.scan();
-        if let Some(scan) = &mut self.scan {
-            scan.why = Some(why);
-        }
+    /// A scan runs: the first, after lost changes, or of one dir.
+    fn busy(&self) -> bool {
+        self.live.as_ref().is_some_and(Live::busy)
     }
 
     /// Scans the dir at the cursor again, or at a file the current dir, on
@@ -456,25 +436,10 @@ impl Browser {
         if d == 0 {
             return self.rescan_all();
         }
-        let dir = below(&view.tree, d);
-        let changes = Changes {
-            rescan: vec![dir.clone().into()],
-            ..Changes::default()
-        };
-        let mut tree = view.tree.clone();
-        let opts = self.options();
-        let (_, started) = mpsc::channel();
-        let thread = thread::spawn(move || match tree.apply(&changes, &opts) {
-            Some(()) => Ok(tree),
-            None => Err(ScanError::Root(io::ErrorKind::NotFound.into())),
-        });
-        self.scan = Some(Scan {
-            started,
-            progress: None,
-            thread,
-            dir: Some(dir),
-            why: None,
-        });
+        self.rescanning = Some(below(&view.tree, d));
+        if let Some(live) = &mut self.live {
+            live.rescan(d);
+        }
     }
 
     /// Scans all of the root again, showing it as it grows.
@@ -491,86 +456,74 @@ impl Browser {
     /// Stops a running scan, and saves what it found, so the next run
     /// finishes it.
     pub fn quit(&mut self) -> io::Result<()> {
-        let Some(scan) = self.scan.take() else {
-            return Ok(());
-        };
-        self.stop.store(true, Ordering::Relaxed);
-        let tree = match scan.thread.join() {
-            Ok(Ok(tree)) => tree,
-            Ok(Err(_)) => return Ok(()),
-            Err(panic) => std::panic::resume_unwind(panic),
-        };
-        match &self.env.cache {
-            Some(cache) => cache.save(&self.root, &tree, self.reclaimable),
-            None => Ok(()),
+        let tree = self.live.take().and_then(Live::stop);
+        match (&self.env.cache, tree) {
+            (Some(cache), Some(tree)) => cache.save(&self.root, &tree, self.reclaimable),
+            _ => Ok(()),
         }
     }
 
-    /// Catches up with the running scan: shows a snapshot of it, unless a
-    /// saved scan is shown, or once it is done, its tree, and saves that.
-    /// Without a scan, applies the changes on disk since the last poll.
-    /// Returns whether a scan, or the update of a saved scan, still runs.
+    /// Catches up with the scan: shows a snapshot of it, unless a saved
+    /// scan is shown, or once it is done, its tree, and saves that. Then
+    /// shows the changes on disk since the last poll. Returns whether a
+    /// scan still runs.
     pub fn poll(&mut self, now: SystemTime) -> bool {
-        let Some(scan) = &mut self.scan else {
-            return self.follow();
-        };
-        if scan.thread.is_finished() {
-            let scan = self.scan.take().unwrap();
-            let done = match scan.thread.join() {
-                Ok(done) => done,
-                Err(panic) => std::panic::resume_unwind(panic),
-            };
-            match done {
-                // the watch kept running
-                Ok(tree) if scan.dir.is_some() => {
-                    if let (Some(base), Some(old)) = (&mut self.baseline, &self.view) {
-                        base.carry(&old.tree, &old.index, &tree, old.tree.len());
-                    }
-                    self.save(&tree);
-                    self.show_done(tree, Instant::now());
-                }
-                Ok(tree) => {
-                    self.save(&tree);
-                    // from where the scan started, so it sees the changes
-                    // made while it ran
-                    self.watch = Watch::start(&self.root, &tree, self.env.cache.as_ref());
-                    self.dir_watch =
-                        (self.watch.is_none()).then(|| DirWatch::new(self.env.inotify, now));
-                    match &mut self.baseline {
-                        Some(base) => {
-                            if let Some(old) = base.of.take() {
-                                base.carry(&old, &old.child_index(), &tree, 0);
-                            }
-                        }
-                        None => {
-                            self.baseline = Some(Baseline {
-                                sizes: tree.totals().size,
-                                at: now,
-                                of: None,
-                            });
-                        }
-                    }
-                    self.show_done(tree, Instant::now());
-                }
-                Err(e) => self.message = Some(format!("cannot scan: {e}")),
-            }
+        let Some(live) = &mut self.live else {
             return false;
+        };
+        match live.wait(Duration::ZERO) {
+            None => {}
+            Some(Err(e)) => {
+                self.rescanning = None;
+                self.message = Some(format!("cannot scan: {e}"));
+            }
+            // a saved scan shows until the scan is done
+            Some(Ok(Event::Scanning(tree))) => {
+                if !matches!(
+                    self.view.as_ref().map(|v| v.status),
+                    Some(Status::Saved { .. })
+                ) {
+                    self.show(tree, Status::Scanning);
+                }
+            }
+            Some(Ok(Event::Ready(tree))) => {
+                self.why = None;
+                self.scanned = now;
+                self.save(&tree);
+                match &mut self.baseline {
+                    Some(base) => {
+                        if let Some(old) = base.of.take() {
+                            base.carry(&old, &tree, 0);
+                        }
+                    }
+                    None => {
+                        self.baseline = Some(Baseline {
+                            sizes: (0..tree.len() as u32).map(|i| tree.size(i)).collect(),
+                            at: now,
+                            of: None,
+                        });
+                    }
+                }
+                self.show(tree, Status::Done);
+            }
+            Some(Ok(Event::Changed(tree, _))) => {
+                // dirs listed afresh come back as new records
+                if let (Some(base), Some(old)) = (&mut self.baseline, &self.view)
+                    && tree.len() > old.tree.len()
+                {
+                    base.carry(&old.tree, &tree, old.tree.len());
+                }
+                if self.rescanning.take().is_some() {
+                    self.save(&tree);
+                }
+                self.show(tree, Status::Done);
+            }
+            Some(Ok(Event::Rescanning(why))) => {
+                self.keep_baseline();
+                self.why = Some(why);
+            }
         }
-        if scan.progress.is_none() {
-            scan.progress = scan.started.try_recv().ok();
-        }
-        // a saved scan shows until the scan is done
-        if let Some(View {
-            status: Status::Saved { .. },
-            ..
-        }) = self.view
-        {
-            return true;
-        }
-        if let Some(tree) = scan.progress.as_ref().and_then(Progress::snapshot) {
-            self.show(tree, Status::Scanning);
-        }
-        true
+        self.busy()
     }
 
     /// Handles a key. Reveal and open go through `run`, given a program and
@@ -659,8 +612,8 @@ impl Browser {
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => self.back(),
             KeyCode::Char(c @ ('r' | 'o')) => self.reveal(self.cursor_path(), c == 'r', run),
             // a running scan is not restarted
-            KeyCode::Char('s') if self.scan.is_none() => self.rescan_dir(),
-            KeyCode::Char('S') if self.scan.is_none() => self.rescan_all(),
+            KeyCode::Char('s') if !self.busy() => self.rescan_dir(),
+            KeyCode::Char('S') if !self.busy() => self.rescan_all(),
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Char('d') => self.panel = Some(0),
             KeyCode::Char('t') => self.top = Some(Top::default()),
@@ -893,7 +846,7 @@ impl Browser {
     ) {
         let view = self.view.as_ref().unwrap();
         let styles = Styles::new(self.env.color);
-        let total = view.totals.size[d as usize];
+        let total = view.tree.size(d);
         let dir = below(&view.tree, d);
         let look = Look {
             bar: area.width >= BAR_COLUMN,
@@ -919,65 +872,6 @@ impl Browser {
                     style,
                 );
             }
-        }
-    }
-
-    /// Applies the changes on disk since the last poll to the tree shown,
-    /// once the watch has replayed those from before it started. Returns
-    /// whether a saved scan is still being brought up to date.
-    fn follow(&mut self) -> bool {
-        let poll = match (&mut self.watch, &mut self.dir_watch, &self.view) {
-            (Some(watch), _, _) => watch.poll(),
-            (None, Some(dirs), Some(view)) => dirs.poll(&view.tree),
-            _ => return false,
-        };
-        let changes = match poll {
-            Poll::Wait => return false,
-            Poll::Lost(why) => {
-                self.rescan_because(why);
-                return true;
-            }
-            Poll::Changes(changes) => changes,
-        };
-        if changes.is_empty() {
-            return false;
-        }
-        let started = Instant::now();
-        let View {
-            mut tree,
-            status,
-            index,
-            ..
-        } = self.view.take().expect("a watch follows a view");
-        // dirs listed afresh come back as new records
-        let old = (self.baseline.is_some() && !changes.rescan.is_empty()).then(|| tree.clone());
-        if tree.apply(&changes, &self.options()).is_none() {
-            self.show(tree, status);
-            self.rescan_because("macOS asked to scan all of it again");
-            return true;
-        }
-        if let (Some(base), Some(old)) = (&mut self.baseline, old) {
-            base.carry(&old, &index, &tree, old.len());
-        }
-        self.show_done(tree, started);
-        false
-    }
-
-    /// Shows `tree`, done since `started`, and tells the dir watch how long
-    /// that took, with the listings of the dirs shown, which `show` redoes.
-    fn show_done(&mut self, tree: Tree, started: Instant) {
-        self.show(tree, Status::Done);
-        if let Some(dirs) = &mut self.dir_watch {
-            dirs.listed(started.elapsed());
-        }
-    }
-
-    fn options(&self) -> ScanOptions {
-        let stop = Arc::clone(&self.stop);
-        ScanOptions {
-            reclaimable: self.reclaimable,
-            stop: Stop::new(move || stop.load(Ordering::Relaxed)),
-            ..ScanOptions::default()
         }
     }
 
@@ -1016,8 +910,8 @@ impl Browser {
         let mut dirs = vec![0];
         for name in &self.trail {
             let parent = *dirs.last().unwrap();
-            let named = |&k: &u32| view.tree.name(view.tree.record(k).name) == &name[..];
-            match view.index.children(parent).iter().copied().find(named) {
+            let named = |&k: &u32| view.tree.name(k) == &name[..];
+            match view.tree.children(parent).iter().copied().find(named) {
                 Some(k) => dirs.push(k),
                 None => break,
             }
@@ -1057,8 +951,8 @@ impl Browser {
             self.ensure(k);
             shown.push(k);
         }
-        if let (Some(dirs), Some(view)) = (&mut self.dir_watch, &self.view) {
-            dirs.show(&view.tree, &shown);
+        if let Some(live) = &mut self.live {
+            live.follow(&shown);
         }
     }
 
@@ -1072,9 +966,9 @@ impl Browser {
         }
         let private = self.reclaimable;
         let files = (self.files.entry(d)).or_insert_with(|| list(&view.tree, d, private));
-        let path = view.tree.dir_path(d);
+        let path = dir_path(&view.tree, d);
         // the root's name is the whole path
-        let parent = Path::new(OsStr::from_bytes(view.tree.name(view.tree.record(d).name)));
+        let parent = Path::new(OsStr::from_bytes(view.tree.name(d)));
         let parent = parent.file_name().unwrap_or_default().as_bytes();
         let sibling = |file: &str| files.iter().any(|f| *f.0 == *file.as_bytes());
         let real = self.real.as_ref().map(|real| {
@@ -1083,8 +977,8 @@ impl Browser {
             real
         });
         let home = self.real_home.as_ref().map(|h| h.as_os_str().as_bytes());
-        let dirs = view.index.children(d).iter().map(|&k| {
-            let name = view.tree.name(view.tree.record(k).name);
+        let dirs = view.tree.children(d).iter().map(|&k| {
+            let name = view.tree.name(k);
             let mut at = path.clone();
             join(&mut at, name);
             let at = Path::new(OsStr::from_bytes(&at));
@@ -1102,7 +996,7 @@ impl Browser {
             let inside = |file: &str| sys::exists(&at.join(file));
             let system = || sys::restricted(at);
             let tagged = || sys::starts_with(&at.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE);
-            let size = view.totals.size[k as usize];
+            let size = view.tree.size(k);
             // snapshots of a scan are of other ids
             let delta = match (&self.baseline, view.status) {
                 (Some(base), Status::Done) => size as i64 - base.size(k) as i64,
@@ -1110,7 +1004,7 @@ impl Browser {
             };
             Row {
                 size,
-                private: view.totals.private[k as usize],
+                private: view.tree.reclaimable(k),
                 item: Item::Dir(k),
                 label: labels::label(&dir, sibling, inside, system, tagged),
                 delta,
@@ -1240,7 +1134,7 @@ impl Browser {
     /// The path of the row at the cursor.
     fn cursor_path(&self) -> Option<Vec<u8>> {
         let (view, (_, name)) = (self.view.as_ref()?, self.at_cursor()?);
-        let mut path = view.tree.dir_path(self.dir());
+        let mut path = dir_path(&view.tree, self.dir());
         join(&mut path, name);
         Some(path)
     }
@@ -1268,14 +1162,14 @@ impl Browser {
     fn title(&self, now: SystemTime) -> String {
         let root = &self.display;
         // why a scan started by itself
-        let why = match self.scan.as_ref().and_then(|s| s.why) {
+        let why = match self.why {
             Some(why) => format!("  ({why})"),
             None => String::new(),
         };
         let Some(view) = &self.view else {
             return format!("{root}  scanning...{why}");
         };
-        let total = format_size(view.totals.size[0]);
+        let total = format_size(view.tree.size(0));
         let partial = match view.denied.len() {
             0 => String::new(),
             n => format!("  (partial: {n} denied)"),
@@ -1283,7 +1177,7 @@ impl Browser {
         // how much the root grew or shrank since the session started
         let change = match &self.baseline {
             Some(base) if view.status == Status::Done => {
-                match view.totals.size[0] as i64 - base.size(0) as i64 {
+                match view.tree.size(0) as i64 - base.size(0) as i64 {
                     0 => String::new(),
                     d => {
                         let age = age(now.duration_since(base.at).unwrap_or_default());
@@ -1297,31 +1191,27 @@ impl Browser {
             true => "  [by change]",
             false => "",
         };
-        let rescanning = match self.scan.as_ref().and_then(|s| s.dir.as_deref()) {
+        let rescanning = match &self.rescanning {
             Some(dir) => format!("  rescanning {}/...", String::from_utf8_lossy(dir)),
             None => String::new(),
         };
         match view.status {
             Status::Scanning => format!("{root}  scanning... at least {total}{why}"),
-            Status::Done => match &self.dir_watch {
-                // changes in the dirs not shown are not seen since
-                Some(dirs) => {
-                    let age = age(now.duration_since(dirs.scanned).unwrap_or_default());
-                    format!(
-                        "{root}  {total}{change}{partial}  scanned {age} ago{sorted}{rescanning}"
-                    )
-                }
-                None => format!("{root}  {total}{change}{partial}{sorted}{rescanning}"),
-            },
+            // changes in the dirs not shown are not seen since
+            Status::Done if self.live.as_ref().is_some_and(|l| !l.follows_all()) => {
+                let age = age(now.duration_since(self.scanned).unwrap_or_default());
+                format!("{root}  {total}{change}{partial}  scanned {age} ago{sorted}{rescanning}")
+            }
+            Status::Done => format!("{root}  {total}{change}{partial}{sorted}{rescanning}"),
             Status::Saved { at } => {
                 let age = age(now.duration_since(at).unwrap_or_default());
                 let stopped = match view.tree.stopped() {
                     true => " (incomplete)",
                     false => "",
                 };
-                let scanning = match self.scan {
-                    Some(_) => ", rescanning...",
-                    None => "",
+                let scanning = match self.busy() {
+                    true => ", rescanning...",
+                    false => "",
                 };
                 format!("{root}  {total}{partial}  saved {age} ago{stopped}{scanning}")
             }
@@ -1370,7 +1260,7 @@ impl Browser {
         let view = self.view.as_ref().filter(|v| v.status == Status::Done)?;
         let lost = self
             .used?
-            .checked_sub(view.totals.size[0])
+            .checked_sub(view.tree.size(0))
             .filter(|&n| n > 0)?;
         Some(format!("not accounted for: {}", format_size(lost)))
     }
@@ -1379,7 +1269,7 @@ impl Browser {
 /// The name bytes of `item`, a row of a dir listed as `files`.
 fn name<'a>(view: &'a View, files: &'a Files, item: Item) -> &'a [u8] {
     match item {
-        Item::Dir(k) => view.tree.name(view.tree.record(k).name),
+        Item::Dir(k) => view.tree.name(k),
         Item::File(i) => &files[i as usize].0,
     }
 }
@@ -1392,7 +1282,7 @@ fn list(tree: &Tree, d: u32, private: bool) -> Files {
     if tree.record(d).flags & (Record::DENIED | Record::OTHER_DEVICE) != 0 {
         return files;
     }
-    let path = tree.dir_path(d);
+    let path = dir_path(tree, d);
     let fd = match d {
         // a symlinked root is followed, as the scan does
         0 => sys::open_root(Path::new(OsStr::from_bytes(&path))),
@@ -1434,14 +1324,10 @@ fn line(
     styles: &Styles,
 ) -> Line<'static> {
     let label = String::from_utf8_lossy(name(view, files, row.item)).into_owned();
-    let flags = match row.item {
-        Item::Dir(k) => view.totals.flags[k as usize],
-        Item::File(_) => 0,
-    };
     // something below was denied, so the sizes are lower bounds
-    let plus = match flags & Record::PARTIAL {
-        0 => " ",
-        _ => "+",
+    let plus = match row.item {
+        Item::Dir(k) if view.tree.partial(k) => "+",
+        _ => " ",
     };
     let size = |n: u64| Span::styled(format!("{:>10}", format_size(n)), styles.size(n));
     let mut spans = vec![size(row.size), Span::styled(plus, styles.dim)];
@@ -1463,10 +1349,10 @@ fn line(
     match row.item {
         Item::Dir(k) => {
             spans.push(Span::styled(format!("{label}/"), styles.dir));
-            let marker = suffix(&view.tree.record(k), flags & !Record::PARTIAL);
-            spans.push(match flags & Record::DENIED {
-                0 => Span::styled(marker, styles.dim),
-                _ => Span::styled(marker, styles.denied),
+            spans.push(match view.tree.error(k) {
+                Some(error) => Span::styled(format!(" (denied: {error})"), styles.denied),
+                None if view.tree.other_device(k) => Span::styled(" (other device)", styles.dim),
+                None => Span::raw(""),
             });
             if let Some(l) = row.label {
                 let style = match l.tier {
@@ -1523,7 +1409,7 @@ fn panel(
     let offset = offset.min(view.denied.len().saturating_sub(height));
     let lines = (area.y + 1..area.bottom()).zip(&view.denied[offset..]);
     for (y, (path, id)) in lines {
-        let why = reason(&view.tree.record(*id), terminal);
+        let why = reason(&view.tree, *id, terminal);
         let line = Line::from_iter([
             Span::raw(format!("{}  ", String::from_utf8_lossy(path))),
             Span::styled(why, styles.denied),
@@ -1632,37 +1518,12 @@ fn scroll(offset: usize, at: usize, height: usize) -> usize {
     offset.min(at).max((at + 1).saturating_sub(height))
 }
 
-/// The path of dir `d` below the root: its names joined by `/`, empty
-/// for the root.
-fn below(tree: &Tree, d: u32) -> Vec<u8> {
-    let mut names = Vec::new();
-    let mut i = d;
-    while i != 0 {
-        let r = tree.record(i);
-        names.push(tree.name(r.name));
-        i = r.parent;
-    }
-    names.reverse();
-    names.join(&b'/')
-}
-
 /// Appends `name` to `path`, a path below the root, which may be empty.
 fn join_below(path: &mut Vec<u8>, name: &[u8]) {
     if !path.is_empty() {
         path.push(b'/');
     }
     path.extend_from_slice(name);
-}
-
-/// The record id of the dir at `path` below the root of `view`, if it is
-/// in the tree.
-fn find(view: &View, path: &[u8]) -> Option<u32> {
-    let mut d = 0;
-    for name in path.split(|&b| b == b'/').filter(|n| !n.is_empty()) {
-        let named = |&&k: &&u32| view.tree.name(view.tree.record(k).name) == name;
-        d = *view.index.children(d).iter().find(named)?;
-    }
-    Some(d)
 }
 
 /// Draws the picks, below the root `root`, from `list`'s offset, the one
@@ -1678,8 +1539,8 @@ fn picks(
     list: &mut Picks,
     styles: &Styles,
 ) {
-    let size = |path: &[u8]| match find(view, path) {
-        Some(d) => Some(view.totals.size[d as usize]),
+    let size = |path: &[u8]| match view.tree.find(Path::new(OsStr::from_bytes(path))) {
+        Some(d) => Some(view.tree.size(d)),
         None => {
             let mut full = root.to_vec();
             join(&mut full, path);

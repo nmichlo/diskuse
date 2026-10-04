@@ -1,5 +1,6 @@
-# The PyPI package: the Python API (`import diskuse`) and the `diskuse`
-# command, a console script calling the same CLI as the binary.
+# The PyPI package: the Python API (`import diskuse`, all Rust, see
+# python/src/lib.rs) and the `diskuse` command, a console script calling the
+# same CLI as the binary.
 
 [build-system]
 # 1.9.3: the first to put `license-files` in the sdist too
@@ -28,8 +29,7 @@ dynamic = ["version"]
 diskuse = "diskuse:_cli"
 
 [project.optional-dependencies]
-# Tree.to_arrow()
-arrow = ["pyarrow>=14"]
+test = ["pytest", "pyarrow>=14"]
 
 [project.urls]
 Repository = "https://github.com/nmichlo/diskuse"
@@ -37,16 +37,38 @@ Issues = "https://github.com/nmichlo/diskuse/issues"
 
 [tool.maturin]
 manifest-path = "python/Cargo.toml"
-python-source = "python"
-module-name = "diskuse._diskuse"
+module-name = "diskuse"
 # here, not in Cargo's release profile, so local release builds keep symbols
 # for profiling
 strip = true
 
-# ruff reads `requires-python` above, which is for the wheel. bench/run.py is
-# the only Python here, a dev script that needs 3.10
+# ruff reads `requires-python` above, which is for the wheel. the Python here
+# (tests, bench, the example) is dev-only and needs 3.10
 [tool.ruff]
+line-length = 120
 target-version = "py310"
+
+[tool.ruff.lint]
+# `E4/E7/E9 + F` is the ruff default, `I` sorts imports, `UP` modernises
+# syntax for the python floor, `TID251` enforces the banned-api list below.
+# `B009`/`B010` ban `getattr(x, "const")` / `setattr(x, "const", v)`.
+select = ["E4", "E7", "E9", "F", "I", "UP", "TID251", "B009", "B010"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"typing.Any".msg = "Any disables type checking wherever it appears. Use a precise type, a TypeVar, a Protocol, or a dedicated sentinel class."
+"typing.cast".msg = "cast asserts a type the checker cannot verify. Narrow with isinstance/assert, or fix the annotation."
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+# ty runs as a pre-commit hook. it needs the package built into `.venv`:
+#     uv sync --extra test
+[tool.ty.environment]
+python-version = "3.10"
+
+[tool.ty.src]
+# its dependencies are inline (PEP 723), so not in `.venv`
+exclude = ["python/examples"]
 
 # rebuild the extension when the Rust changes, not only pyproject.toml
 [tool.uv]

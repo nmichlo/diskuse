@@ -1,6 +1,5 @@
 //! The `diskuse scan` text output.
 
-use crate::sys;
 use crate::tree::{ReadTree, Record};
 use std::cmp::Ordering;
 use std::fmt::Write;
@@ -10,8 +9,6 @@ use std::fmt::Write;
 /// bytes not shared with a clone. `top` appends that many of the largest
 /// files. The first line says so if the tree is partial or stopped.
 pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> String {
-    let totals = tree.totals();
-    let index = tree.child_index();
     let denied = count_denied(tree);
     let sizes = |size: u64, private: u64| match reclaimable {
         true => format!("{:>10}  {:>10}", format_size(size), format_size(private)),
@@ -20,8 +17,8 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> St
 
     let mut out = format!(
         "{}  {}",
-        sizes(totals.size[0], totals.private[0]),
-        String::from_utf8_lossy(tree.name(tree.record(0).name))
+        sizes(tree.size(0), tree.reclaimable(0)),
+        String::from_utf8_lossy(tree.name(0))
     );
     if denied > 0 {
         write!(out, "  (partial: {denied} denied)").unwrap();
@@ -32,19 +29,11 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> St
     out.push('\n');
 
     // (size, private, name bytes for the tie-break, label)
-    let mut rows: Vec<(u64, u64, &[u8], String)> = index
-        .children(0)
-        .iter()
+    let mut rows: Vec<(u64, u64, &[u8], String)> = (tree.children(0).iter())
         .map(|&i| {
-            let r = tree.record(i);
-            let name = tree.name(r.name);
-            let label = format!(
-                "{}/{}",
-                String::from_utf8_lossy(name),
-                suffix(&r, totals.flags[i as usize])
-            );
-            let i = i as usize;
-            (totals.size[i], totals.private[i], name, label)
+            let name = tree.name(i);
+            let label = format!("{}/{}", String::from_utf8_lossy(name), suffix(tree, i));
+            (tree.size(i), tree.reclaimable(i), name, label)
         })
         .collect();
     let root = tree.record(0);
@@ -57,9 +46,8 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>) -> St
     }
     if let Some(n) = top {
         out.push_str("\nlargest files:\n");
-        for (size, path) in largest_files(tree, n) {
-            let path = String::from_utf8_lossy(&path);
-            writeln!(out, "{:>10}  {path}", format_size(size)).unwrap();
+        for (path, size) in tree.largest_files(n) {
+            writeln!(out, "{:>10}  {}", format_size(size), path.display()).unwrap();
         }
     }
     out
@@ -74,16 +62,6 @@ pub(crate) fn largest_first(a: (u64, &[u8]), b: (u64, &[u8])) -> Ordering {
     b.0.cmp(&a.0).then(a.1.cmp(b.1))
 }
 
-/// The `n` largest files as `(bytes, path)`, ties by path bytes.
-pub fn largest_files(tree: &impl ReadTree, n: usize) -> Vec<(u64, Vec<u8>)> {
-    let mut files: Vec<_> = (tree.largest())
-        .map(|(bytes, dir, name)| (bytes, tree.path(dir, name)))
-        .collect();
-    files.sort_by(|a, b| largest_first((a.0, &a.1), (b.0, &b.1)));
-    files.truncate(n);
-    files
-}
-
 /// How many directories could not be read.
 fn count_denied(tree: &impl ReadTree) -> usize {
     (0..tree.len() as u32)
@@ -92,26 +70,16 @@ fn count_denied(tree: &impl ReadTree) -> usize {
 }
 
 /// The marker after a directory's name: ` (denied: EACCES)`,
-/// ` (other device)`, ` (partial)` or nothing. `flags` is from
-/// [`crate::Totals::flags`].
-pub(crate) fn suffix(r: &Record, flags: u16) -> String {
-    if flags & Record::DENIED != 0 {
-        format!(" (denied: {})", denied(r))
-    } else if flags & Record::OTHER_DEVICE != 0 {
+/// ` (other device)`, ` (partial)` or nothing.
+pub(crate) fn suffix(tree: &impl ReadTree, id: u32) -> String {
+    if let Some(error) = tree.error(id) {
+        format!(" (denied: {error})")
+    } else if tree.other_device(id) {
         " (other device)".into()
-    } else if flags & Record::PARTIAL != 0 {
+    } else if tree.partial(id) {
         " (partial)".into()
     } else {
         String::new()
-    }
-}
-
-/// Why a [`Record::DENIED`] dir could not be read: `EACCES`, `EPERM` or
-/// `errno N`.
-pub fn denied(r: &Record) -> String {
-    match sys::errno_name(r.errno) {
-        Some(name) => name.into(),
-        None => format!("errno {}", r.errno),
     }
 }
 

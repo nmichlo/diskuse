@@ -70,25 +70,50 @@ Sizes are allocated bytes like `du -x`. Scans stay on one disk, never follow sym
 
 <br/>
 
+## 🦀 &nbsp;Rust
+
+The scanner is a library too (`cargo add diskuse`). Folders are ids, and the root is 0:
+
+```rust
+use diskuse::{Event, LiveOptions, ReadTree, ScanOptions};
+
+let tree = diskuse::scan(path, &ScanOptions::default())?;
+for &k in tree.children(0) {
+    println!("{} {}", tree.size(k), tree.path(k).display()); // allocated bytes, like du
+}
+tree.find(Path::new("a/b")); // Some(id)
+tree.largest_files(10); // [(path, bytes), ...]
+
+for event in diskuse::live(path, LiveOptions::default()) {
+    match event? {
+        Event::Ready(tree) => {} // the scan finished
+        Event::Changed(tree, changes) => {} // [(path, delta_bytes), ...]
+        _ => {}
+    }
+}
+```
+
+<br/>
+
 ## 🐍 &nbsp;Python
 
-The same package can also be used from Python:
+The same API from Python (`pip install diskuse`):
 
 ```python
 import diskuse
 
 tree = diskuse.scan("~/src")
-print(tree.root.size)  # allocated bytes, like du
-for d in tree.root.children():  # largest first
-    print(d.size, d.name)
+for k in tree.children(0):
+    print(tree.size(k), tree.path(k))  # allocated bytes, like du
+tree.find("a/b")  # id or None
 tree.largest_files(10)  # [(path, bytes), ...]
-tree.to_arrow()  # every folder as a row, needs pyarrow
+pyarrow.table(tree)  # every folder as a row, also polars and duckdb
 
-for e in diskuse.live("~/src"):  # or: async for e in ...
-    match e:
-        case diskuse.Ready(tree):
+for event in diskuse.live("~/src"):  # or: async for
+    match event:
+        case diskuse.Event.Ready(tree):
             ...  # the scan finished
-        case diskuse.Changed(tree, changes):
+        case diskuse.Event.Changed(tree, changes):
             ...  # [(path, delta_bytes), ...]
 ```
 

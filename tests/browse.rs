@@ -957,7 +957,7 @@ fn guides_to_full_disk_access_once_before_the_first_scan() {
     let f = fixture();
     let e = expected(&f);
     let total = diskuse::scan(f.dir.path(), &ScanOptions::default()).unwrap();
-    let used = total.totals().size[0] + (1 << 20);
+    let used = total.size(0) + (1 << 20);
     let mut app = enter_volume(&f, used, FullDiskAccess::Missing);
     let guide: Vec<Line> = [
         "Full Disk Access is off for iTerm",

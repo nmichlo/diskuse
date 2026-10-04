@@ -6,12 +6,16 @@
 //! A live update appends the dirs new since, so the order holds, and flags
 //! the ones gone [`Record::REMOVED`] rather than moving any record.
 
+use crate::sys;
 use hashbrown::HashTable;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::hash::{BuildHasher, RandomState};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// How many of the largest files a scan keeps.
 pub const LARGEST: usize = 1000;
@@ -21,7 +25,7 @@ pub const LARGEST: usize = 1000;
 pub struct Record {
     /// Index of the parent record, [`Record::NO_PARENT`] for the root.
     pub parent: u32,
-    /// Id for [`Tree::name`].
+    /// Id for [`ReadTree::raw_name`].
     pub name: u32,
     /// [`Record::DENIED`], [`Record::OTHER_DEVICE`] and [`Record::REMOVED`]
     /// bits.
@@ -39,37 +43,45 @@ impl Record {
     pub const DENIED: u16 = 1 << 0;
     /// On another device than the root, so not descended into (`du -x`).
     pub const OTHER_DEVICE: u16 = 1 << 1;
-    /// Only in [`Totals::flags`]: some descendant is [`Record::DENIED`].
+    /// Never in a record: some descendant is [`Record::DENIED`], see
+    /// [`ReadTree::partial`].
     pub const PARTIAL: u16 = 1 << 2;
-    /// Gone since the scan, like everything below it. Its `own` is 0, and [`Tree::child_index`] leaves it out. No other
-    /// bit is set.
+    /// Gone since the scan, like everything below it. Its `own` is 0, and
+    /// [`ReadTree::children`] leaves it out. No other bit is set.
     pub const REMOVED: u16 = 1 << 3;
 }
 
-/// Per-record values that depend on descendants.
-#[derive(Debug)]
-pub struct Totals {
-    /// `own` of the record plus that of all its descendants.
-    pub size: Vec<u64>,
-    /// The same sum of [`ReadTree::own_private`].
-    pub private: Vec<u64>,
-    /// The record's flags plus [`Record::PARTIAL`].
-    pub flags: Vec<u16>,
-}
+/// What [`ReadTree`]'s per-folder methods read, computed from the records
+/// on first use. Sealed: only this crate's trees hold one.
+pub(crate) mod cache {
+    use std::sync::OnceLock;
 
-/// Children of every record: `kids[start[id]..start[id + 1]]`.
-#[derive(Debug)]
-pub struct ChildIndex {
-    pub start: Vec<u32>,
-    pub kids: Vec<u32>,
-}
+    #[derive(Clone, Debug)]
+    pub struct Derived {
+        /// `own` of each record plus that of all its descendants.
+        pub size: Vec<u64>,
+        /// The same sum of [`super::ReadTree::own_private`].
+        pub private: Vec<u64>,
+        /// Each record's flags plus [`super::Record::PARTIAL`].
+        pub flags: Vec<u16>,
+        /// The children of record `id` are `kids[start[id]..start[id + 1]]`.
+        pub start: Vec<u32>,
+        pub kids: Vec<u32>,
+    }
 
-impl ChildIndex {
-    pub fn children(&self, id: u32) -> &[u32] {
-        let id = id as usize;
-        &self.kids[self.start[id] as usize..self.start[id + 1] as usize]
+    impl Derived {
+        pub fn children(&self, id: u32) -> &[u32] {
+            let id = id as usize;
+            &self.kids[self.start[id] as usize..self.start[id + 1] as usize]
+        }
+    }
+
+    pub trait Cached {
+        fn cache(&self) -> &OnceLock<Derived>;
     }
 }
+
+use cache::{Cached, Derived};
 
 /// One of the [`LARGEST`] largest files. Ordered by `bytes` first.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize)]
@@ -107,13 +119,16 @@ pub struct Tree {
     pub(crate) since: u64,
     /// The scan was stopped before it listed every dir.
     pub(crate) stopped: bool,
+    /// Reset by every change to the records.
+    pub(crate) cache: OnceLock<Derived>,
 }
 
 /// Read access to a tree: an owned [`Tree`], or a saved one read in place
 /// ([`crate::SavedTree`]), so `show` prints a saved scan without building a
-/// [`Tree`].
-pub trait ReadTree {
-    /// How many records there are.
+/// [`Tree`]. Folders are record ids, the root is 0, and a parent's id is
+/// always below its children's.
+pub trait ReadTree: Cached {
+    /// How many records there are, including [`Record::REMOVED`] ones.
     fn len(&self) -> usize;
 
     fn is_empty(&self) -> bool {
@@ -127,8 +142,9 @@ pub trait ReadTree {
     /// macOS.
     fn own_private(&self, id: u32) -> u64;
 
-    /// Raw name bytes. The root's name is the scanned path as given.
-    fn name(&self, name: u32) -> &[u8];
+    /// The name with id `name` ([`Record::name`]). Name 0 is the root's,
+    /// the scanned path as given.
+    fn raw_name(&self, name: u32) -> &[u8];
 
     /// The [`LARGEST`] largest files, or all if fewer, in no particular
     /// order, as `(bytes, dir, name)`: see [`LargeFile`].
@@ -138,82 +154,171 @@ pub trait ReadTree {
     /// bounds.
     fn stopped(&self) -> bool;
 
-    /// The path of directory `id`: the root's name, then `/` and each name
-    /// below it.
-    fn dir_path(&self, id: u32) -> Vec<u8> {
-        let mut names = Vec::new();
-        let mut i = id;
-        while i != 0 {
-            let r = self.record(i);
-            names.push(self.name(r.name));
-            i = r.parent;
-        }
-        let mut path = self.name(0).to_vec();
-        for name in names.iter().rev() {
-            join(&mut path, name);
-        }
-        path
+    /// The name of folder `id`; for the root, the scanned path as given.
+    fn name(&self, id: u32) -> &[u8] {
+        self.raw_name(self.record(id).name)
     }
 
-    /// The path of file `name` in directory `dir`, like
-    /// [`ReadTree::dir_path`].
-    fn path(&self, dir: u32, name: &[u8]) -> Vec<u8> {
-        let mut path = self.dir_path(dir);
+    /// The path of folder `id`: the root's, then each name below it.
+    fn path(&self, id: u32) -> PathBuf {
+        OsString::from_vec(dir_path(self, id)).into()
+    }
+
+    /// Allocated bytes of folder `id` and everything below it.
+    fn size(&self, id: u32) -> u64 {
+        derived(self).size[id as usize]
+    }
+
+    /// Allocated bytes of folder `id` itself and its files.
+    fn own(&self, id: u32) -> u64 {
+        self.record(id).own
+    }
+
+    /// Of [`ReadTree::size`], the bytes deleting the folder frees: see
+    /// [`ReadTree::own_private`].
+    fn reclaimable(&self, id: u32) -> u64 {
+        derived(self).private[id as usize]
+    }
+
+    /// Why folder `id` could not be read (`EACCES`, `EPERM`, `errno N`).
+    fn error(&self, id: u32) -> Option<String> {
+        let r = self.record(id);
+        (r.flags & Record::DENIED != 0).then(|| match sys::errno_name(r.errno) {
+            Some(name) => name.into(),
+            None => format!("errno {}", r.errno),
+        })
+    }
+
+    /// Something below folder `id` could not be read, so its size is a
+    /// lower bound.
+    fn partial(&self, id: u32) -> bool {
+        derived(self).flags[id as usize] & Record::PARTIAL != 0
+    }
+
+    /// Folder `id` is a mount point, not scanned into (`du -x`).
+    fn other_device(&self, id: u32) -> bool {
+        self.record(id).flags & Record::OTHER_DEVICE != 0
+    }
+
+    /// The subfolders of `id`, in no particular order, leaving out
+    /// [`Record::REMOVED`] ones.
+    fn children(&self, id: u32) -> &[u32] {
+        derived(self).children(id)
+    }
+
+    /// The folder at `path`: relative to the root, or absolute and below
+    /// it. `.` parts are skipped.
+    fn find(&self, path: &Path) -> Option<u32> {
+        let root = Path::new(OsStr::from_bytes(self.raw_name(0)));
+        let below = match path.is_absolute() {
+            true => path.strip_prefix(root).ok()?,
+            false => path,
+        };
+        let mut id = 0;
+        for part in below.components() {
+            let name = match part {
+                Component::CurDir => continue,
+                Component::Normal(name) => name.as_bytes(),
+                _ => return None,
+            };
+            id = *self.children(id).iter().find(|&&k| self.name(k) == name)?;
+        }
+        Some(id)
+    }
+
+    /// The `n` largest files, of the [`LARGEST`] kept, as `(path, bytes)`,
+    /// largest first, ties by path.
+    fn largest_files(&self, n: usize) -> Vec<(PathBuf, u64)> {
+        let mut files: Vec<_> = (self.largest())
+            .map(|(bytes, dir, name)| (file_path(self, dir, name), bytes))
+            .collect();
+        files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        files.truncate(n);
+        (files.into_iter())
+            .map(|(path, bytes)| (OsString::from_vec(path).into(), bytes))
+            .collect()
+    }
+}
+
+/// The path of folder `id` as bytes, as [`ReadTree::path`].
+pub(crate) fn dir_path(tree: &(impl ReadTree + ?Sized), id: u32) -> Vec<u8> {
+    let mut names = Vec::new();
+    let mut i = id;
+    while i != 0 {
+        let r = tree.record(i);
+        names.push(tree.raw_name(r.name));
+        i = r.parent;
+    }
+    let mut path = tree.raw_name(0).to_vec();
+    for name in names.iter().rev() {
         join(&mut path, name);
-        path
     }
+    path
+}
 
-    fn totals(&self) -> Totals {
-        let n = self.len();
-        let (mut size, mut private, mut flags) = (vec![0; n], vec![0; n], vec![0; n]);
-        // children come after parents, so one backwards pass sees every child
-        // before its parent
-        for i in (0..n).rev() {
-            let r = self.record(i as u32);
-            size[i] += r.own;
-            private[i] += self.own_private(i as u32);
-            flags[i] |= r.flags;
-            if i > 0 {
-                let p = r.parent as usize;
-                size[p] += size[i];
-                private[p] += private[i];
-                if flags[i] & (Record::DENIED | Record::PARTIAL) != 0 {
-                    flags[p] |= Record::PARTIAL;
-                }
+/// The path of file `name` in folder `dir`, as [`dir_path`].
+pub(crate) fn file_path(tree: &(impl ReadTree + ?Sized), dir: u32, name: &[u8]) -> Vec<u8> {
+    let mut path = dir_path(tree, dir);
+    join(&mut path, name);
+    path
+}
+
+fn derived<T: ReadTree + ?Sized>(tree: &T) -> &Derived {
+    tree.cache().get_or_init(|| derive(tree))
+}
+
+/// One backwards pass for the sums, as children come after parents, and
+/// two forward ones for the children of each record.
+pub(crate) fn derive(tree: &(impl ReadTree + ?Sized)) -> Derived {
+    let n = tree.len();
+    let (mut size, mut private, mut flags) = (vec![0; n], vec![0; n], vec![0; n]);
+    for i in (0..n).rev() {
+        let r = tree.record(i as u32);
+        size[i] += r.own;
+        private[i] += tree.own_private(i as u32);
+        flags[i] |= r.flags;
+        if i > 0 {
+            let p = r.parent as usize;
+            size[p] += size[i];
+            private[p] += private[i];
+            if flags[i] & (Record::DENIED | Record::PARTIAL) != 0 {
+                flags[p] |= Record::PARTIAL;
             }
-        }
-        Totals {
-            size,
-            private,
-            flags,
         }
     }
+    let there = |r: &Record| r.flags & Record::REMOVED == 0;
+    let mut start = vec![0u32; n + 1];
+    for i in 1..n {
+        let r = tree.record(i as u32);
+        if there(&r) {
+            start[r.parent as usize + 1] += 1;
+        }
+    }
+    for i in 1..=n {
+        start[i] += start[i - 1];
+    }
+    let mut next = start.clone();
+    let mut kids = vec![0u32; start[n] as usize];
+    for i in 1..n {
+        let r = tree.record(i as u32);
+        if there(&r) {
+            let slot = &mut next[r.parent as usize];
+            kids[*slot as usize] = i as u32;
+            *slot += 1;
+        }
+    }
+    Derived {
+        size,
+        private,
+        flags,
+        start,
+        kids,
+    }
+}
 
-    /// The children of every record not [`Record::REMOVED`].
-    fn child_index(&self) -> ChildIndex {
-        let n = self.len();
-        let there = |r: &Record| r.flags & Record::REMOVED == 0;
-        let mut start = vec![0u32; n + 1];
-        for i in 1..n {
-            let r = self.record(i as u32);
-            if there(&r) {
-                start[r.parent as usize + 1] += 1;
-            }
-        }
-        for i in 1..=n {
-            start[i] += start[i - 1];
-        }
-        let mut next = start.clone();
-        let mut kids = vec![0u32; start[n] as usize];
-        for i in 1..n {
-            let r = self.record(i as u32);
-            if there(&r) {
-                let slot = &mut next[r.parent as usize];
-                kids[*slot as usize] = i as u32;
-                *slot += 1;
-            }
-        }
-        ChildIndex { start, kids }
+impl Cached for Tree {
+    fn cache(&self) -> &OnceLock<Derived> {
+        &self.cache
     }
 }
 
@@ -230,7 +335,7 @@ impl ReadTree for Tree {
         self.private.get(id as usize).copied().unwrap_or(0)
     }
 
-    fn name(&self, name: u32) -> &[u8] {
+    fn raw_name(&self, name: u32) -> &[u8] {
         &self.names[name as usize]
     }
 
@@ -336,6 +441,19 @@ fn scatter(base: Vec<u64>, pairs: impl Iterator<Item = (u32, u64)>, len: usize) 
     all
 }
 
+/// The path of folder `d` below the root: its names joined by `/`, empty
+/// for the root.
+pub(crate) fn below(tree: &impl ReadTree, d: u32) -> Vec<u8> {
+    let mut names = Vec::new();
+    let mut i = d;
+    while i != 0 {
+        names.push(tree.name(i));
+        i = tree.record(i).parent;
+    }
+    names.reverse();
+    names.join(&b'/')
+}
+
 /// Appends `name` to `path` after a `/`.
 pub(crate) fn join(path: &mut Vec<u8>, name: &[u8]) {
     // `scan /` must not print `//usr`
@@ -407,6 +525,7 @@ impl Progress {
             private,
             since: 0,
             stopped: false,
+            cache: OnceLock::new(),
         })
     }
 }
@@ -561,6 +680,7 @@ impl Builder {
             links,
             since,
             stopped,
+            cache: OnceLock::new(),
         }
     }
 }

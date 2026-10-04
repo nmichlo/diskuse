@@ -1,45 +1,41 @@
 //! The `--json` output: one object, the root dir, with its subdirectories
 //! nested in `children`. Written by hand, as the schema is small.
 
-use crate::report::{denied, largest_files, largest_first};
-use crate::tree::{ReadTree, Record};
+use crate::report::largest_first;
+use crate::tree::ReadTree;
 use std::fmt::Write;
+use std::os::unix::ffi::OsStrExt;
 
 /// The root and `depth` levels of subdirectories below it, each level
 /// ordered like [`crate::report`]. `reclaimable` adds `reclaimable` sizes,
 /// and `top` a `largest_files` list to the root. The root of a tree a
 /// stopped scan has `incomplete`.
 pub fn json(tree: &impl ReadTree, reclaimable: bool, depth: usize, top: Option<usize>) -> String {
-    let totals = tree.totals();
-    let index = tree.child_index();
     let kids = |id: u32| {
-        let mut kids = index.children(id).to_vec();
+        let mut kids = tree.children(id).to_vec();
         kids.sort_by(|&a, &b| {
-            let key = |i: u32| (totals.size[i as usize], tree.name(tree.record(i).name));
+            let key = |i: u32| (tree.size(i), tree.name(i));
             largest_first(key(a), key(b))
         });
         kids.into_iter()
     };
     // every key but `children`, and no closing brace
     let node = |out: &mut String, id: u32| {
-        let r = tree.record(id);
-        let i = id as usize;
         out.push_str("{\"name\":");
-        let lossy = string(out, tree.name(r.name));
-        write!(out, ",\"size\":{}", totals.size[i]).unwrap();
+        let lossy = string(out, tree.name(id));
+        write!(out, ",\"size\":{}", tree.size(id)).unwrap();
         if reclaimable {
-            write!(out, ",\"reclaimable\":{}", totals.private[i]).unwrap();
+            write!(out, ",\"reclaimable\":{}", tree.reclaimable(id)).unwrap();
         }
-        write!(out, ",\"own\":{}", r.own).unwrap();
-        let flags = totals.flags[i];
-        if flags & Record::DENIED != 0 {
+        write!(out, ",\"own\":{}", tree.own(id)).unwrap();
+        if let Some(error) = tree.error(id) {
             out.push_str(",\"denied\":");
-            string(out, denied(&r).as_bytes());
+            string(out, error.as_bytes());
         }
-        if flags & Record::OTHER_DEVICE != 0 {
+        if tree.other_device(id) {
             out.push_str(",\"other_device\":true");
         }
-        if flags & Record::PARTIAL != 0 {
+        if tree.partial(id) {
             out.push_str(",\"partial\":true");
         }
         if lossy {
@@ -85,12 +81,12 @@ pub fn json(tree: &impl ReadTree, reclaimable: bool, depth: usize, top: Option<u
     }
     if let Some(n) = top {
         out.push_str(",\"largest_files\":[");
-        for (k, (size, path)) in largest_files(tree, n).into_iter().enumerate() {
+        for (k, (path, size)) in tree.largest_files(n).into_iter().enumerate() {
             if k > 0 {
                 out.push(',');
             }
             out.push_str("{\"path\":");
-            string(&mut out, &path);
+            string(&mut out, path.as_os_str().as_bytes());
             write!(out, ",\"size\":{size}}}").unwrap();
         }
         out.push(']');
