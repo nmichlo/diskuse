@@ -27,7 +27,7 @@ pub use app::{App, Preflight, browse};
 pub use browse::{Browser, Env};
 pub use cli::cli;
 pub use json::json;
-pub use live::{Event, Live, LiveOptions, live};
+pub use live::{Event, Live, LiveOptions, Waker, live};
 pub use report::report;
 pub use scan::{Reader, ScanError, ScanOptions, Stop, scan, scan_live};
 pub use store::{CacheDir, Saved, SavedFile, SavedTree};
