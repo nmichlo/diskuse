@@ -8,7 +8,7 @@ use arrow_array::{
     ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, RecordBatch, RecordBatchIterator,
     UInt32Array, UInt64Array,
 };
-use diskuse::{Event, LiveOptions, ReadTree, Record, ScanError, ScanOptions, Tree};
+use diskuse::{Event, LiveOptions, ReadTree, Record, ScanError, ScanOptions, Tree, Waker};
 use pyo3::exceptions::{PyIndexError, PyOSError, PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyCapsule, PyTuple};
@@ -19,9 +19,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// How long a wait for an event runs without the GIL before Python gets to
-/// check for Ctrl-C, or `follow` and `rescan` get the live scan.
-const SLICE: Duration = Duration::from_millis(50);
+/// How often a sync `for` over a live scan checks for Ctrl-C: Python only
+/// handles signals when the wait returns to it.
+const SIGNALS: Duration = Duration::from_millis(50);
 
 /// `path` with `~` expanded, as `os.path.expanduser`.
 fn expand(py: Python<'_>, path: PathBuf) -> PyResult<PathBuf> {
@@ -225,15 +225,19 @@ impl From<Event> for PyEvent {
 
 /// A live scan: iterate it, sync or async. Leaving the loop stops it.
 #[pyclass(frozen, name = "Live", module = "diskuse")]
-struct PyLive(Mutex<diskuse::Live>);
+struct PyLive {
+    live: Mutex<diskuse::Live>,
+    /// Wakes the wait holding `live`, which needs no lock.
+    waker: Waker,
+}
 
 impl PyLive {
-    /// The next event, waiting at most [`SLICE`] without the GIL. `Err(None)`
-    /// once the scan failed and nothing comes again.
-    fn wait(&self, py: Python<'_>) -> Result<Option<PyEvent>, Option<PyErr>> {
+    /// The next event, waiting at most `timeout` without the GIL, or until
+    /// woken. `Err(None)` once the scan failed and nothing comes again.
+    fn wait(&self, py: Python<'_>, timeout: Duration) -> Result<Option<PyEvent>, Option<PyErr>> {
         let (event, done) = py.detach(|| {
-            let mut live = self.0.lock().unwrap();
-            (live.wait(SLICE), live.is_done())
+            let mut live = self.live.lock().unwrap();
+            (live.wait(timeout), live.is_done())
         });
         match event {
             Some(Ok(event)) => Ok(Some(event.into())),
@@ -256,7 +260,11 @@ fn live(py: Python<'_>, path: PathBuf, interval: f64, threads: Option<usize>) ->
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
         ..LiveOptions::default()
     };
-    Ok(PyLive(Mutex::new(py.detach(|| diskuse::live(&path, opts)))))
+    let live = py.detach(|| diskuse::live(&path, opts));
+    Ok(PyLive {
+        waker: live.waker(),
+        live: Mutex::new(live),
+    })
 }
 
 #[pymethods]
@@ -267,7 +275,7 @@ impl PyLive {
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyEvent>> {
         loop {
-            match self.wait(py) {
+            match self.wait(py, SIGNALS) {
                 Ok(Some(event)) => return Ok(Some(event)),
                 Ok(None) => py.check_signals()?,
                 Err(None) => return Ok(None),
@@ -290,19 +298,21 @@ impl PyLive {
     /// Where the OS keeps no record of a whole tree (Linux), follows only
     /// the folders `ids` of the latest tree. Ignored elsewhere.
     fn follow(&self, py: Python<'_>, ids: Vec<u32>) {
-        py.detach(|| self.0.lock().unwrap().follow(&ids));
+        self.waker.wake();
+        py.detach(|| self.live.lock().unwrap().follow(&ids));
     }
 
     /// Scans folder `id` of the latest tree again, then reports `Changed`;
     /// 0 scans it all again.
     fn rescan(&self, py: Python<'_>, id: u32) {
-        py.detach(|| self.0.lock().unwrap().rescan(id));
+        self.waker.wake();
+        py.detach(|| self.live.lock().unwrap().rescan(id));
     }
 }
 
-/// The awaitable `__anext__` returns: waits of [`SLICE`] each on a worker
-/// thread (`asyncio.to_thread`), until one brings an event. A cancelled
-/// `async for` so leaves no thread waiting longer than one slice.
+/// The awaitable `__anext__` returns: a wait on a worker thread
+/// (`asyncio.to_thread`), again after each wake, until one brings an
+/// event. Cancelling it wakes the wait, so no thread is left waiting.
 #[pyclass(module = "diskuse")]
 struct Next {
     live: Py<PyLive>,
@@ -326,7 +336,10 @@ impl Next {
                         py,
                         None,
                         None,
-                        move |args: &Bound<'_, PyTuple>, _| match live.get().wait(args.py()) {
+                        move |args: &Bound<'_, PyTuple>, _| match live
+                            .get()
+                            .wait(args.py(), Duration::MAX)
+                        {
                             Ok(event) => Ok(event),
                             Err(None) => Err(PyStopAsyncIteration::new_err(())),
                             Err(Some(e)) => Err(e),
@@ -350,6 +363,32 @@ impl Next {
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// Cancelling: wakes the wait, then passes the error to it.
+    #[pyo3(signature = (typ, val = None, _tb = None))]
+    fn throw(
+        &mut self,
+        py: Python<'_>,
+        typ: Py<PyAny>,
+        val: Option<Py<PyAny>>,
+        _tb: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.live.get().waker.wake();
+        // the single-argument form: the others are deprecated
+        let exc = val.unwrap_or(typ);
+        match self.step.take() {
+            Some(step) => Ok(step.bind(py).call_method1("throw", (exc,))?.unbind()),
+            None => Err(PyErr::from_value(exc.into_bound(py))),
+        }
+    }
+
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.live.get().waker.wake();
+        match self.step.take() {
+            Some(step) => step.bind(py).call_method0("close").map(drop),
+            None => Ok(()),
         }
     }
 }

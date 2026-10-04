@@ -64,8 +64,41 @@ impl Default for LiveOptions {
 /// listed again, without.
 struct Job {
     thread: JoinHandle<Result<Tree, ScanError>>,
-    started: mpsc::Receiver<Progress>,
     progress: Option<Progress>,
+    /// The thread is done, so joining it does not block.
+    exited: bool,
+}
+
+/// What wakes [`Live::wait`] before its deadline.
+enum Wake {
+    /// The running scan's progress, for snapshots.
+    Started(Progress),
+    /// The running scan's thread is done.
+    Exited,
+    /// From a [`Waker`].
+    Interrupt,
+}
+
+/// Sends [`Wake::Exited`] when its scan thread is done, even by a panic.
+struct Exit(mpsc::Sender<Wake>);
+
+impl Drop for Exit {
+    fn drop(&mut self) {
+        // the receiver only goes away with the `Live`
+        let _ = self.0.send(Wake::Exited);
+    }
+}
+
+/// Wakes a [`Live::wait`] on another thread, which then returns `None`:
+/// to cancel it, or to take its lock sooner. A wake while none waits makes
+/// the next return at once.
+#[derive(Clone)]
+pub struct Waker(mpsc::Sender<Wake>);
+
+impl Waker {
+    pub fn wake(&self) {
+        let _ = self.0.send(Wake::Interrupt);
+    }
 }
 
 enum Follow {
@@ -94,21 +127,22 @@ pub struct Live {
     state: State,
     /// When the next snapshot or check for changes is due.
     due: Instant,
+    tx: mpsc::Sender<Wake>,
+    rx: mpsc::Receiver<Wake>,
 }
-
-/// How often a running scan is checked for being done, within
-/// [`Live::wait`].
-const CHECK: Duration = Duration::from_millis(20);
 
 /// Scans `root` and keeps following it: the events come from
 /// [`Live::wait`], or from iterating, which waits as long as it takes.
 pub fn live(root: &Path, opts: LiveOptions) -> Live {
+    let (tx, rx) = mpsc::channel();
     let mut live = Live {
         root: root.into(),
         opts,
         stop: Arc::default(),
         state: State::Done,
         due: Instant::now(),
+        tx,
+        rx,
     };
     live.start();
     live
@@ -123,20 +157,58 @@ impl Live {
         }
     }
 
-    fn start(&mut self) {
-        let (tx, started) = mpsc::channel();
-        let (root, opts) = (self.root.clone(), self.options());
+    /// Runs `scan` on its own thread, which wakes [`Live::wait`] with its
+    /// progress and once done.
+    fn spawn(
+        &self,
+        scan: impl FnOnce(&dyn Fn(Progress)) -> Result<Tree, ScanError> + Send + 'static,
+    ) -> Job {
+        let tx = self.tx.clone();
         let thread = thread::spawn(move || {
-            // the receiver only goes away with the `Live`
-            scan_live(&root, &opts, |p| {
-                let _ = tx.send(p);
+            let exit = Exit(tx);
+            scan(&|p| {
+                let _ = exit.0.send(Wake::Started(p));
             })
         });
-        self.state = State::Scanning(Job {
+        Job {
             thread,
-            started,
             progress: None,
-        });
+            exited: false,
+        }
+    }
+
+    fn start(&mut self) {
+        let (root, opts) = (self.root.clone(), self.options());
+        self.state = State::Scanning(self.spawn(move |progress| scan_live(&root, &opts, progress)));
+    }
+
+    /// Wakes a [`Live::wait`] from another thread.
+    pub fn waker(&self) -> Waker {
+        Waker(self.tx.clone())
+    }
+
+    /// Takes in what woke [`Live::wait`] without waiting; whether it was a
+    /// [`Waker`].
+    fn take(&mut self, mut wake: Option<Wake>) -> bool {
+        let mut interrupted = false;
+        while let Some(w) = wake.or_else(|| self.rx.try_recv().ok()) {
+            let job = match &mut self.state {
+                State::Scanning(job)
+                | State::Following {
+                    rescan: Some(job), ..
+                } => Some(job),
+                _ => None,
+            };
+            match (w, job) {
+                (Wake::Interrupt, _) => interrupted = true,
+                (Wake::Started(p), Some(job)) => job.progress = Some(p),
+                (Wake::Exited, Some(job)) => job.exited = true,
+                // each scan is joined after its last wake, before the next starts
+                (_, None) => unreachable!("a wake with no scan running"),
+            }
+            wake = None;
+        }
+        interrupted
     }
 
     /// The next event within `timeout`, or `None`. A snapshot comes at
@@ -144,9 +216,14 @@ impl Live {
     /// soon as the scan is done, then the changes of each interval as one
     /// `Changed`. After an error the tree is followed as before, unless
     /// the scan itself failed: then [`Live::is_done`].
+    /// Returns `None` early when woken by a [`Waker`].
     pub fn wait(&mut self, timeout: Duration) -> Option<Result<Event, ScanError>> {
-        let until = Instant::now() + timeout;
+        let until = Instant::now().checked_add(timeout);
+        let mut wake = None;
         loop {
+            if self.take(wake.take()) {
+                return None;
+            }
             let now = Instant::now();
             let due = now >= self.due;
             if due {
@@ -156,11 +233,15 @@ impl Live {
                 return Some(event);
             }
             let now = Instant::now();
-            if self.is_done() || now >= until {
+            if self.is_done() || until.is_some_and(|u| now >= u) {
                 return None;
             }
-            let next = self.due.min(until).min(now + CHECK);
-            thread::sleep(next.saturating_duration_since(now));
+            let next = until.map_or(self.due, |u| u.min(self.due));
+            match self.rx.recv_timeout(next.saturating_duration_since(now)) {
+                Ok(w) => wake = Some(w),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!("`Live` holds a sender"),
+            }
         }
     }
 
@@ -168,15 +249,12 @@ impl Live {
         match &mut self.state {
             State::Done => None,
             State::Scanning(job) => {
-                if job.thread.is_finished() {
+                if job.exited {
                     let State::Scanning(job) = std::mem::replace(&mut self.state, State::Done)
                     else {
                         unreachable!()
                     };
                     return Some(self.finish(job));
-                }
-                if job.progress.is_none() {
-                    job.progress = job.started.try_recv().ok();
                 }
                 let snapshot = due.then(|| job.progress.as_ref()?.snapshot()).flatten();
                 snapshot.map(|tree| Ok(Event::Scanning(tree)))
@@ -186,7 +264,7 @@ impl Live {
                 rescan: rescan @ Some(_),
                 ..
             } => {
-                if !rescan.as_ref().unwrap().thread.is_finished() {
+                if !rescan.as_ref().unwrap().exited {
                     return None;
                 }
                 let done = join(rescan.take().unwrap());
@@ -267,9 +345,7 @@ impl Live {
     pub fn rescan(&mut self, dir: u32) {
         let opts = self.options();
         let State::Following {
-            tree,
-            rescan: rescan @ None,
-            ..
+            tree, rescan: None, ..
         } = &mut self.state
         else {
             return;
@@ -282,16 +358,13 @@ impl Live {
             ..Changes::default()
         };
         let mut tree = (**tree).clone();
-        let (_, started) = mpsc::channel();
-        let thread = thread::spawn(move || match tree.apply(&changes, &opts) {
+        let job = self.spawn(move |_| match tree.apply(&changes, &opts) {
             Some(()) => Ok(tree),
             None => Err(ScanError::Root(io::ErrorKind::NotFound.into())),
         });
-        *rescan = Some(Job {
-            thread,
-            started,
-            progress: None,
-        });
+        if let State::Following { rescan, .. } = &mut self.state {
+            *rescan = Some(job);
+        }
     }
 
     /// A scan runs: the first, a [`Live::rescan`], or after lost changes.
@@ -337,7 +410,7 @@ impl Iterator for Live {
     /// [`Live::is_done`].
     fn next(&mut self) -> Option<Self::Item> {
         while !self.is_done() {
-            if let Some(event) = self.wait(Duration::from_secs(1)) {
+            if let Some(event) = self.wait(Duration::MAX) {
                 return Some(event);
             }
         }

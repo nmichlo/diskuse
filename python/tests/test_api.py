@@ -5,6 +5,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pyarrow as pa
@@ -180,6 +181,21 @@ def test_live_async(root: Path) -> None:
         raise AssertionError("ended")
 
     assert asyncio.run(run()) == [(root / "c", blocks(root / "c/new"))]
+
+
+def test_cancelling_an_async_wait_stops_it_at_once(root: Path) -> None:
+    async def run() -> None:
+        live = diskuse.live(root, interval=0.2)
+        async for e in live:
+            if isinstance(e, diskuse.Event.Ready):
+                break
+        # nothing changes, so the wait is cancelled, and its thread must end
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(anext(live), 0.3)
+
+    start = time.monotonic()
+    asyncio.run(run())
+    assert time.monotonic() - start < 2
 
 
 def test_a_rescan_reports_the_folder_again(root: Path) -> None:
