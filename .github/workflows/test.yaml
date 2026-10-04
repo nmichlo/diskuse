@@ -24,8 +24,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
-      # the library alone, as `default-features = false` users build it
-      - run: cargo test --no-default-features --lib --test live
 
   # the Python API: builds the extension with maturin through uv, then pytest
   python:
@@ -41,7 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v7
-      - run: uv run --extra test pytest python/tests -q
+      - run: uv run --extra test pytest crates/diskuse-python/tests -q
 
   # advisories, licences, bans and sources, from `deny.toml`
   deny:

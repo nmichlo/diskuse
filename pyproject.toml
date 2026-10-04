@@ -1,5 +1,5 @@
 # The PyPI package: the Python API (`import diskuse`, all Rust, see
-# python/src/lib.rs) and the `diskuse` command, a console script calling the
+# crates/diskuse-python/src/lib.rs) and the `diskuse` command, a console script calling the
 # same CLI as the binary.
 
 [build-system]
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: System :: Filesystems",
 ]
 description = "A fast, read-only disk usage browser for macOS and Linux"
-# from python/Cargo.toml. CI stamps its version from the release tag
+# from the workspace's Cargo.toml. CI stamps its version from the release tag
 dynamic = ["version"]
 
 [project.scripts]
@@ -36,8 +36,11 @@ Repository = "https://github.com/nmichlo/diskuse"
 Issues = "https://github.com/nmichlo/diskuse/issues"
 
 [tool.maturin]
-manifest-path = "python/Cargo.toml"
+manifest-path = "crates/diskuse-python/Cargo.toml"
 module-name = "diskuse"
+# the stub is beside this file, where maturin takes it for a wheel: without
+# this a wheel built from the sdist has no types
+include = [{ path = "diskuse.pyi", format = "sdist" }]
 # here, not in Cargo's release profile, so local release builds keep symbols
 # for profiling
 strip = true
@@ -68,14 +71,13 @@ python-version = "3.10"
 
 [tool.ty.src]
 # its dependencies are inline (PEP 723), so not in `.venv`
-exclude = ["python/examples"]
+exclude = ["crates/diskuse-python/examples"]
 
 # rebuild the extension when the Rust changes, not only pyproject.toml
 [tool.uv]
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },
-    { file = "python/Cargo.toml" },
-    { file = "src/**/*.rs" },
-    { file = "python/src/**/*.rs" },
+    { file = "crates/*/Cargo.toml" },
+    { file = "crates/*/src/**/*.rs" },
 ]
