@@ -1,0 +1,36 @@
+---
+source: tests/browse.rs
+---
+/fixture  1.5 MiB | 2 folders unreadable (d) | scanned 0 s ago
+   8.0 KiB   0.5% top
+       0 B        empty/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+top | 8.0 KiB
+/p  enter keep  esc clear
+--- styles ---
+ 0  10..17  BOLD
+ 0  17..20  DarkGray
+ 0  44..47  DarkGray
+ 1   0..59  Indexed(231) on Indexed(25) BOLD
+ 2   0..11  DarkGray
+ 2  12..17  DarkGray
+ 2  18..24  BOLD
+18   3..6   DarkGray
+18   6..13  Green
+19   0..2   Cyan BOLD
+19   4..9   Cyan BOLD
+19  16..19  Cyan BOLD

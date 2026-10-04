@@ -39,6 +39,11 @@ bench-check:
 bench-orb *ARGS:
     bench/orb.sh {{ARGS}}
 
+# store the screens the browser draws now as the expected ones, for this
+# platform (tests/snapshots); review the diff before committing
+snapshots:
+    INSTA_UPDATE=always cargo test --test browse
+
 # re-record the README demo GIF (needs `brew install vhs`)
 demo:
     cargo build --release

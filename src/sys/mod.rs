@@ -77,6 +77,7 @@ fn retry<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
 /// What `fstat` says about an open directory.
 pub struct DirStat {
     pub dev: u64,
+    pub ino: u64,
     pub bytes: u64,
 }
 
@@ -112,6 +113,7 @@ impl DirStat {
     fn of(st: Stat) -> Self {
         Self {
             dev: st.st_dev as u64,
+            ino: st.st_ino,
             bytes: st.st_blocks as u64 * 512,
         }
     }

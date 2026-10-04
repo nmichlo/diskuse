@@ -1,0 +1,68 @@
+---
+source: tests/browse.rs
+---
+/fixture  1.5 MiB | 2 folders unreadable (d)
+   1.5 MiB  97.5% big/                                        20.0 KiB+ b/
+  32.0 KiB+  2.0% a/                                           8.0 KiB  h1
+   8.0 KiB   0.5% top                                          8.0 KiB  h2
+       0 B        empty/                                       4.0 KiB  f1
+       0 B        locked/ (denied: EACCES)
+       0 B        sym
+
+
+
+
+
+
+
+
+
+
+
+a/ | 32.0 KiB  own 12.0 KiB | 1 folder below unreadable
+hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  / filter  ? help  q quit
+--- styles ---
+ 0  10..17  BOLD
+ 0  17..20  DarkGray
+ 1   0..10  Yellow
+ 1  10..11  DarkGray
+ 1  12..17  Yellow
+ 1  18..22  BOLD
+ 1  60..70  Green
+ 1  70..71  DarkGray
+ 1  72..74  BOLD
+ 2   0..59  Indexed(231) on Indexed(25) BOLD
+ 2  60..70  Green
+ 2  70..71  DarkGray
+ 3   0..10  Green
+ 3  10..11  DarkGray
+ 3  12..17  Green
+ 3  60..70  Green
+ 3  70..71  DarkGray
+ 4   0..11  DarkGray
+ 4  12..17  DarkGray
+ 4  18..24  BOLD
+ 4  60..70  Green
+ 4  70..71  DarkGray
+ 5   0..11  DarkGray
+ 5  12..17  DarkGray
+ 5  18..25  BOLD
+ 5  25..42  Red
+ 6   0..11  DarkGray
+ 6  12..17  DarkGray
+18   0..2   BOLD
+18   2..5   DarkGray
+18   5..13  Green
+18  13..19  DarkGray
+18  27..30  DarkGray
+18  30..55  Yellow
+19   0..4   Cyan BOLD
+19  11..12  Cyan BOLD
+19  19..20  Cyan BOLD
+19  28..33  Cyan BOLD
+19  40..41  Cyan BOLD
+19  49..50  Cyan BOLD
+19  59..62  Cyan BOLD
+19  71..72  Cyan BOLD
+19  81..82  Cyan BOLD
+19  89..90  Cyan BOLD

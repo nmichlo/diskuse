@@ -1,0 +1,31 @@
+---
+source: tests/browse.rs
+---
+/fixture  1.6 MiB | 2 folders unreadable (d) | scanned 0 s ago
+no matches for 'zz'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/zz  enter keep  esc clear
+--- styles ---
+ 0  10..17  BOLD
+ 0  17..20  DarkGray
+ 0  44..47  DarkGray
+ 1   0..19  DarkGray
+19   0..3   Cyan BOLD
+19   5..10  Cyan BOLD
+19  17..20  Cyan BOLD

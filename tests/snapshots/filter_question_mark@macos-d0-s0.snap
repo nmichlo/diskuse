@@ -1,0 +1,30 @@
+---
+source: tests/browse.rs
+---
+/tmp/du-XXXXXX  1.5 MiB | 2 folders unreadable (d)
+no matches for '?'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/?  enter keep  esc clear
+--- styles ---
+ 0  16..23  BOLD
+ 0  23..26  DarkGray
+ 1   0..18  DarkGray
+19   0..2   Cyan BOLD
+19   4..9   Cyan BOLD
+19  16..19  Cyan BOLD

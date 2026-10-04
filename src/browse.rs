@@ -2104,6 +2104,7 @@ mod tests {
             name,
             flags: 0,
             errno: 0,
+            ino: 0,
             own,
         };
         tree.push(dir(Record::NO_PARENT, 0, 0), 0);
@@ -2167,6 +2168,7 @@ mod tests {
             name: 0,
             flags: 0,
             errno: 0,
+            ino: 0,
             own,
         };
         tree.push(record(Record::NO_PARENT, 4096), 0);
