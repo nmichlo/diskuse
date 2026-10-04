@@ -401,6 +401,9 @@ impl Browser {
             interval: Duration::ZERO,
             ignore: self.env.cache.as_ref().map(|c| c.path().into()),
             inotify: self.env.inotify,
+            // the dirs shown are followed: a watch on every dir costs kernel
+            // memory and seconds on a large tree
+            shown_only: true,
         };
         self.live = Some(live(&self.root, opts));
     }

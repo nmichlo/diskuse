@@ -1,7 +1,6 @@
 //! inotify: Linux reports the changes in a dir to whoever watches it, while
-//! the watch lasts, and keeps no record of them. Each watch costs kernel
-//! memory, and there are only so many (`max_user_watches`), so only a few
-//! dirs are watched at a time.
+//! the watch lasts, and keeps no record of them. Each watch costs about
+//! 1 KiB of kernel memory, and there are only so many (`max_user_watches`).
 
 use super::Note;
 use rustix::fd::OwnedFd;
@@ -56,20 +55,25 @@ impl Inotify {
         inotify::init(flags).ok().map(Self)
     }
 
-    /// Watches dir `path`, following a symlink only if `follow`. `None` if
-    /// it cannot, or its filesystem would not report every change.
-    pub fn add(&self, path: &CStr, follow: bool) -> Option<i32> {
-        let fs = rustix::fs::statfs(path).ok()?.f_type;
-        // `f_type` is signed on some targets
-        #[allow(clippy::unnecessary_cast)]
-        if REMOTE.contains(&(fs as u32)) {
-            return None;
+    /// Whether inotify would miss changes to dir `path`, as its
+    /// filesystem is remote or FUSE, or it cannot tell.
+    pub fn remote(path: &CStr) -> bool {
+        match rustix::fs::statfs(path) {
+            // `f_type` is signed on some targets
+            #[allow(clippy::unnecessary_cast)]
+            Ok(fs) => REMOTE.contains(&(fs.f_type as u32)),
+            Err(_) => true,
         }
+    }
+
+    /// Watches dir `path`, following a symlink only if `follow`. `NOSPC`
+    /// once the watches run out (`max_user_watches`).
+    pub fn add(&self, path: &CStr, follow: bool) -> rustix::io::Result<i32> {
         let flags = match follow {
             true => WATCH,
             false => WATCH | WatchFlags::DONT_FOLLOW,
         };
-        inotify::add_watch(&self.0, path, flags).ok()
+        inotify::add_watch(&self.0, path, flags)
     }
 
     /// Stops watch `wd`. It may have ended already, with its dir.

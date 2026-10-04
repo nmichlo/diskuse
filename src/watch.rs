@@ -13,10 +13,12 @@
 //! only the dirs it shows ([`DirWatch`]).
 
 use crate::live::Reason;
+use crate::scan::Applied;
 use crate::sys::{self, Event};
 use crate::tree::{ReadTree, Record, Tree, dir_path};
 use rustix::fd::AsFd;
-use std::collections::BTreeSet;
+use rustix::io::Errno;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -283,7 +285,11 @@ impl DirWatch {
             }
             let path = CString::new(dir_path(tree, d)).expect("names hold no NUL");
             // a symlinked root is followed, as the scan does
-            let wd = (self.inotify.as_ref()).and_then(|i| i.add(&path, d == 0));
+            let watch = |i: &sys::Inotify| i.add(&path, d == 0).ok();
+            let wd = match sys::Inotify::remote(&path) {
+                true => None,
+                false => self.inotify.as_ref().and_then(watch),
+            };
             self.dirs.push((d, wd));
         }
     }
@@ -329,5 +335,114 @@ impl DirWatch {
     pub fn listed(&mut self, took: Duration) {
         self.listed = Instant::now();
         self.took = took;
+    }
+}
+
+/// Every folder of a tree, each watched with inotify, where the OS keeps
+/// no record of changes below a path (Linux). The pattern of the `notify`
+/// crate's recursive mode.
+pub(crate) struct TreeWatch {
+    inotify: sys::Inotify,
+    /// The watch of each folder, by id, if it has one.
+    wd: Vec<Option<i32>>,
+    /// The folder of each watch.
+    dir: HashMap<i32, u32>,
+    /// Folders found changed, to list again.
+    dirty: BTreeSet<u32>,
+}
+
+impl TreeWatch {
+    /// Watches every folder of `tree`. `None` without inotify, on a
+    /// filesystem it would miss changes on, or with more folders than
+    /// watches left.
+    pub fn start(tree: &Tree) -> Option<Self> {
+        let root = CString::new(dir_path(tree, 0)).expect("names hold no NUL");
+        if sys::Inotify::remote(&root) {
+            return None;
+        }
+        let mut watch = Self {
+            inotify: sys::Inotify::new()?,
+            wd: Vec::new(),
+            dir: HashMap::new(),
+            dirty: BTreeSet::new(),
+        };
+        watch.add(tree, 0).then_some(watch)
+    }
+
+    /// Watches the folders of `tree` from id `from` on. False once the
+    /// watches run out.
+    fn add(&mut self, tree: &Tree, from: u32) -> bool {
+        self.wd.resize(tree.len(), None);
+        let skip = Record::OTHER_DEVICE | Record::DENIED | Record::REMOVED;
+        for d in from..tree.len() as u32 {
+            if tree.record(d).flags & skip != 0 {
+                continue;
+            }
+            let path = CString::new(dir_path(tree, d)).expect("names hold no NUL");
+            // a symlinked root is followed, as the scan does
+            match self.inotify.add(&path, d == 0) {
+                Ok(wd) => {
+                    self.wd[d as usize] = Some(wd);
+                    // one dir seen at two paths, as through a bind mount,
+                    // has one watch: the later path wins
+                    self.dir.insert(wd, d);
+                }
+                Err(Errno::NOSPC) => return false,
+                // gone since, which its parent's listing shows
+                Err(_) => {}
+            }
+        }
+        true
+    }
+
+    /// The folders of `tree` to list again: those inotify saw change.
+    pub fn poll(&mut self, tree: &Tree) -> Poll {
+        let (mut lost, mut gone) = (false, Vec::new());
+        let (dir, dirty) = (&mut self.dir, &mut self.dirty);
+        self.inotify.read(|note| match note {
+            sys::Note::Changed(wd) => dirty.extend(dir.get(&wd)),
+            // the folder is in its parent's listing, unless it is the root
+            sys::Note::Gone(wd) => {
+                if let Some(d) = dir.remove(&wd) {
+                    dirty.insert(if d == 0 { 0 } else { tree.record(d).parent });
+                }
+                gone.push(wd);
+            }
+            sys::Note::Lost => lost = true,
+        });
+        // a folder moved keeps its watch: listing its new parent watches it
+        // at its new path
+        for wd in gone {
+            self.inotify.remove(wd);
+        }
+        if lost {
+            return Poll::Lost(Reason::Dropped);
+        }
+        match self.dirty.is_empty() {
+            true => Poll::Wait,
+            false => Poll::Changes(Changes {
+                dirs: std::mem::take(&mut self.dirty).into_iter().collect(),
+                ..Changes::default()
+            }),
+        }
+    }
+
+    /// Follows `tree` after [`Tree::apply`] did `applied` to it: its ids
+    /// numbered again, and its new folders watched. False once the
+    /// watches run out.
+    pub fn applied(&mut self, tree: &Tree, applied: &Applied) -> bool {
+        if let Some(moved) = &applied.moved {
+            let mut wd = vec![None; tree.len()];
+            // the folders new to the tree have no watch yet
+            for (old, &new) in moved.iter().enumerate().take(self.wd.len()) {
+                if new != u32::MAX {
+                    wd[new as usize] = self.wd[old];
+                }
+            }
+            self.dir.retain(|_, d| moved[*d as usize] != u32::MAX);
+            self.dir.values_mut().for_each(|d| *d = moved[*d as usize]);
+            self.wd = wd;
+        }
+        self.add(tree, applied.new)
     }
 }
