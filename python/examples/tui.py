@@ -11,11 +11,9 @@
 
 Enter goes into a folder, Backspace goes back, s scans the folder at the
 cursor again, q quits. Sizes fill in while it scans, then follow changes on
-disk. The change column is the change since the scan finished. Files come
-from `os.scandir`: diskuse only keeps folder totals.
+disk. The change column is the change since the scan finished.
 """
 
-import os
 import sys
 from pathlib import Path
 
@@ -87,10 +85,7 @@ class Browse(App[None]):
             change = tree.size(k) - self.ready.size(was) if self.ready and was is not None else 0
             rows.append((tree.size(k), change, tree.name(k) + "/"))
         try:
-            with os.scandir(tree.path(d)) as entries:
-                for f in entries:
-                    if not f.is_dir(follow_symlinks=False):
-                        rows.append((f.stat(follow_symlinks=False).st_blocks * 512, 0, f.name))
+            rows += [(size, 0, name) for name, size in tree.files(d)]
         except OSError:
             pass
         table = self.query_one(DataTable)
@@ -131,4 +126,4 @@ class Browse(App[None]):
 
 
 if __name__ == "__main__":
-    Browse(os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else ".")).run()
+    Browse(sys.argv[1] if len(sys.argv) > 1 else ".").run()

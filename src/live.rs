@@ -7,10 +7,9 @@
 //! of a whole tree (Linux), only the folders given to [`Live::follow`] are
 //! followed.
 
-use crate::scan::{ScanError, ScanOptions, Stop, scan_live};
-use crate::tree::{Progress, ReadTree, Record, Tree, below};
+use crate::scan::{ApplyError, Deltas, ScanError, ScanOptions, Stop, scan_live};
+use crate::tree::{Progress, ReadTree, Tree, below};
 use crate::watch::{Changes, DirWatch, Poll, Watch};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -29,8 +28,35 @@ pub enum Event {
     /// went, with by how many bytes, by path. Empty if only folders of 0
     /// bytes did.
     Changed(Tree, Vec<(PathBuf, i64)>),
-    /// Changes were lost, for this reason, so the tree is scanned again.
-    Rescanning(&'static str),
+    /// Changes were lost, so the tree is scanned again.
+    Rescanning(Reason),
+}
+
+/// Why a [`Live`] scans the whole tree again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    /// The OS dropped change events.
+    Dropped,
+    /// macOS's change ids wrapped around.
+    IdsWrapped,
+    /// The scanned folder itself moved.
+    RootMoved,
+    /// macOS did not replay the changes made while scanning within 30 s.
+    NoReplay,
+    /// macOS asked for the whole tree to be scanned again.
+    MustScanAll,
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Dropped => "the OS dropped change events",
+            Self::IdsWrapped => "macOS event ids wrapped",
+            Self::RootMoved => "the scanned dir moved",
+            Self::NoReplay => "macOS did not replay the changes made while scanning within 30 s",
+            Self::MustScanAll => "macOS asked to scan all of it again",
+        })
+    }
 }
 
 /// How a [`Live`] scans and follows.
@@ -63,7 +89,8 @@ impl Default for LiveOptions {
 /// A scan on its own thread: a full scan, with snapshots, or a folder
 /// listed again, without.
 struct Job {
-    thread: JoinHandle<Result<Tree, ScanError>>,
+    /// The tree, and for a rescan what changed.
+    thread: JoinHandle<Result<(Tree, Deltas), ApplyError>>,
     progress: Option<Progress>,
     /// The thread is done, so joining it does not block.
     exited: bool,
@@ -161,7 +188,7 @@ impl Live {
     /// progress and once done.
     fn spawn(
         &self,
-        scan: impl FnOnce(&dyn Fn(Progress)) -> Result<Tree, ScanError> + Send + 'static,
+        scan: impl FnOnce(&dyn Fn(Progress)) -> Result<(Tree, Deltas), ApplyError> + Send + 'static,
     ) -> Job {
         let tx = self.tx.clone();
         let thread = thread::spawn(move || {
@@ -179,7 +206,10 @@ impl Live {
 
     fn start(&mut self) {
         let (root, opts) = (self.root.clone(), self.options());
-        self.state = State::Scanning(self.spawn(move |progress| scan_live(&root, &opts, progress)));
+        self.state = State::Scanning(self.spawn(move |progress| {
+            let tree = scan_live(&root, &opts, progress).map_err(ApplyError::Scan)?;
+            Ok((tree, None))
+        }));
     }
 
     /// Wakes a [`Live::wait`] from another thread.
@@ -267,12 +297,13 @@ impl Live {
                 if !rescan.as_ref().unwrap().exited {
                     return None;
                 }
-                let done = join(rescan.take().unwrap());
-                Some(done.map(|new| {
-                    let changes = deltas(tree, &new).unwrap_or_default();
-                    **tree = new;
-                    Event::Changed(shared(tree), changes)
-                }))
+                match join(rescan.take().unwrap()) {
+                    Ok((new, deltas)) => {
+                        **tree = new;
+                        Some(Ok(Event::Changed(shared(tree), deltas.unwrap_or_default())))
+                    }
+                    Err(e) => Some(self.failed(e)),
+                }
             }
             State::Following { .. } if !due => None,
             State::Following {
@@ -294,27 +325,39 @@ impl Live {
                     }
                 };
                 let started = Instant::now();
-                let before = shared(tree);
                 let opts = self.options();
                 let State::Following { tree, follow, .. } = &mut self.state else {
                     unreachable!()
                 };
-                if tree.apply(&changes, &opts).is_none() {
-                    self.start();
-                    return Some(Ok(Event::Rescanning("macOS asked to scan all of it again")));
-                }
+                let deltas = tree.apply(&changes, &opts);
                 if let Follow::Shown(dirs) = &mut **follow {
                     dirs.listed(started.elapsed());
                 }
-                let changes = deltas(&before, tree)?;
-                Some(Ok(Event::Changed(shared(tree), changes)))
+                match deltas {
+                    Ok(deltas) => Some(Ok(Event::Changed(shared(tree), deltas?))),
+                    Err(e) => Some(self.failed(e)),
+                }
             }
+        }
+    }
+
+    /// A full scan when only that brings the tree up to date, or the error.
+    fn failed(&mut self, e: ApplyError) -> Result<Event, ScanError> {
+        match e {
+            ApplyError::FullScan => {
+                self.start();
+                Ok(Event::Rescanning(Reason::MustScanAll))
+            }
+            ApplyError::Scan(e) => Err(e),
         }
     }
 
     /// `Ready`, and the tree followed from then, or the scan's error.
     fn finish(&mut self, job: Job) -> Result<Event, ScanError> {
-        let tree = join(job)?;
+        let tree = match join(job) {
+            Ok((tree, _)) => tree,
+            Err(e) => return self.failed(e),
+        };
         let ignore = self.opts.ignore.as_deref();
         let follow = Box::new(match Watch::start(&self.root, &tree, ignore) {
             Some(watch) => Follow::All(watch),
@@ -358,9 +401,9 @@ impl Live {
             ..Changes::default()
         };
         let mut tree = (**tree).clone();
-        let job = self.spawn(move |_| match tree.apply(&changes, &opts) {
-            Some(()) => Ok(tree),
-            None => Err(ScanError::Root(io::ErrorKind::NotFound.into())),
+        let job = self.spawn(move |_| {
+            let deltas = tree.apply(&changes, &opts)?;
+            Ok((tree, deltas))
         });
         if let State::Following { rescan, .. } = &mut self.state {
             *rescan = Some(job);
@@ -397,7 +440,7 @@ impl Live {
             State::Scanning(job)
             | State::Following {
                 rescan: Some(job), ..
-            } => join(job).ok(),
+            } => join(job).ok().map(|(tree, _)| tree),
             _ => None,
         }
     }
@@ -431,7 +474,7 @@ impl Drop for Live {
     }
 }
 
-fn join(job: Job) -> Result<Tree, ScanError> {
+fn join(job: Job) -> Result<(Tree, Deltas), ApplyError> {
     match job.thread.join() {
         Ok(done) => done,
         Err(panic) => std::panic::resume_unwind(panic),
@@ -445,42 +488,4 @@ fn shared(tree: &Tree) -> Tree {
     let mut copy = tree.clone();
     copy.links.clear();
     copy
-}
-
-/// What changed from `before` to `after`, the same tree with changes
-/// applied: each folder whose own bytes changed, and each folder that
-/// appeared or went, with its whole size, by path. `None` if nothing did,
-/// not even a folder of 0 bytes.
-fn deltas(before: &Tree, after: &Tree) -> Option<Vec<(PathBuf, i64)>> {
-    let gone = |t: &Tree, id: u32| t.record(id).flags & Record::REMOVED != 0;
-    let mut out = Vec::new();
-    for id in 0..after.len() as u32 {
-        let r = after.record(id);
-        if (id as usize) < before.len() {
-            let was_gone = gone(before, id);
-            let is_gone = gone(after, id);
-            let parent_gone = id != 0 && gone(after, r.parent);
-            if is_gone && !was_gone && !parent_gone {
-                out.push((before.path(id), -(before.size(id) as i64)));
-            } else if !is_gone && r.own != before.own(id) {
-                out.push((after.path(id), r.own as i64 - before.own(id) as i64));
-            }
-        } else if !gone(after, id) && (r.parent as usize) < before.len() {
-            out.push((after.path(id), after.size(id) as i64));
-        }
-    }
-    if out.is_empty() {
-        return None;
-    }
-    // a folder listed afresh goes and comes back, at one path
-    out.sort();
-    out.dedup_by(|b, a| {
-        let same = a.0 == b.0;
-        if same {
-            a.1 += b.1;
-        }
-        same
-    });
-    out.retain(|&(_, d)| d != 0);
-    Some(out)
 }

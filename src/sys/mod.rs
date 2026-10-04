@@ -129,7 +129,7 @@ pub enum Event {
     HistoryDone,
     /// Changes were lost, or the watched path itself moved: only a full
     /// scan is right. Why, for the user.
-    Lost(&'static str),
+    Lost(crate::live::Reason),
 }
 
 /// Watches a path until dropped.

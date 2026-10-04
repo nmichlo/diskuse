@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator
 from collections.abc import Iterator
 from os import PathLike
 from pathlib import Path
+from typing import ClassVar
 from typing import final
 
 def scan(path: str | PathLike[str], threads: int | None = None) -> Tree:
@@ -51,6 +52,10 @@ class Tree:
         """Its subfolders, in no particular order."""
     def find(self, path: str | PathLike[str]) -> int | None:
         """The folder at `path`, relative to the root or absolute below it."""
+    def files(self, id: int) -> list[tuple[str, int]]:
+        """The files of folder `id` and their allocated bytes, listed from
+        disk now, as the tree keeps only folder totals. None for a folder on
+        another device."""
     def largest_files(self, n: int = 100) -> list[tuple[Path, int]]:
         """The `n` largest files, largest first. Only 1000 are kept."""
     def stopped(self) -> bool:
@@ -58,6 +63,21 @@ class Tree:
     def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
         """Every folder as a row: id, parent, name, size, own, denied,
         partial, other_device. For `pyarrow.table(tree)`, polars, duckdb."""
+
+@final
+class Reason:
+    """Why a live scan scans the whole tree again. `str()` says it in words."""
+
+    Dropped: ClassVar[Reason]
+    """The OS dropped change events."""
+    IdsWrapped: ClassVar[Reason]
+    """macOS's change ids wrapped around."""
+    RootMoved: ClassVar[Reason]
+    """The scanned folder itself moved."""
+    NoReplay: ClassVar[Reason]
+    """macOS did not replay the changes made while scanning within 30 s."""
+    MustScanAll: ClassVar[Reason]
+    """macOS asked for the whole tree to be scanned again."""
 
 class Event:
     """What a live scan reports."""
@@ -90,11 +110,11 @@ class Event:
 
     @final
     class Rescanning(Event):
-        """Changes were lost, for `reason`, so the tree is scanned again."""
+        """Changes were lost, so the tree is scanned again."""
 
         __match_args__ = ("reason",)
-        reason: str
-        def __init__(self, reason: str) -> None: ...
+        reason: Reason
+        def __init__(self, reason: Reason) -> None: ...
 
 @final
 class Live:

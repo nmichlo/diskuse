@@ -8,14 +8,14 @@ use arrow_array::{
     ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, RecordBatch, RecordBatchIterator,
     UInt32Array, UInt64Array,
 };
-use diskuse::{Event, LiveOptions, ReadTree, Record, ScanError, ScanOptions, Tree, Waker};
+use diskuse::{Event, LiveOptions, ReadTree, Reason, Record, ScanError, ScanOptions, Tree, Waker};
 use pyo3::exceptions::{PyIndexError, PyOSError, PyStopAsyncIteration, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyCapsule, PyTuple};
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,8 +37,22 @@ fn options(threads: Option<usize>) -> ScanOptions {
     }
 }
 
-fn os_error(e: ScanError) -> PyErr {
-    PyOSError::new_err(e.to_string())
+/// The error scanning `root`: for the root itself, the `OSError` subclass
+/// of its errno with `root` as the filename, as `open` raises.
+fn os_error(py: Python<'_>, e: ScanError, root: &Path) -> PyErr {
+    let ScanError::Root(io) = &e else {
+        return PyOSError::new_err(e.to_string());
+    };
+    let Some(errno) = io.raw_os_error() else {
+        return PyOSError::new_err(format!("{}: {io}", root.display()));
+    };
+    match py
+        .import("os")
+        .and_then(|os| os.call_method1("strerror", (errno,)))
+    {
+        Ok(strerror) => PyOSError::new_err((errno, strerror.unbind(), root.to_path_buf())),
+        Err(e) => e,
+    }
 }
 
 /// Scans `path` with `threads` threads, or as many as help, with the GIL
@@ -48,7 +62,7 @@ fn os_error(e: ScanError) -> PyErr {
 fn scan(py: Python<'_>, path: PathBuf, threads: Option<usize>) -> PyResult<PyTree> {
     let path = expand(py, path)?;
     let tree = py.detach(|| diskuse::scan(&path, &options(threads)));
-    let tree = tree.map_err(|e| PyOSError::new_err(format!("{}: {e}", path.display())))?;
+    let tree = tree.map_err(|e| os_error(py, e, &path))?;
     Ok(PyTree::new(tree))
 }
 
@@ -71,8 +85,11 @@ impl PyTree {
         Self(Arc::new(tree))
     }
 
+    /// `id`, if it is a folder of this tree, not one removed since the
+    /// scan.
     fn id(&self, id: u32) -> PyResult<u32> {
-        match (id as usize) < self.0.len() {
+        let there = |id| self.0.record(id).flags & Record::REMOVED == 0;
+        match (id as usize) < self.0.len() && there(id) {
             true => Ok(id),
             false => Err(PyIndexError::new_err(format!("no folder {id}"))),
         }
@@ -115,6 +132,15 @@ impl PyTree {
 
     fn find(&self, path: PathBuf) -> Option<u32> {
         self.0.find(&path)
+    }
+
+    /// Listed from disk now, as the tree keeps only folder totals.
+    fn files(&self, py: Python<'_>, id: u32) -> PyResult<Vec<(OsString, u64)>> {
+        let id = self.id(id)?;
+        let files = py.detach(|| self.0.files(id, false))?;
+        Ok((files.into_iter())
+            .map(|f| (OsString::from_vec(f.name.into()), f.bytes))
+            .collect())
     }
 
     #[pyo3(signature = (n = 100))]
@@ -185,6 +211,49 @@ fn batch(tree: &Tree) -> RecordBatch {
     .unwrap()
 }
 
+/// Why a live scan scans the whole tree again, as in Rust. `str()` says it
+/// in words.
+#[pyclass(frozen, eq, from_py_object, name = "Reason", module = "diskuse")]
+#[derive(Clone, Copy, PartialEq)]
+enum PyReason {
+    Dropped,
+    IdsWrapped,
+    RootMoved,
+    NoReplay,
+    MustScanAll,
+}
+
+impl From<Reason> for PyReason {
+    fn from(reason: Reason) -> Self {
+        match reason {
+            Reason::Dropped => Self::Dropped,
+            Reason::IdsWrapped => Self::IdsWrapped,
+            Reason::RootMoved => Self::RootMoved,
+            Reason::NoReplay => Self::NoReplay,
+            Reason::MustScanAll => Self::MustScanAll,
+        }
+    }
+}
+
+impl From<PyReason> for Reason {
+    fn from(reason: PyReason) -> Self {
+        match reason {
+            PyReason::Dropped => Self::Dropped,
+            PyReason::IdsWrapped => Self::IdsWrapped,
+            PyReason::RootMoved => Self::RootMoved,
+            PyReason::NoReplay => Self::NoReplay,
+            PyReason::MustScanAll => Self::MustScanAll,
+        }
+    }
+}
+
+#[pymethods]
+impl PyReason {
+    fn __str__(&self) -> String {
+        Reason::from(*self).to_string()
+    }
+}
+
 /// What a live scan reports, as in Rust.
 #[pyclass(frozen, name = "Event", module = "diskuse")]
 enum PyEvent {
@@ -199,7 +268,7 @@ enum PyEvent {
         changes: Vec<(PathBuf, i64)>,
     },
     Rescanning {
-        reason: String,
+        reason: PyReason,
     },
 }
 
@@ -226,6 +295,7 @@ impl From<Event> for PyEvent {
 /// A live scan: iterate it, sync or async. Leaving the loop stops it.
 #[pyclass(frozen, name = "Live", module = "diskuse")]
 struct PyLive {
+    root: PathBuf,
     live: Mutex<diskuse::Live>,
     /// Wakes the wait holding `live`, which needs no lock.
     waker: Waker,
@@ -241,7 +311,7 @@ impl PyLive {
         });
         match event {
             Some(Ok(event)) => Ok(Some(event.into())),
-            Some(Err(e)) => Err(Some(os_error(e))),
+            Some(Err(e)) => Err(Some(os_error(py, e, &self.root))),
             None if done => Err(None),
             None => Ok(None),
         }
@@ -262,6 +332,7 @@ fn live(py: Python<'_>, path: PathBuf, interval: f64, threads: Option<usize>) ->
     };
     let live = py.detach(|| diskuse::live(&path, opts));
     Ok(PyLive {
+        root: path,
         waker: live.waker(),
         live: Mutex::new(live),
     })
@@ -401,6 +472,7 @@ fn diskuse_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_cli, m)?)?;
     m.add_class::<PyTree>()?;
     m.add_class::<PyEvent>()?;
+    m.add_class::<PyReason>()?;
     m.add_class::<PyLive>()?;
     Ok(())
 }
