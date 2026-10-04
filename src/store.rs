@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! magic     b"DUSE"
-//! version   u8 = 6
+//! version   u8 = 7
 //! flags     u8: bit 0 = scanned with reclaimable sizes, bit 1 = stopped
 //! 0         u16, so the archive starts aligned, at byte 8
 //! archive   rkyv, of `Body`
@@ -39,7 +39,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"DUSE";
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 const RECLAIMABLE: u8 = 1 << 0;
 const STOPPED: u8 = 1 << 1;
 const HEADER_LEN: usize = 8;
@@ -278,6 +278,7 @@ impl ReadTree for SavedTree<'_> {
             name: r.name.to_native(),
             flags: r.flags.to_native(),
             errno: r.errno.to_native(),
+            ino: r.ino.to_native(),
             own: r.own.to_native(),
         }
     }

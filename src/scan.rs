@@ -155,7 +155,9 @@ fn walk_root(
     let walk = Walk::new(tree, Links::new(), st.dev, lister, opts.stop.clone(), gate);
     let own = Own::of(&st, opts.reclaimable);
     progress(walk.tree.progress());
-    walk.run(&pool, |s| walk.list(s, fd, Record::NO_PARENT, 0, own));
+    walk.run(&pool, |s| {
+        walk.list(s, fd, Record::NO_PARENT, 0, st.ino, own);
+    });
     Ok(walk.finish(since, false))
 }
 
@@ -340,6 +342,7 @@ struct Child {
     /// The subdirectory's own allocated bytes, from the parent's listing.
     own: Own,
     dev: u64,
+    ino: u64,
     mount: bool,
 }
 
@@ -433,22 +436,23 @@ impl Walk {
             // release the parent's fd as soon as possible to bound open fds
             drop(parent_fd);
             match opened {
-                Ok(fd) => self.list(s, fd, parent, name, child.own),
+                Ok(fd) => self.list(s, fd, parent, name, child.ino, child.own),
                 // like du: a denied directory still counts its own blocks
                 Err(e) => {
-                    self.deny(parent, name, child.own, e);
+                    self.deny(parent, name, child.ino, child.own, e);
                 }
             }
         }
         self.gate.visited();
     }
 
-    fn deny(&self, parent: u32, name: u32, own: Own, e: Errno) -> u32 {
+    fn deny(&self, parent: u32, name: u32, ino: u64, own: Own, e: Errno) -> u32 {
         let record = Record {
             parent,
             name,
             flags: Record::DENIED,
             errno: e.raw_os_error() as u16,
+            ino: ino as u32,
             own: own.bytes,
         };
         self.tree.push(record, own.private)
@@ -468,6 +472,7 @@ impl Walk {
                     private: e.private,
                 },
                 dev: e.dev,
+                ino: e.ino,
                 mount: e.mount,
             }),
             _ if e.nlink > 1 && !self.claim((e.dev, e.ino), &mut claimed) => {}
@@ -516,17 +521,26 @@ impl Walk {
 
     /// Lists the open directory `fd`, pushes its record, then spawns a task
     /// per subdirectory.
-    fn list<'s>(&'s self, s: &rayon::Scope<'s>, fd: OwnedFd, parent: u32, name: u32, own: Own) {
+    fn list<'s>(
+        &'s self,
+        s: &rayon::Scope<'s>,
+        fd: OwnedFd,
+        parent: u32,
+        name: u32,
+        ino: u64,
+        own: Own,
+    ) {
         let listing = self.read(&fd, own);
         let id = match listing.denied {
             // files listed before the error are counted, so they compete too
-            Some(e) => self.deny(parent, name, listing.own, e),
+            Some(e) => self.deny(parent, name, ino, listing.own, e),
             None => {
                 let record = Record {
                     parent,
                     name,
                     flags: 0,
                     errno: 0,
+                    ino: ino as u32,
                     own: listing.own.bytes,
                 };
                 self.tree.push(record, listing.own.private)
@@ -550,6 +564,7 @@ impl Walk {
                     name,
                     flags: Record::OTHER_DEVICE,
                     errno: 0,
+                    ino: kid.ino as u32,
                     own: 0,
                 };
                 self.tree.push(record, 0);
@@ -849,8 +864,11 @@ impl Tree {
         for kid in listing.kids {
             let other = kid.mount || kid.dev != st.dev;
             match before.remove(kid.name.to_bytes()) {
-                // still there, on the same side of a mount point
-                Some(k) if (self.record(k).flags & Record::OTHER_DEVICE != 0) == other => {}
+                // still there, the same dir, on the same side of a mount
+                // point. Another dir that took its name is listed afresh
+                Some(k)
+                    if (self.record(k).flags & Record::OTHER_DEVICE != 0) == other
+                        && self.record(k).ino == kid.ino as u32 => {}
                 Some(k) => {
                     self.remove(k);
                     new.push(kid);
@@ -871,6 +889,7 @@ impl Tree {
                 name,
                 flags: Record::OTHER_DEVICE,
                 errno: 0,
+                ino: kid.ino as u32,
                 own: 0,
             };
             self.push(record, 0);
@@ -937,4 +956,204 @@ fn open_path(root: &OwnedFd, names: &[CString]) -> rustix::io::Result<OwnedFd> {
         fd = sys::open_child(fd.as_fd(), name)?;
     }
     Ok(fd)
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // the test makes and changes a tree of files
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestRunner;
+    use std::fs;
+
+    /// How many sets of changes are tried.
+    const CASES: u32 = 256;
+
+    /// Every folder by its path below the root, with its total and own
+    /// bytes, sorted: what a tree says, whatever its ids.
+    fn folders(tree: &Tree) -> Vec<(Vec<u8>, u64, u64)> {
+        let mut out = Vec::new();
+        let mut stack = vec![0];
+        while let Some(k) = stack.pop() {
+            out.push((crate::tree::below(tree, k), tree.size(k), tree.own(k)));
+            stack.extend_from_slice(tree.children(k));
+        }
+        out.sort();
+        out
+    }
+
+    /// The dirs below `root`, each relative to it, sorted; the root is "".
+    fn dirs(root: &Path) -> Vec<PathBuf> {
+        let mut out = vec![PathBuf::new()];
+        let mut i = 0;
+        while i < out.len() {
+            let mut kids: Vec<PathBuf> = (fs::read_dir(root.join(&out[i])).unwrap())
+                .map(|e| e.unwrap())
+                .filter(|e| e.file_type().unwrap().is_dir())
+                .map(|e| out[i].join(e.file_name()))
+                .collect();
+            kids.sort();
+            out.extend(kids);
+            i += 1;
+        }
+        out
+    }
+
+    /// A change to make on disk, by numbers that pick among what is there.
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// Writes file `f{name}` of `blocks` 4 KiB blocks in a dir, over
+        /// any there: a new file, or one that grew or shrank in place.
+        Write { dir: u8, name: u8, blocks: u8 },
+        /// Deletes a file of a dir, if it has any.
+        Delete { dir: u8, file: u8 },
+        /// Makes dir `d{name}` in a dir, with a file in it.
+        Mkdir { dir: u8, name: u8 },
+        /// Removes a dir with everything below it, but never the root.
+        Rmdir { dir: u8 },
+        /// Moves a dir into another, as `m{name}`.
+        Move { dir: u8, to: u8, name: u8 },
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        let n = any::<u8>;
+        prop_oneof![
+            (n(), 0..3u8, 0..4u8).prop_map(|(dir, name, blocks)| Op::Write { dir, name, blocks }),
+            (n(), n()).prop_map(|(dir, file)| Op::Delete { dir, file }),
+            (n(), 0..3u8).prop_map(|(dir, name)| Op::Mkdir { dir, name }),
+            n().prop_map(|dir| Op::Rmdir { dir }),
+            (n(), n(), 0..2u8).prop_map(|(dir, to, name)| Op::Move { dir, to, name }),
+        ]
+    }
+
+    /// Makes `op` below `root`, and returns the dirs whose listing it
+    /// changed, as the OS reports them: relative to the root.
+    fn make(root: &Path, op: &Op) -> Vec<PathBuf> {
+        let dirs = dirs(root);
+        let pick = |i: u8| dirs[usize::from(i) % dirs.len()].clone();
+        match *op {
+            Op::Write { dir, name, blocks } => {
+                let dir = pick(dir);
+                let bytes = vec![7; usize::from(blocks) * 4096];
+                fs::write(root.join(&dir).join(format!("f{name}")), bytes).unwrap();
+                vec![dir]
+            }
+            Op::Delete { dir, file } => {
+                let dir = pick(dir);
+                let mut files: Vec<PathBuf> = (fs::read_dir(root.join(&dir)).unwrap())
+                    .map(|e| e.unwrap())
+                    .filter(|e| e.file_type().unwrap().is_file())
+                    .map(|e| e.path())
+                    .collect();
+                files.sort();
+                if files.is_empty() {
+                    return Vec::new();
+                }
+                fs::remove_file(&files[usize::from(file) % files.len()]).unwrap();
+                vec![dir]
+            }
+            Op::Mkdir { dir, name } => {
+                let dir = pick(dir);
+                let new = root.join(&dir).join(format!("d{name}"));
+                if new.exists() {
+                    return Vec::new();
+                }
+                fs::create_dir(&new).unwrap();
+                fs::write(new.join("f0"), vec![7; 4096]).unwrap();
+                vec![dir.join(format!("d{name}")), dir]
+            }
+            Op::Rmdir { dir } => {
+                let dir = pick(dir);
+                let Some(parent) = dir.parent() else {
+                    return Vec::new();
+                };
+                // every dir emptied on the way, then the one it was in. An
+                // empty dir has nothing to empty: only its parent changes
+                let holds = |d: &PathBuf| fs::read_dir(root.join(d)).unwrap().next().is_some();
+                let mut touched: Vec<PathBuf> = (dirs.iter())
+                    .filter(|d| d.starts_with(&dir) && holds(d))
+                    .cloned()
+                    .collect();
+                fs::remove_dir_all(root.join(&dir)).unwrap();
+                touched.push(parent.into());
+                touched
+            }
+            Op::Move { dir, to, name } => {
+                let (dir, to) = (pick(dir), pick(to));
+                let new = to.join(format!("m{name}"));
+                let Some(parent) = dir.parent() else {
+                    return Vec::new();
+                };
+                // not into itself, nor over another
+                if to.starts_with(&dir) || root.join(&new).exists() {
+                    return Vec::new();
+                }
+                fs::rename(root.join(&dir), root.join(&new)).unwrap();
+                vec![parent.into(), to]
+            }
+        }
+    }
+
+    /// An empty dir removed and another moved to its name, between two
+    /// looks at their parent: the OS reports the parent alone.
+    #[test]
+    fn a_dir_replaced_by_another_of_its_name_is_listed_again() {
+        let opts = ScanOptions::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("empty")).unwrap();
+        fs::create_dir(root.join("full")).unwrap();
+        fs::write(root.join("full/f"), vec![7; 8192]).unwrap();
+        let mut tree = scan(root, &opts).unwrap();
+        fs::remove_dir(root.join("empty")).unwrap();
+        fs::rename(root.join("full"), root.join("empty")).unwrap();
+        let changes = Changes {
+            changed: vec![Box::default()],
+            ..Changes::default()
+        };
+        tree.apply(&changes, &opts).unwrap();
+        assert_eq!(folders(&tree), folders(&scan(root, &opts).unwrap()));
+    }
+
+    /// After any changes on disk, a tree brought up to date with the dirs
+    /// they touched says what a fresh scan says, and its deltas add up to
+    /// the change of the total.
+    #[test]
+    fn apply_equals_a_fresh_scan() {
+        let opts = ScanOptions {
+            threads: NonZeroUsize::new(2),
+            ..ScanOptions::default()
+        };
+        let ops = proptest::collection::vec(proptest::collection::vec(op(), 1..6), 1..6);
+        // the same cases every run
+        let mut runner = TestRunner::new_with_rng(
+            ProptestConfig::with_cases(CASES),
+            proptest::test_runner::TestRng::deterministic_rng(
+                proptest::test_runner::RngAlgorithm::ChaCha,
+            ),
+        );
+        let result = runner.run(&ops, |batches| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            for d in ["d0/d0", "d1"] {
+                fs::create_dir_all(root.join(d)).unwrap();
+                fs::write(root.join(d).join("f0"), vec![7; 8192]).unwrap();
+            }
+            let mut tree = scan(root, &opts).unwrap();
+            for batch in &batches {
+                let before = tree.size(0) as i64;
+                let touched = batch.iter().flat_map(|op| make(root, op));
+                let changes = Changes {
+                    changed: touched.map(|p| p.as_os_str().as_bytes().into()).collect(),
+                    ..Changes::default()
+                };
+                let applied = tree.apply(&changes, &opts).unwrap();
+                prop_assert_eq!(folders(&tree), folders(&scan(root, &opts).unwrap()));
+                let deltas: i64 = applied.deltas.iter().flatten().map(|&(_, d)| d).sum();
+                prop_assert_eq!(deltas, tree.size(0) as i64 - before);
+            }
+            Ok(())
+        });
+        result.unwrap();
+    }
 }

@@ -1,0 +1,31 @@
+---
+source: tests/browse.rs
+---
+volumes
+ 800.0 GiB used of  926.0 GiB   126.0 GiB free  86.4%  /
+  10.0 GiB used of   64.0 GiB    54.0 GiB free  15.6%  /Volumes/USB
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+arrows/jk move  enter scan  ? help  q quit
+--- styles ---
+ 1   0..10  Red
+ 1  48..53  Red
+ 2   0..100 Indexed(231) on Indexed(25) BOLD
+19   0..9   Cyan BOLD
+19  16..21  Cyan BOLD
+19  28..29  Cyan BOLD
+19  36..37  Cyan BOLD

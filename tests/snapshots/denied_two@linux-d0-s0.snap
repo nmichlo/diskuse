@@ -1,0 +1,33 @@
+---
+source: tests/browse.rs
+---
+/fixture  1.5 MiB | 2 folders unreadable (d) | scanned 0 s ago
+2 directories could not be read, so their contents are not counted:
+/tmp/du-XXXXXX/a/b/locked  permission denied (try sudo)
+/tmp/du-XXXXXX/locked  permission denied (try sudo)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+arrows/jk scroll  d close  ? help  q quit
+--- styles ---
+ 0  10..17  BOLD
+ 0  17..20  DarkGray
+ 0  44..47  DarkGray
+ 2  27..55  Red
+ 3  23..51  Red
+19   0..9   Cyan BOLD
+19  18..19  Cyan BOLD
+19  27..28  Cyan BOLD
+19  35..36  Cyan BOLD

@@ -1,0 +1,60 @@
+---
+source: tests/browse.rs
+---
+/fixture  1.5 MiB | 2 folders unreadable (d) | scanned 0 s ago
+   1.5 MiB  97.5% big/                                         1.5 MiB  f
+  32.0 KiB+  2.0% a/
+   8.0 KiB   0.5% top
+       0 B        empty/
+       0 B        locked/ (denied: EACCES)
+       0 B        sym
+
+
+
+
+
+
+
+
+
+
+
+big/ | 1.5 MiB  own 1.5 MiB
+hjkl move  i info  u units  space pick  p picks  r reveal  s/S rescan  / filter  ? help  q quit
+--- styles ---
+ 0  10..17  BOLD
+ 0  17..20  DarkGray
+ 0  44..47  DarkGray
+ 1   0..59  Indexed(231) on Indexed(25) BOLD
+ 1  60..70  Yellow
+ 1  70..71  DarkGray
+ 2   0..10  Green
+ 2  10..11  DarkGray
+ 2  12..17  Green
+ 2  18..20  BOLD
+ 3   0..10  Green
+ 3  10..11  DarkGray
+ 3  12..17  Green
+ 4   0..11  DarkGray
+ 4  12..17  DarkGray
+ 4  18..24  BOLD
+ 5   0..11  DarkGray
+ 5  12..17  DarkGray
+ 5  18..25  BOLD
+ 5  25..42  Red
+ 6   0..11  DarkGray
+ 6  12..17  DarkGray
+18   0..4   BOLD
+18   4..7   DarkGray
+18   7..14  Yellow
+18  14..20  DarkGray
+19   0..4   Cyan BOLD
+19  11..12  Cyan BOLD
+19  19..20  Cyan BOLD
+19  28..33  Cyan BOLD
+19  40..41  Cyan BOLD
+19  49..50  Cyan BOLD
+19  59..62  Cyan BOLD
+19  71..72  Cyan BOLD
+19  81..82  Cyan BOLD
+19  89..90  Cyan BOLD
