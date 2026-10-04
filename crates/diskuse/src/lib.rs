@@ -11,6 +11,7 @@ mod app;
 mod browse;
 mod cli;
 mod guide;
+mod logfile;
 #[doc(hidden)]
 pub mod reveal;
 mod style;

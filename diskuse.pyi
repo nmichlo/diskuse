@@ -34,7 +34,7 @@ def live(
 
     `interval` is how often, in seconds, a snapshot comes while scanning,
     and changes after. `shown_only`: on Linux, follow only the folders given
-    to `Live.follow`, not every folder. Leaving the loop stops it.
+    to `Live.follow`, not every folder. `close()` it, or use `with`.
     """
 
 @final
@@ -72,7 +72,7 @@ class Tree:
 
 @final
 class Reason:
-    """Why a live scan scans the whole tree again. `str()` says it in words."""
+    """Why changes were missed. `str()` says it in words."""
 
     Dropped: ClassVar[Reason]
     """The OS dropped change events."""
@@ -82,8 +82,8 @@ class Reason:
     """The scanned folder itself moved."""
     NoReplay: ClassVar[Reason]
     """macOS did not replay the changes made while scanning within 30 s."""
-    MustScanAll: ClassVar[Reason]
-    """macOS asked for the whole tree to be scanned again."""
+    MustScan: ClassVar[Reason]
+    """The OS merged the changes below a folder into "scan it again"."""
 
 class Event:
     """What a live scan reports."""
@@ -115,16 +115,24 @@ class Event:
         def __init__(self, tree: Tree, changes: list[tuple[Path, int]]) -> None: ...
 
     @final
-    class Rescanning(Event):
-        """Changes were lost, so the tree is scanned again."""
+    class Missed(Event):
+        """Changes at or below `path` were missed, so the tree may be out of
+        date there until `Live.rescan`. Nothing is scanned again by itself."""
 
-        __match_args__ = ("reason",)
+        __match_args__ = ("reason", "path")
         reason: Reason
-        def __init__(self, reason: Reason) -> None: ...
+        path: Path
+        def __init__(self, reason: Reason, path: Path) -> None: ...
 
 @final
 class Live:
-    """A live scan: iterate it, sync or async."""
+    """A live scan: iterate it, sync or async, then `close()` it, or use it
+    as a context manager."""
+
+    def __enter__(self) -> Live: ...
+    def __exit__(self, *args: object) -> None: ...
+    def close(self) -> None:
+        """Stops the scan and ends every loop over it."""
 
     def __iter__(self) -> Iterator[Event]: ...
     def __next__(self) -> Event: ...
@@ -136,5 +144,8 @@ class Live:
     def follow(self, ids: list[int]) -> None:
         """With `shown_only`, or once inotify watches run out (Linux),
         follows only folders `ids` of the latest tree."""
+    def relist(self, ids: list[int]) -> None:
+        """Lists folders `ids` of the latest tree again, and reports what
+        changed in them: for folders looked at after `Missed`."""
     def rescan(self, id: int) -> None:
         """Scans folder `id` again, then reports `Changed`; 0 rescans all."""

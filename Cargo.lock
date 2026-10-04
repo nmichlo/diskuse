@@ -100,6 +100,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrow-array"
 version = "60.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -504,6 +513,7 @@ dependencies = [
  "clap",
  "diskuse-core",
  "insta",
+ "log",
  "ratatui",
  "rustix",
  "signal-hook",
@@ -519,6 +529,7 @@ dependencies = [
  "crc32fast",
  "hashbrown 0.16.1",
  "libc",
+ "log",
  "memmap2",
  "proptest",
  "rayon",
@@ -535,6 +546,7 @@ dependencies = [
  "diskuse",
  "diskuse-core",
  "pyo3",
+ "pyo3-log",
 ]
 
 [[package]]
@@ -1146,6 +1158,17 @@ checksum = "dfc0b8e19df29aad7086cf977bb0c2a2f143e30567eb113e9cf72b62ca698330"
 dependencies = [
  "libc",
  "pyo3-build-config",
+]
+
+[[package]]
+name = "pyo3-log"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f64083bd3a16a353d9d62335808e8e13d0552d2a2b83fdb084496192dcfa9fcd"
+dependencies = [
+ "arc-swap",
+ "log",
+ "pyo3",
 ]
 
 [[package]]

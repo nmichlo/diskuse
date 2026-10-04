@@ -123,8 +123,10 @@ fn env(desktop: Desktop) -> Env {
         terminal: "iTerm".into(),
         cache: None,
         inotify: true,
-        interval: Duration::ZERO,
+        // often, so the tests are fast
+        interval: Duration::from_millis(5),
         units: Units::Binary,
+        wake: None,
         color: true,
         home: None,
     }
@@ -190,13 +192,13 @@ fn click(x: u16, y: u16) -> MouseEvent {
 
 /// Polls `b` until no scan runs.
 fn finish_scan(b: &mut Browser) {
-    while b.poll(now(), Duration::ZERO) {
+    while b.poll(now()) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
 
 fn finish(app: &mut App) {
-    while app.poll(now(), Duration::ZERO) {
+    while app.poll(now()) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -745,7 +747,7 @@ fn reveals_and_opens_a_largest_file() {
 fn shown_within(b: &mut Browser, within: Duration, ready: impl Fn(&str) -> bool) -> Buffer {
     let deadline = Instant::now() + within;
     loop {
-        b.poll(now(), Duration::ZERO);
+        b.poll(now());
         let drawn = draw(b, now());
         let text = shot(&drawn);
         if ready(&text) {
