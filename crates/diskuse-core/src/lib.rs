@@ -22,7 +22,7 @@ mod watch;
 pub use access::{FullDiskAccess, preflight};
 pub use json::json;
 pub use labels::{Label, Labels, Tier};
-pub use live::{Event, Live, LiveOptions, Reason, Waker, live};
+pub use live::{Event, Handler, Live, LiveOptions, Reason, live};
 pub use report::{Units, largest_first, report};
 pub use scan::{Reader, ScanError, ScanOptions, Stop, scan, scan_live};
 pub use store::{CacheDir, Saved, SavedFile, SavedTree};

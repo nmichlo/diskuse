@@ -147,6 +147,7 @@ impl Output {
 /// script both call this, so they cannot drift apart.
 pub fn cli(args: impl IntoIterator<Item = OsString>) -> u8 {
     let cli = Cli::parse_from(args);
+    crate::logfile::init_from_env();
     match (cli.command, cli.path) {
         (
             Some(Command::Scan {

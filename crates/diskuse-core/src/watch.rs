@@ -64,7 +64,7 @@ pub(crate) enum Poll {
     /// The replay has not ended, or the stream has not gone quiet after it.
     /// Or no dir shown is due to be listed again.
     Wait,
-    /// Changes were lost: only a full scan is right. Why, for the user.
+    /// Changes were missed, this once: only a full scan finds them.
     Lost(Reason),
     Changes(Changes),
 }
@@ -138,7 +138,8 @@ impl Watch {
             self.add(batch);
         }
         let now = Instant::now();
-        if let Some(why) = self.lost {
+        // said once: the stream goes on with the changes after
+        if let Some(why) = self.lost.take() {
             return Poll::Lost(why);
         }
         if !self.settled && self.replayed.is_some() && !self.flushed {
@@ -153,10 +154,13 @@ impl Watch {
         }
         if !self.settled {
             let Some(replayed) = self.replayed else {
-                return match now - self.started > REPLAY_MAX {
-                    true => Poll::Lost(Reason::NoReplay),
-                    false => Poll::Wait,
-                };
+                if now - self.started <= REPLAY_MAX {
+                    return Poll::Wait;
+                }
+                // those made while scanning are missed; the ones since
+                // are still to come
+                self.settled = true;
+                return Poll::Lost(Reason::NoReplay);
             };
             if now - self.last < QUIET && now - replayed < QUIET_MAX {
                 return Poll::Wait;

@@ -7,7 +7,7 @@ use crate::guide::{draw_guide, settings_command};
 use crate::reveal;
 use crate::style::Styles;
 use crate::volume_list;
-use diskuse_core::{FullDiskAccess, Mount, Units, Waker, mounts, preflight};
+use diskuse_core::{FullDiskAccess, Mount, Units, mounts, preflight};
 use ratatui::Frame;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -21,7 +21,7 @@ use std::ffi::OsString;
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -96,8 +96,14 @@ pub fn browse(path: Option<&Path>, reclaimable: bool, units: Units) -> io::Resul
         .filter(|home| cfg!(target_os = "macos") && path.is_none_or(|p| on_home_path(p, home)))
         .map(|home| Box::new(move || preflight(&home)) as Preflight);
     // the preflight runs here, before the terminal is taken over
+    // scans wake the terminal loop through its one channel
+    let (tx, msgs) = mpsc::channel();
+    let wake = tx.clone();
     let env = Env {
         units,
+        wake: Some(Arc::new(move || {
+            let _ = wake.send(Msg::Scan);
+        })),
         ..Env::from_env()
     };
     let mut app = App::new(path, mounts, env, preflight, reclaimable);
@@ -109,8 +115,8 @@ pub fn browse(path: Option<&Path>, reclaimable: bool, units: Units) -> io::Resul
         hook(info);
     }));
     let mut terminal = ratatui::init();
-    let result =
-        execute!(io::stdout(), EnableMouseCapture).and_then(|()| run(&mut terminal, &mut app));
+    let result = execute!(io::stdout(), EnableMouseCapture)
+        .and_then(|()| run(&mut terminal, &mut app, tx, msgs));
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     if let Err(e) = app.quit() {
@@ -124,57 +130,46 @@ fn on_home_path(path: &Path, home: &Path) -> bool {
     std::fs::canonicalize(path).is_ok_and(|p| p.starts_with(home) || home.starts_with(&p))
 }
 
-/// Draws, then waits for a key, the mouse, or the scan shown, whichever
-/// comes first. Input comes from its own thread, which wakes the scan's
-/// wait.
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
-    let (tx, input) = mpsc::channel();
-    let waker: Arc<Mutex<Option<Waker>>> = Arc::default();
-    let wake = Arc::clone(&waker);
+/// What the terminal loop waits on.
+enum Msg {
+    /// A key, the mouse, or the terminal resized.
+    Input(Event),
+    /// A scan has something new ([`Env::wake`]).
+    Scan,
+}
+
+/// Draws, then waits for a key, the mouse or a scan, whichever comes
+/// first, or for the next second, as the screen shows ages.
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    tx: mpsc::Sender<Msg>,
+    msgs: mpsc::Receiver<Msg>,
+) -> io::Result<()> {
     thread::spawn(move || {
         while let Ok(e) = event::read() {
-            if tx.send(e).is_err() {
+            if tx.send(Msg::Input(e)).is_err() {
                 break;
-            }
-            if let Some(w) = &*wake.lock().unwrap() {
-                w.wake();
             }
         }
     });
-    let mut pending = Vec::new();
     loop {
         terminal.draw(|f| app.draw(f, SystemTime::now()))?;
-        // all input first, so a key never waits on the scan
-        pending.extend(input.try_iter());
-        let timeout = if pending.is_empty() {
-            TICK
-        } else {
-            Duration::ZERO
-        };
-        for e in pending.drain(..) {
-            match e {
-                Event::Key(key)
+        // all there is at once: a burst of scan events is one redraw
+        let first = msgs.recv_timeout(TICK).ok();
+        for msg in first.into_iter().chain(msgs.try_iter()) {
+            match msg {
+                Msg::Input(Event::Key(key))
                     if key.kind == KeyEventKind::Press
                         && app.key(key, &mut reveal::spawn).is_break() =>
                 {
                     return Ok(());
                 }
-                Event::Mouse(m) => app.mouse(m, SystemTime::now()),
+                Msg::Input(Event::Mouse(m)) => app.mouse(m, SystemTime::now()),
                 _ => {}
             }
         }
-        // set before the wait, and input is taken after it, so no key is
-        // missed
-        *waker.lock().unwrap() = app.waker();
-        match app.waker() {
-            Some(_) => {
-                app.poll(SystemTime::now(), timeout);
-            }
-            None => {
-                app.poll(SystemTime::now(), Duration::ZERO);
-                pending.extend(input.recv_timeout(timeout));
-            }
-        }
+        app.poll(SystemTime::now());
     }
 }
 
@@ -256,25 +251,16 @@ impl App {
         app
     }
 
-    /// Catches up with a running scan, or with changes on disk, waiting up
-    /// to `timeout` for the browser shown ([`Browser::poll`]). Returns
-    /// whether a scan still runs.
-    pub fn poll(&mut self, now: SystemTime, timeout: Duration) -> bool {
+    /// Catches up with a running scan, or with changes on disk
+    /// ([`Browser::poll`]). Returns whether a scan still runs.
+    pub fn poll(&mut self, now: SystemTime) -> bool {
         // a parked browser keeps up too, so changes do not pile up
         if let Some(b) = &mut self.parked {
-            b.poll(now, Duration::ZERO);
+            b.poll(now);
         }
         match &mut self.screen {
-            Screen::Browse(b) => b.poll(now, timeout),
+            Screen::Browse(b) => b.poll(now),
             _ => false,
-        }
-    }
-
-    /// Wakes an [`App::poll`] waiting on another thread, if one would wait.
-    pub fn waker(&self) -> Option<Waker> {
-        match &self.screen {
-            Screen::Browse(b) => b.waker(),
-            _ => None,
         }
     }
 

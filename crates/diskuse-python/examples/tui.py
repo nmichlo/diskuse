@@ -68,9 +68,13 @@ class Browse(App[None]):
                     self.status = ""
                 case diskuse.Event.Changed(tree, _):
                     self.latest = tree
-                case diskuse.Event.Rescanning(reason):
-                    self.status = f"rescanning ({reason})"
+                case diskuse.Event.Missed(reason, _):
+                    # nothing is scanned again by itself: s on the root does
+                    self.status = f"changes missed ({reason})"
             self.show()
+
+    def on_unmount(self) -> None:
+        self.live.close()
 
     def here(self) -> int | None:
         return self.latest.find(Path(*self.trail)) if self.latest else None
