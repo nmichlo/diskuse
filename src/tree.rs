@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub const LARGEST: usize = 1000;
 
 /// One directory.
-#[derive(Clone, Copy, Debug, rkyv::Archive, rkyv::Serialize)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "cli", derive(rkyv::Archive, rkyv::Serialize))]
 pub struct Record {
     /// Index of the parent record, [`Record::NO_PARENT`] for the root.
     pub parent: u32,
@@ -97,7 +98,8 @@ pub struct File {
 }
 
 /// One of the [`LARGEST`] largest files. Ordered by `bytes` first.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "cli", derive(rkyv::Archive, rkyv::Serialize))]
 pub struct LargeFile {
     /// Allocated bytes, as counted in its directory's `own`.
     pub bytes: u64,
@@ -501,18 +503,6 @@ impl Tree {
         (self.records, self.private, self.names) = (records, private, Arc::new(names));
         self.cache = OnceLock::new();
         Some(id)
-    }
-
-    /// The first id of `self` that no longer names the folder it named in
-    /// `old`, an earlier tree of the same root: where new records start,
-    /// or where [`Tree::compact`] or a full scan numbered them again.
-    pub(crate) fn moved_from(&self, old: &Tree) -> u32 {
-        let same = |k: usize| {
-            let (a, b) = (old.records[k], self.records[k]);
-            a.parent == b.parent && old.names[a.name as usize] == self.names[b.name as usize]
-        };
-        let n = old.records.len().min(self.records.len());
-        (0..n).find(|&k| !same(k)).unwrap_or(n) as u32
     }
 
     /// Appends a name, without looking for an equal one, which would need

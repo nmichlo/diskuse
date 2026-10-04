@@ -72,7 +72,7 @@ Sizes are allocated bytes like `du -x`. Scans stay on one disk, never follow sym
 
 ## 🦀 &nbsp;Rust
 
-The scanner is a library too (`cargo add diskuse`). Folders are ids, and the root is 0:
+The scanner is a library too (`cargo add diskuse --no-default-features`, without the command's dependencies). Folders are ids of one tree, and the root is 0:
 
 ```rust
 use diskuse::{Event, LiveOptions, ReadTree, ScanOptions};
@@ -83,6 +83,7 @@ for &k in tree.children(0) {
 }
 tree.find(Path::new("a/b")); // Some(id)
 tree.largest_files(10); // [(path, bytes), ...]
+tree.files(0, false)?; // the root's files, listed from disk now
 
 for event in diskuse::live(path, LiveOptions::default()) {
     match event? {
@@ -107,6 +108,7 @@ for k in tree.children(0):
     print(tree.size(k), tree.path(k))  # allocated bytes, like du
 tree.find("a/b")  # id or None
 tree.largest_files(10)  # [(path, bytes), ...]
+tree.files(0)  # the root's files, listed from disk now
 pyarrow.table(tree)  # every folder as a row, also polars and duckdb
 
 for event in diskuse.live("~/src"):  # or: async for

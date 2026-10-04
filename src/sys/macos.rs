@@ -12,10 +12,11 @@ use crate::volumes::Mount;
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::io::{Errno, Result};
 use std::cell::RefCell;
-use std::ffi::{CStr, CString, OsString, c_char, c_int};
+use std::ffi::{CStr, OsString, c_char, c_int};
 use std::io;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::Path;
+use std::os::unix::ffi::OsStringExt;
+#[cfg(feature = "cli")]
+use {std::ffi::CString, std::os::unix::ffi::OsStrExt, std::path::Path};
 
 // Not in the libc crate.
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
@@ -272,6 +273,7 @@ fn u64_at(e: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(e[at..at + 8].try_into().unwrap())
 }
 
+#[cfg(feature = "cli")]
 /// ATTR_VOL_UUID of the volume holding `path`, or 0 if the filesystem has
 /// none. Any path on the volume works, not only its root as the man page
 /// says.
