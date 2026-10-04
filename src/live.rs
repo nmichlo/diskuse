@@ -7,9 +7,9 @@
 //! of a whole tree (Linux), only the folders given to [`Live::follow`] are
 //! followed.
 
-use crate::scan::{ApplyError, Deltas, ScanError, ScanOptions, Stop, scan_live};
+use crate::scan::{Applied, ApplyError, ScanError, ScanOptions, Stop, scan_live};
 use crate::tree::{Progress, ReadTree, Tree, below};
-use crate::watch::{Changes, DirWatch, Poll, Watch};
+use crate::watch::{Changes, DirWatch, Poll, TreeWatch, Watch};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -73,6 +73,9 @@ pub struct LiveOptions {
     /// On Linux, watch the followed folders with inotify. Off, they are
     /// listed again on a timer, as where inotify cannot watch them.
     pub inotify: bool,
+    /// On Linux, follow only the folders given to [`Live::follow`], as a
+    /// browser showing a few at a time does, not every folder.
+    pub shown_only: bool,
 }
 
 impl Default for LiveOptions {
@@ -82,6 +85,7 @@ impl Default for LiveOptions {
             interval: Duration::from_millis(500),
             ignore: None,
             inotify: true,
+            shown_only: false,
         }
     }
 }
@@ -90,7 +94,7 @@ impl Default for LiveOptions {
 /// listed again, without.
 struct Job {
     /// The tree, and for a rescan what changed.
-    thread: JoinHandle<Result<(Tree, Deltas), ApplyError>>,
+    thread: JoinHandle<Result<(Tree, Applied), ApplyError>>,
     progress: Option<Progress>,
     /// The thread is done, so joining it does not block.
     exited: bool,
@@ -129,10 +133,24 @@ impl Waker {
 }
 
 enum Follow {
-    /// Every change below the root.
+    /// Every change below the root, from the OS's record of them (macOS).
     All(Watch),
+    /// Every folder, each watched (Linux).
+    Every(TreeWatch),
     /// Those in the folders given to [`Live::follow`].
     Shown(DirWatch),
+}
+
+impl Follow {
+    /// Follows `tree` after [`Tree::apply`]: falls back to following only
+    /// the folders given to [`Live::follow`] once watches run out.
+    fn applied(&mut self, tree: &Tree, applied: &Applied, inotify: bool) {
+        if let Follow::Every(watch) = self
+            && !watch.applied(tree, applied)
+        {
+            *self = Follow::Shown(DirWatch::new(inotify));
+        }
+    }
 }
 
 enum State {
@@ -188,7 +206,7 @@ impl Live {
     /// progress and once done.
     fn spawn(
         &self,
-        scan: impl FnOnce(&dyn Fn(Progress)) -> Result<(Tree, Deltas), ApplyError> + Send + 'static,
+        scan: impl FnOnce(&dyn Fn(Progress)) -> Result<(Tree, Applied), ApplyError> + Send + 'static,
     ) -> Job {
         let tx = self.tx.clone();
         let thread = thread::spawn(move || {
@@ -208,7 +226,7 @@ impl Live {
         let (root, opts) = (self.root.clone(), self.options());
         self.state = State::Scanning(self.spawn(move |progress| {
             let tree = scan_live(&root, &opts, progress).map_err(ApplyError::Scan)?;
-            Ok((tree, None))
+            Ok((tree, Applied::default()))
         }));
     }
 
@@ -291,16 +309,18 @@ impl Live {
             }
             State::Following {
                 tree,
+                follow,
                 rescan: rescan @ Some(_),
-                ..
             } => {
                 if !rescan.as_ref().unwrap().exited {
                     return None;
                 }
                 match join(rescan.take().unwrap()) {
-                    Ok((new, deltas)) => {
+                    Ok((new, applied)) => {
                         **tree = new;
-                        Some(Ok(Event::Changed(shared(tree), deltas.unwrap_or_default())))
+                        follow.applied(tree, &applied, self.opts.inotify);
+                        let changes = applied.deltas.unwrap_or_default();
+                        Some(Ok(Event::Changed(shared(tree), changes)))
                     }
                     Err(e) => Some(self.failed(e)),
                 }
@@ -313,6 +333,7 @@ impl Live {
             } => {
                 let poll = match &mut **follow {
                     Follow::All(watch) => watch.poll(),
+                    Follow::Every(watch) => watch.poll(tree),
                     Follow::Shown(dirs) => dirs.poll(tree),
                 };
                 let changes = match poll {
@@ -329,12 +350,15 @@ impl Live {
                 let State::Following { tree, follow, .. } = &mut self.state else {
                     unreachable!()
                 };
-                let deltas = tree.apply(&changes, &opts);
+                let applied = tree.apply(&changes, &opts);
                 if let Follow::Shown(dirs) = &mut **follow {
                     dirs.listed(started.elapsed());
                 }
-                match deltas {
-                    Ok(deltas) => Some(Ok(Event::Changed(shared(tree), deltas?))),
+                match applied {
+                    Ok(applied) => {
+                        follow.applied(tree, &applied, self.opts.inotify);
+                        Some(Ok(Event::Changed(shared(tree), applied.deltas?)))
+                    }
                     Err(e) => Some(self.failed(e)),
                 }
             }
@@ -359,9 +383,16 @@ impl Live {
             Err(e) => return self.failed(e),
         };
         let ignore = self.opts.ignore.as_deref();
+        let every = || match self.opts.inotify && !self.opts.shown_only {
+            true => TreeWatch::start(&tree),
+            false => None,
+        };
         let follow = Box::new(match Watch::start(&self.root, &tree, ignore) {
             Some(watch) => Follow::All(watch),
-            None => Follow::Shown(DirWatch::new(self.opts.inotify)),
+            None => match every() {
+                Some(watch) => Follow::Every(watch),
+                None => Follow::Shown(DirWatch::new(self.opts.inotify)),
+            },
         });
         let event = Event::Ready(shared(&tree));
         self.state = State::Following {
@@ -423,7 +454,7 @@ impl Live {
     /// folders given to [`Live::follow`].
     pub fn follows_all(&self) -> bool {
         match &self.state {
-            State::Following { follow, .. } => matches!(**follow, Follow::All(_)),
+            State::Following { follow, .. } => !matches!(**follow, Follow::Shown(_)),
             _ => false,
         }
     }
@@ -474,7 +505,7 @@ impl Drop for Live {
     }
 }
 
-fn join(job: Job) -> Result<(Tree, Deltas), ApplyError> {
+fn join(job: Job) -> Result<(Tree, Applied), ApplyError> {
     match job.thread.join() {
         Ok(done) => done,
         Err(panic) => std::panic::resume_unwind(panic),

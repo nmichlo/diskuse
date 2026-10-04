@@ -101,6 +101,17 @@ pub(crate) enum ApplyError {
 /// path. `None` if nothing did, not even a folder of 0 bytes.
 pub(crate) type Deltas = Option<Vec<(PathBuf, i64)>>;
 
+/// What [`Tree::apply`] did.
+#[derive(Debug, Default)]
+pub(crate) struct Applied {
+    pub deltas: Deltas,
+    /// The ids from this one on are folders new to the tree.
+    pub new: u32,
+    /// Each old id's new one, `u32::MAX` for a folder gone, if the ids
+    /// were numbered again ([`Tree::compact`]).
+    pub moved: Option<Vec<u32>>,
+}
+
 /// Scans `root` without crossing devices or mount points, or following
 /// symlinks.
 ///
@@ -577,9 +588,12 @@ impl Tree {
         &mut self,
         changes: &Changes,
         opts: &ScanOptions,
-    ) -> Result<Deltas, ApplyError> {
+    ) -> Result<Applied, ApplyError> {
         if changes.is_empty() {
-            return Ok(None);
+            return Ok(Applied {
+                new: self.len() as u32,
+                ..Applied::default()
+            });
         }
         // taken, as the records change: what reads the tree next derives
         // it again
@@ -621,9 +635,18 @@ impl Tree {
         if !new.is_empty() {
             self.scan_new(&root, new, dev, lister, &pool, gate, opts);
         }
+        let n = index.size.len();
         let deltas = self.deltas(&index);
-        self.compact();
-        Ok(deltas)
+        let moved = self.compact();
+        let new = match &moved {
+            Some(id) => id[..n].iter().filter(|&&k| k != u32::MAX).count(),
+            None => n,
+        };
+        Ok(Applied {
+            deltas,
+            new: new as u32,
+            moved,
+        })
     }
 
     /// Scans `new`, the subdirectories new in dirs listed again, in one

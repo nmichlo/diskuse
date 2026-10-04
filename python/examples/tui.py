@@ -95,8 +95,6 @@ class Browse(App[None]):
             table.add_row(human(size), f"{'+' if change > 0 else ''}{human(change)}" if change else "", name, key=name)
         table.move_cursor(row=at)
         self.title = f"{tree.path(d)}  {human(tree.size(d))}  {self.status}"
-        # on Linux, only the folders followed report changes
-        self.live.follow([d])
 
     def selected(self) -> str | None:
         table = self.query_one(DataTable)

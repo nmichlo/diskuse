@@ -457,11 +457,12 @@ impl Tree {
 
     /// Once removed records are half the tree, drops them and the names
     /// only they used, and numbers the rest again, in order, so a tree
-    /// followed for long stays the size of what is on disk.
-    pub(crate) fn compact(&mut self) {
+    /// followed for long stays the size of what is on disk. Returns each
+    /// old id's new one, `u32::MAX` for those dropped, if it did.
+    pub(crate) fn compact(&mut self) -> Option<Vec<u32>> {
         let removed = |r: &Record| r.flags & Record::REMOVED != 0;
         if self.records.iter().filter(|r| removed(r)).count() * 2 <= self.records.len() {
-            return;
+            return None;
         }
         let mut id = vec![u32::MAX; self.records.len()];
         let mut name = vec![u32::MAX; self.names.count()];
@@ -499,6 +500,7 @@ impl Tree {
         }
         (self.records, self.private, self.names) = (records, private, Arc::new(names));
         self.cache = OnceLock::new();
+        Some(id)
     }
 
     /// The first id of `self` that no longer names the folder it named in

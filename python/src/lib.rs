@@ -320,14 +320,22 @@ impl PyLive {
 
 /// Scans `path` and keeps following it: see `Event`. `interval` is how
 /// often, in seconds, a snapshot comes while scanning, and changes after.
+/// `shown_only`: on Linux, follow only the folders given to `follow`.
 #[pyfunction]
-#[pyo3(signature = (path, interval = 0.5, threads = None))]
-fn live(py: Python<'_>, path: PathBuf, interval: f64, threads: Option<usize>) -> PyResult<PyLive> {
+#[pyo3(signature = (path, interval = 0.5, threads = None, shown_only = false))]
+fn live(
+    py: Python<'_>,
+    path: PathBuf,
+    interval: f64,
+    threads: Option<usize>,
+    shown_only: bool,
+) -> PyResult<PyLive> {
     let path = expand(py, path)?;
     let opts = LiveOptions {
         scan: options(threads),
         interval: Duration::try_from_secs_f64(interval)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+        shown_only,
         ..LiveOptions::default()
     };
     let live = py.detach(|| diskuse::live(&path, opts));
@@ -366,8 +374,15 @@ impl PyLive {
         }
     }
 
-    /// Where the OS keeps no record of a whole tree (Linux), follows only
-    /// the folders `ids` of the latest tree. Ignored elsewhere.
+    /// With `shown_only`, or once inotify watches run out (Linux), follows
+    /// only the folders `ids` of the latest tree. Ignored otherwise.
+    /// Every change below the root is followed, not only those in the
+    /// folders given to `follow`.
+    fn follows_all(&self, py: Python<'_>) -> bool {
+        self.waker.wake();
+        py.detach(|| self.live.lock().unwrap().follows_all())
+    }
+
     fn follow(&self, py: Python<'_>, ids: Vec<u32>) {
         self.waker.wake();
         py.detach(|| self.live.lock().unwrap().follow(&ids));

@@ -182,7 +182,11 @@ impl Inotify {
         None
     }
 
-    pub fn add(&self, _: &CStr, _: bool) -> Option<i32> {
+    pub fn remote(_: &CStr) -> bool {
+        true
+    }
+
+    pub fn add(&self, _: &CStr, _: bool) -> Result<i32> {
         match *self {}
     }
 

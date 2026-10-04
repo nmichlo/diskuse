@@ -24,11 +24,17 @@ def scan(path: str | PathLike[str], threads: int | None = None) -> Tree:
     once. `threads` fixes the thread count; by default it adapts.
     """
 
-def live(path: str | PathLike[str], interval: float = 0.5, threads: int | None = None) -> Live:
+def live(
+    path: str | PathLike[str],
+    interval: float = 0.5,
+    threads: int | None = None,
+    shown_only: bool = False,
+) -> Live:
     """Scans `path` and keeps following it: see `Event`.
 
     `interval` is how often, in seconds, a snapshot comes while scanning,
-    and changes after. Leaving the loop stops it.
+    and changes after. `shown_only`: on Linux, follow only the folders given
+    to `Live.follow`, not every folder. Leaving the loop stops it.
     """
 
 @final
@@ -124,7 +130,11 @@ class Live:
     def __next__(self) -> Event: ...
     def __aiter__(self) -> AsyncIterator[Event]: ...
     async def __anext__(self) -> Event: ...
+    def follows_all(self) -> bool:
+        """Every change below the root is followed, not only those in the
+        folders given to `follow`."""
     def follow(self, ids: list[int]) -> None:
-        """On Linux, follows only folders `ids` of the latest tree."""
+        """With `shown_only`, or once inotify watches run out (Linux),
+        follows only folders `ids` of the latest tree."""
     def rescan(self, id: int) -> None:
         """Scans folder `id` again, then reports `Changed`; 0 rescans all."""

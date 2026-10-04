@@ -160,16 +160,10 @@ def until_ready(live: diskuse.Live) -> tuple[list[str], diskuse.Tree]:
     raise AssertionError("no Ready")
 
 
-def follow_all(live: diskuse.Live, tree: diskuse.Tree) -> None:
-    """Every folder, where only those followed are (Linux)."""
-    live.follow([0, *(k for c in tree.children(0) for k in [c, *tree.children(c)])])
-
-
 def test_live_reports_ready_then_each_change(root: Path) -> None:
     live = diskuse.live(root, interval=0.2)
     kinds, tree = until_ready(live)
-    assert (kinds[-1], tree.size(0)) == ("Ready", diskuse.scan(root).size(0))
-    follow_all(live, tree)
+    assert (kinds[-1], tree.size(0), live.follows_all()) == ("Ready", diskuse.scan(root).size(0), True)
     (root / "a/new").write_bytes(b"x" * 4096)
     change = next(e for e in live if isinstance(e, diskuse.Event.Changed))
     assert change.changes == [(root / "a", blocks(root / "a/new"))]
@@ -181,8 +175,7 @@ def test_live_async(root: Path) -> None:
         live = diskuse.live(root, interval=0.2)
         async for e in live:
             match e:
-                case diskuse.Event.Ready(tree):
-                    follow_all(live, tree)
+                case diskuse.Event.Ready(_):
                     (root / "c/new").write_bytes(b"x" * 8192)
                 case diskuse.Event.Changed(_, changes):
                     return changes
