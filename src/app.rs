@@ -5,6 +5,7 @@
 use crate::access::{self, FullDiskAccess, draw_guide, settings_command};
 use crate::browse::{Browser, Clicks, Env, nav};
 use crate::live::Waker;
+use crate::report::Units;
 use crate::reveal;
 use crate::style::Styles;
 use crate::sys;
@@ -32,7 +33,7 @@ use std::time::{Duration, SystemTime};
 const TICK: Duration = Duration::from_secs(1);
 
 /// Every key, and what it does, as the help lists them.
-const KEYS: [(&str, &str); 20] = [
+const KEYS: [(&str, &str); 22] = [
     ("Up Down k j", "move"),
     ("PageUp PageDown", "move by a screen"),
     ("Home End g G", "go to the first or the last row"),
@@ -60,6 +61,8 @@ const KEYS: [(&str, &str); 20] = [
     ),
     ("d", "list the directories that could not be read, and why"),
     ("t", "list the largest files"),
+    ("i", "show everything about the selected item"),
+    ("u", "switch sizes between GiB (1024) and GB (1000)"),
     ("?", "show or hide this help"),
     (
         "q Esc",
@@ -76,8 +79,9 @@ const KEYS_HELP: &str = "? or esc close";
 pub type Preflight = Box<dyn FnOnce() -> FullDiskAccess>;
 
 /// Browses `path` full screen until the user quits, or without a path,
-/// starts on the volume list. `reclaimable` adds reclaimable sizes.
-pub fn browse(path: Option<&Path>, reclaimable: bool) -> io::Result<()> {
+/// starts on the volume list. `reclaimable` adds reclaimable sizes; sizes
+/// start in `units`.
+pub fn browse(path: Option<&Path>, reclaimable: bool, units: Units) -> io::Result<()> {
     let mounts = match path {
         Some(path) => {
             // fail before taking over the terminal
@@ -95,7 +99,11 @@ pub fn browse(path: Option<&Path>, reclaimable: bool) -> io::Result<()> {
         .filter(|home| cfg!(target_os = "macos") && path.is_none_or(|p| on_home_path(p, home)))
         .map(|home| Box::new(move || access::preflight(&home)) as Preflight);
     // the preflight runs here, before the terminal is taken over
-    let mut app = App::new(path, mounts, Env::from_env(), preflight, reclaimable);
+    let env = Env {
+        units,
+        ..Env::from_env()
+    };
+    let mut app = App::new(path, mounts, env, preflight, reclaimable);
     // gives the mouse back on panic too: `ratatui::init` restores the rest,
     // then calls this hook
     let hook = std::panic::take_hook();
@@ -304,6 +312,18 @@ impl App {
             self.help = true;
             return ControlFlow::Continue(());
         }
+        // every screen switches units, the parked browser too
+        if key.code == KeyCode::Char('u') && !typing {
+            self.env.units = self.env.units.toggled();
+            let browsers = match &mut self.screen {
+                Screen::Browse(b) => Some(b),
+                _ => None,
+            };
+            for b in browsers.into_iter().chain(self.parked.as_mut()) {
+                b.set_units(self.env.units);
+            }
+            return ControlFlow::Continue(());
+        }
         let page = volume_list::height(self.area);
         match &mut self.screen {
             Screen::Volumes => match key.code {
@@ -388,7 +408,9 @@ impl App {
         }
         let styles = Styles::new(self.env.color);
         match &mut self.screen {
-            Screen::Volumes => volume_list::draw(frame, &self.volumes, self.cursor, styles),
+            Screen::Volumes => {
+                volume_list::draw(frame, &self.volumes, self.cursor, styles, self.env.units);
+            }
             Screen::Guide(_, message) => {
                 draw_guide(frame, &self.env.terminal, message.as_deref());
             }
