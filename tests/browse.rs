@@ -378,6 +378,7 @@ fn env(desktop: Desktop) -> Env {
         terminal: "iTerm".into(),
         cache: None,
         inotify: true,
+        interval: Duration::ZERO,
         color: true,
         home: None,
     }
@@ -532,7 +533,7 @@ fn scanned(root: &Path, desktop: Desktop) -> Browser {
 fn scanned_as(root: &Path, display: &str, desktop: Desktop, reclaimable: bool) -> Browser {
     let mut b = Browser::new(root, display, env(desktop), None, None, reclaimable);
     b.scan();
-    while b.poll(now()) {
+    while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
     b
@@ -947,7 +948,7 @@ fn enter_volume(f: &Fixture, used: u64, access: FullDiskAccess) -> App {
 }
 
 fn finish(app: &mut App) {
-    while app.poll(now()) {
+    while app.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -1093,7 +1094,7 @@ fn labels_dirs_by_how_safe_deleting_them_is() {
     };
     let mut b = Browser::new(root, "/labels", env, None, None, false);
     b.scan();
-    while b.poll(now()) {
+    while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
     let of = 45056 + tag + 10 * d;
@@ -1188,7 +1189,7 @@ fn draws_without_colours_for_no_color() {
     };
     let mut b = Browser::new(f.dir.path(), "/fixture", env, None, None, false);
     b.scan();
-    while b.poll(now()) {
+    while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
     press(&mut b, &[KeyCode::Down, KeyCode::Right, KeyCode::Right]);
@@ -1368,7 +1369,7 @@ fn reveals_and_opens_a_largest_file() {
 fn shows_within(b: &mut Browser, expected: &Buffer, within: Duration) {
     let deadline = Instant::now() + within;
     loop {
-        b.poll(now());
+        b.poll(now(), Duration::ZERO);
         let drawn = draw(b, now());
         if drawn == *expected {
             return;
@@ -1427,7 +1428,7 @@ fn follows_changes(inotify: bool, within: Duration, at: fn(&Path) -> PathBuf) {
     };
     let mut b = Browser::new(&at(root), "/live", env, Some(saved), None, false);
     b.scan();
-    while b.poll(now()) {
+    while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
@@ -1569,7 +1570,7 @@ fn rescans_over_a_stopped_saved_scan() {
         screen(&title, [&[], &[], &[]], None, 0, HELP)
     );
 
-    while b.poll(now()) {
+    while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
     let x = 4096 + d;
@@ -1619,7 +1620,7 @@ fn rescans_the_selected_dir_or_all() {
 
     press(&mut b, &[KeyCode::Char('s')]);
     assert_eq!(draw(&mut b, now()), shown(0, "  rescanning a/..."));
-    while b.poll(now()) {
+    while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(draw(&mut b, now()), shown(8192, ""));
@@ -1629,7 +1630,7 @@ fn rescans_the_selected_dir_or_all() {
         draw(&mut b, now()),
         screen("/fixture  scanning...", [&[], &[], &[]], None, 0, HELP)
     );
-    while b.poll(now()) {
+    while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(draw(&mut b, now()), shown(8192, ""));
@@ -1659,7 +1660,7 @@ fn picks_items_and_lists_them() {
         };
         let mut b = Browser::new(root, "/picks", env, None, None, false);
         b.scan();
-        while b.poll(now()) {
+        while b.poll(now(), Duration::ZERO) {
             std::thread::sleep(Duration::from_millis(1));
         }
         b
@@ -1730,7 +1731,7 @@ fn sorts_by_change_on_c() {
     let mut b = scanned(root, Desktop::None);
     file(&root.join("small/new"), 8192);
     press(&mut b, &[KeyCode::Down, KeyCode::Char('s')]);
-    while b.poll(now()) {
+    while b.poll(now(), Duration::ZERO) {
         std::thread::sleep(Duration::from_millis(1));
     }
     let d = common::own_bytes(root);
