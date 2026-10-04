@@ -196,7 +196,7 @@ impl Baseline {
     /// Gives each record of `new` from id `from` on the start size of the
     /// dir at the same path in `old`, an earlier tree of the same root, or
     /// 0 if there is none: from `from` on, the ids of `new` are new or
-    /// numbered again ([`Tree::moved_from`]).
+    /// numbered again ([`moved_from`]).
     fn carry(&mut self, old: &Tree, new: &Tree, from: usize) {
         let mut sizes = self.sizes.clone();
         sizes.truncate(from);
@@ -232,6 +232,18 @@ impl Baseline {
         }
         self.sizes = sizes;
     }
+}
+
+/// The first id of `new` that no longer names the folder it named in
+/// `old`, an earlier tree of the same root: where new records start, or
+/// where a compaction or a full scan numbered them again.
+fn moved_from(new: &Tree, old: &Tree) -> u32 {
+    let same = |k: u32| {
+        let (a, b) = (old.record(k), new.record(k));
+        a.parent == b.parent && old.name(k) == new.name(k)
+    };
+    let n = old.len().min(new.len()) as u32;
+    (0..n).find(|&k| !same(k)).unwrap_or(n)
 }
 
 /// A tree as shown, with what drawing it needs.
@@ -497,7 +509,7 @@ impl Browser {
                 match &mut self.baseline {
                     Some(base) => {
                         if let Some(old) = base.of.take() {
-                            base.carry(&old, &tree, tree.moved_from(&old) as usize);
+                            base.carry(&old, &tree, moved_from(&tree, &old) as usize);
                         }
                     }
                     None => {
@@ -513,7 +525,7 @@ impl Browser {
             Some(Ok(Event::Changed(tree, _))) => {
                 // new records, or all of them numbered again
                 if let (Some(base), Some(old)) = (&mut self.baseline, &self.view) {
-                    base.carry(&old.tree, &tree, tree.moved_from(&old.tree) as usize);
+                    base.carry(&old.tree, &tree, moved_from(&tree, &old.tree) as usize);
                 }
                 if self.rescanning.take().is_some() {
                     self.save(&tree);

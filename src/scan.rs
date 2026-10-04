@@ -61,7 +61,8 @@ impl fmt::Debug for Stop {
 
 /// Which directory reader lists entries. Used by the differential test and
 /// benchmarks; users want [`Reader::Auto`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum Reader {
     /// The fastest reader for the OS (`getattrlistbulk` on macOS).
     #[default]

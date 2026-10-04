@@ -21,6 +21,7 @@ use rustix::fs::{AtFlags, FileType, OFlags, Stat};
 use rustix::io::{Errno, Result};
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use std::ffi::CStr;
+#[cfg(feature = "cli")]
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -233,6 +234,7 @@ pub fn firmlinks() -> Vec<Firmlink> {
     Vec::new()
 }
 
+#[cfg(feature = "cli")]
 /// All of `file`, mapped read-only, so a saved scan is read in place
 /// rather than copied.
 #[allow(unsafe_code)]
@@ -245,6 +247,7 @@ pub fn map(file: &File) -> io::Result<memmap2::Mmap> {
     unsafe { memmap2::Mmap::map(file) }
 }
 
+#[cfg(feature = "cli")]
 /// The allocated bytes of `path` by one `lstat`, or `None` if it cannot be
 /// read, as when it is gone.
 #[cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_cast))]
@@ -254,6 +257,7 @@ pub fn allocated(path: &Path) -> Option<u64> {
         .map(|st| st.st_blocks as u64 * 512)
 }
 
+#[cfg(feature = "cli")]
 /// Whether macOS protects `path` from changes (System Integrity
 /// Protection's `restricted` flag), by one `lstat`. Never elsewhere.
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -265,6 +269,7 @@ pub fn restricted(path: &Path) -> bool {
     false
 }
 
+#[cfg(feature = "cli")]
 /// Whether the file at `path` starts with `prefix`, by reading only that
 /// much. False if it cannot be read.
 pub fn starts_with(path: &Path, prefix: &[u8]) -> bool {
@@ -274,6 +279,7 @@ pub fn starts_with(path: &Path, prefix: &[u8]) -> bool {
     read.is_ok() && head == prefix
 }
 
+#[cfg(feature = "cli")]
 /// Whether `path` is still there, by one `lstat`, which never follows a
 /// final symlink. Only "no such file" counts as gone; any other error
 /// cannot tell, so counts as there.
@@ -306,6 +312,7 @@ pub fn read_dir_with(fd: impl AsFd, lister: Lister, f: impl FnMut(Entry<'_>)) ->
     portable::read_dir(fd.as_fd(), f)
 }
 
+#[cfg(feature = "cli")]
 /// An id of the volume holding `path`, stable across mounts and reboots:
 /// the volume UUID on macOS, `f_fsid` elsewhere.
 pub fn volume_id(path: &Path) -> Result<u128> {

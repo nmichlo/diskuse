@@ -7,6 +7,7 @@ use crate::browse::{Browser, Clicks, Env, nav};
 use crate::reveal;
 use crate::style::Styles;
 use crate::sys;
+use crate::volume_list;
 use crate::volumes::{self, Mount};
 use ratatui::Frame;
 use ratatui::crossterm::event::{
@@ -193,7 +194,7 @@ impl App {
     ) -> Self {
         let mut app = Self {
             env,
-            volumes: volumes::volumes(mounts),
+            volumes: volume_list::volumes(mounts),
             listed: path.is_none(),
             cursor: 0,
             preflight,
@@ -260,7 +261,7 @@ impl App {
             self.help = true;
             return ControlFlow::Continue(());
         }
-        let page = volumes::height(self.area);
+        let page = volume_list::height(self.area);
         match &mut self.screen {
             Screen::Volumes => match key.code {
                 code if let Some(at) = nav(code, self.cursor, self.volumes.len(), page) => {
@@ -316,7 +317,7 @@ impl App {
                     MouseEventKind::ScrollUp => KeyCode::Up,
                     MouseEventKind::ScrollDown => KeyCode::Down,
                     MouseEventKind::Down(MouseButton::Left) => {
-                        let row = volumes::row_at(self.area, self.cursor, event.row);
+                        let row = volume_list::row_at(self.area, self.cursor, event.row);
                         if let Some(at) = row.filter(|&at| at < n) {
                             match self.clicks.double(now, (0, event.row)) {
                                 true => self.scan_selected(),
@@ -344,7 +345,7 @@ impl App {
         }
         let styles = Styles::new(self.env.color);
         match &mut self.screen {
-            Screen::Volumes => volumes::draw(frame, &self.volumes, self.cursor, styles),
+            Screen::Volumes => volume_list::draw(frame, &self.volumes, self.cursor, styles),
             Screen::Guide(_, message) => {
                 draw_guide(frame, &self.env.terminal, message.as_deref());
             }
