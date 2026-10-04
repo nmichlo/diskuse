@@ -18,5 +18,11 @@ allow = [
     "Zlib",
 ]
 
+# Runs only while compiling (a proc-macro's dependency, through arrow-array's
+# ahash), so it is in no binary or wheel: public domain is fine there.
+[[licenses.exceptions]]
+crate = "tiny-keccak"
+allow = ["CC0-1.0"]
+
 [bans]
 multiple-versions = "warn"
