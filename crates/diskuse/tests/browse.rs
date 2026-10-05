@@ -15,7 +15,9 @@ mod common;
 use common::{Fixture, file, fixture, tempdir};
 use diskuse::reveal::Desktop;
 use diskuse::{App, Browser, Env};
-use diskuse_core::{CacheDir, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions, Units};
+use diskuse_core::{
+    CacheDir, FolderId, FullDiskAccess, Mount, ReadTree, Saved, ScanOptions, Units,
+};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
@@ -506,7 +508,7 @@ fn enter_volume(f: &Fixture, used: u64, access: FullDiskAccess) -> App {
 fn guides_to_full_disk_access_once_before_the_first_scan() {
     let f = fixture();
     let total = diskuse_core::scan(f.dir.path(), &ScanOptions::default()).unwrap();
-    let used = total.size(0) + (1 << 20);
+    let used = total.size(FolderId::ROOT) + (1 << 20);
     let mut app = enter_volume(&f, used, FullDiskAccess::Missing);
     assert_screen!("full_disk_access_guide", draw_app(&mut app));
 
@@ -896,10 +898,8 @@ fn rescans_over_a_stopped_saved_scan() {
         fs::create_dir(root.join(name)).unwrap();
         file(&root.join(name).join("f"), 4096);
     }
-    let opts = ScanOptions {
-        stop: diskuse_core::Stop::new(|| true),
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.stop = diskuse_core::Stop::new(|| true);
     let saved = Saved {
         tree: diskuse_core::scan(root, &opts).unwrap(),
         reclaimable: false,

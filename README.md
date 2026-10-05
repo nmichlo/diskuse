@@ -78,15 +78,15 @@ Sizes are allocated bytes like `du -x`. Scans stay on one disk, never follow sym
 The scanner is a library too (`cargo add diskuse-core`). Folders are ids of one tree, and the root is 0:
 
 ```rust
-use diskuse_core::{Event, LiveOptions, ReadTree, ScanOptions};
+use diskuse_core::{Event, FolderId, LiveOptions, ReadTree, ScanOptions};
 
 let tree = diskuse_core::scan(path, &ScanOptions::default())?;
-for &k in tree.children(0) {
+for k in tree.children(FolderId::ROOT) {
     println!("{} {}", tree.size(k), tree.path(k).display()); // allocated bytes, like du
 }
-tree.find(Path::new("a/b")); // Some(id)
+tree.find(Path::new("a/b")); // Some(id), good for this tree only
 tree.largest_files(10); // [(path, bytes), ...]
-tree.files(0, false)?; // the root's files, listed from disk now
+tree.files(FolderId::ROOT, false)?; // the root's files, listed from disk now
 
 // a thread of its own scans and follows; events come to a handler,
 // here a channel
@@ -96,7 +96,7 @@ for event in events {
     match event? {
         Event::Ready(tree) => {} // the scan finished
         Event::Changed(tree, changes) => {} // [(path, delta_bytes), ...]
-        Event::Missed(reason, path) => live.rescan(0), // the OS missed changes: your call
+        Event::Missed(reason, path) => live.rescan(FolderId::ROOT), // the OS missed changes: your call
         _ => {}
     }
 }

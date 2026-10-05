@@ -1,5 +1,6 @@
 //! The `diskuse` Python package: the Rust library's API, name for name.
-//! Folders are ids, the root is 0, as in Rust. Only Python has `~`
+//! Folders are plain integers, the root is 0: where Rust has a `FolderId`,
+//! its index. Only Python has `~`
 //! expansion, `async for`, and the Arrow PyCapsule interface.
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
@@ -8,13 +9,13 @@ use arrow_array::{
     ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, RecordBatch, RecordBatchIterator,
     UInt32Array, UInt64Array,
 };
-use diskuse_core::{Event, LiveOptions, ReadTree, Reason, Record, ScanError, ScanOptions, Tree};
+use diskuse_core::{Event, FolderId, LiveOptions, ReadTree, Reason, ScanError, ScanOptions, Tree};
 use pyo3::exceptions::{
     PyBaseException, PyIndexError, PyOSError, PyStopAsyncIteration, PyStopIteration,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyCapsule, PyTuple};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStringExt;
@@ -35,10 +36,9 @@ fn expand(py: Python<'_>, path: PathBuf) -> PyResult<PathBuf> {
 }
 
 fn options(threads: Option<usize>) -> ScanOptions {
-    ScanOptions {
-        threads: threads.and_then(NonZeroUsize::new),
-        ..ScanOptions::default()
-    }
+    let mut opts = ScanOptions::default();
+    opts.threads = threads.and_then(NonZeroUsize::new);
+    opts
 }
 
 /// The error scanning `root`: for the root itself, the `OSError` subclass
@@ -95,19 +95,30 @@ struct PyTree(Arc<Tree>);
 impl PyTree {
     fn new(tree: Tree) -> Self {
         // derived here, not on the first call, which holds the GIL
-        tree.size(0);
+        tree.size(FolderId::ROOT);
         Self(Arc::new(tree))
     }
 
     /// `id`, if it is a folder of this tree, not one removed since the
-    /// scan.
-    fn id(&self, id: u32) -> PyResult<u32> {
-        let there = |id| self.0.record(id).flags & Record::REMOVED == 0;
-        match (id as usize) < self.0.len() && there(id) {
-            true => Ok(id),
+    /// scan. Python keeps plain integers, so which tree an id is from is
+    /// not checked.
+    fn id(&self, id: u32) -> PyResult<FolderId> {
+        let folder = FolderId::unchecked(id);
+        match self.0.contains(folder) {
+            true => Ok(folder),
             false => Err(PyIndexError::new_err(format!("no folder {id}"))),
         }
     }
+}
+
+/// A folder as Python has it: its index.
+fn index(id: FolderId) -> u32 {
+    id.index() as u32
+}
+
+/// The folders Python names by `ids`, in whichever tree they are given to.
+fn folders(ids: Vec<u32>) -> Vec<FolderId> {
+    ids.into_iter().map(FolderId::unchecked).collect()
 }
 
 #[pymethods]
@@ -141,11 +152,11 @@ impl PyTree {
     }
 
     fn children(&self, id: u32) -> PyResult<Vec<u32>> {
-        Ok(self.0.children(self.id(id)?).to_vec())
+        Ok(self.0.children(self.id(id)?).map(index).collect())
     }
 
     fn find(&self, path: PathBuf) -> Option<u32> {
-        self.0.find(&path)
+        self.0.find(&path).map(index)
     }
 
     /// Listed from disk now, as the tree keeps only folder totals.
@@ -185,35 +196,42 @@ impl PyTree {
     fn __repr__(&self) -> String {
         format!(
             "<Tree {} {} bytes>",
-            self.0.path(0).display(),
-            self.0.size(0)
+            self.0.path(FolderId::ROOT).display(),
+            self.0.size(FolderId::ROOT)
         )
     }
 }
 
 /// Every folder not removed, with its id, its parent's (none for the
-/// root), its name as a dictionary of every name, lossy UTF-8, and sizes
+/// root), its name as a dictionary of the names, lossy UTF-8, and sizes
 /// and flags.
 fn batch(tree: &Tree) -> RecordBatch {
-    let ids: Vec<u32> = (0..tree.len() as u32)
-        .filter(|&i| tree.record(i).flags & Record::REMOVED == 0)
+    let ids: Vec<FolderId> = tree.ids().collect();
+    // each name once, in the order first met
+    let mut names: Vec<&[u8]> = Vec::new();
+    let mut key_of: HashMap<&[u8], u32> = HashMap::new();
+    let keys: UInt32Array = (ids.iter())
+        .map(|&i| {
+            *key_of.entry(tree.name(i)).or_insert_with_key(|name| {
+                names.push(name);
+                names.len() as u32 - 1
+            })
+        })
         .collect();
-    let names: LargeStringArray = (0..tree.name_count())
-        .map(|n| Some(String::from_utf8_lossy(tree.raw_name(n)).into_owned()))
+    let names: LargeStringArray = (names.iter())
+        .map(|n| Some(String::from_utf8_lossy(n)))
         .collect();
-    let keys: UInt32Array = ids.iter().map(|&i| tree.record(i).name).collect();
     let name = DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(names)).unwrap();
-    let parent: UInt32Array = (ids.iter())
-        .map(|&i| (i != 0).then(|| tree.record(i).parent))
-        .collect();
-    let u64s = |f: &dyn Fn(u32) -> u64| -> ArrayRef {
+    let parent: UInt32Array = ids.iter().map(|&i| tree.parent(i).map(index)).collect();
+    let u64s = |f: &dyn Fn(FolderId) -> u64| -> ArrayRef {
         Arc::new(ids.iter().map(|&i| f(i)).collect::<UInt64Array>())
     };
-    let bools = |f: &dyn Fn(u32) -> bool| -> ArrayRef {
+    let bools = |f: &dyn Fn(FolderId) -> bool| -> ArrayRef {
         Arc::new(ids.iter().map(|&i| Some(f(i))).collect::<BooleanArray>())
     };
+    let id: UInt32Array = ids.iter().map(|&i| index(i)).collect();
     RecordBatch::try_from_iter([
-        ("id", Arc::new(UInt32Array::from(ids.clone())) as ArrayRef),
+        ("id", Arc::new(id) as ArrayRef),
         ("parent", Arc::new(parent)),
         ("name", Arc::new(name)),
         ("size", u64s(&|i| tree.size(i))),
@@ -245,6 +263,7 @@ impl From<Reason> for PyReason {
             Reason::RootMoved => Self::RootMoved,
             Reason::NoReplay => Self::NoReplay,
             Reason::MustScan => Self::MustScan,
+            _ => unreachable!("the bindings are built with the library they name"),
         }
     }
 }
@@ -304,6 +323,7 @@ impl From<Event> for PyEvent {
                 reason: reason.into(),
                 path,
             },
+            _ => unreachable!("the bindings are built with the library they name"),
         }
     }
 }
@@ -383,13 +403,11 @@ fn live(
 ) -> PyResult<PyLive> {
     log_to_python();
     let path = expand(py, path)?;
-    let opts = LiveOptions {
-        scan: options(threads),
-        interval: Duration::try_from_secs_f64(interval)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
-        shown_only,
-        ..LiveOptions::default()
-    };
+    let mut opts = LiveOptions::default();
+    opts.scan = options(threads);
+    opts.interval = Duration::try_from_secs_f64(interval)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    opts.shown_only = shown_only;
     let inbox = Arc::new(Inbox::default());
     let wake = Arc::new(Wake::default());
     let is_async = Arc::new(AtomicBool::new(false));
@@ -525,19 +543,19 @@ impl PyLive {
     /// With `shown_only`, or once inotify watches run out (Linux), follows
     /// only the folders `ids` of the latest tree. Ignored otherwise.
     fn follow(&self, ids: Vec<u32>) {
-        self.with(|live| live.follow(&ids));
+        self.with(|live| live.follow(&folders(ids)));
     }
 
     /// Lists the folders `ids` of the latest tree again, and reports what
     /// changed in them: for folders looked at after `Missed`.
     fn relist(&self, ids: Vec<u32>) {
-        self.with(|live| live.relist(&ids));
+        self.with(|live| live.relist(&folders(ids)));
     }
 
     /// Scans folder `id` of the latest tree again, then reports `Changed`;
     /// 0 scans it all again.
     fn rescan(&self, id: u32) {
-        self.with(|live| live.rescan(id));
+        self.with(|live| live.rescan(FolderId::unchecked(id)));
     }
 }
 

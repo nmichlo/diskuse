@@ -13,8 +13,9 @@
 //! all be watched (Linux), only those given to [`Live::follow`] are
 //! followed.
 
+use crate::read::FolderId;
 use crate::scan::{ApplyError, Pool, ScanError, ScanOptions, Stop, walk_root};
-use crate::tree::{Progress, ReadTree, Tree, below};
+use crate::tree::{Progress, Raw, Tree, below};
 use crate::watch::{Changes, DirWatch, Poll, TreeWatch, Watch};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -24,8 +25,9 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// What a [`Live`] reports.
+/// What a [`Live`] reports. More may come: match with a `_` arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Event {
     /// The tree scanned so far: every size is a lower bound.
     Scanning(Tree),
@@ -43,6 +45,7 @@ pub enum Event {
 
 /// Why changes were missed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Reason {
     /// The OS dropped change events.
     Dropped,
@@ -68,8 +71,10 @@ impl std::fmt::Display for Reason {
     }
 }
 
-/// How a [`Live`] scans and follows.
+/// How a [`Live`] scans and follows: start from [`LiveOptions::default`]
+/// and set what differs, as more options may come.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct LiveOptions {
     /// Its `stop` is replaced: a [`Live`] stops its own scans.
     pub scan: ScanOptions,
@@ -121,9 +126,9 @@ impl Handler for mpsc::Sender<Result<Event, ScanError>> {
 
 /// What the worker is told: by its [`Live`], and by the scan it runs.
 enum Msg {
-    Follow(Vec<u32>),
-    Relist(Vec<u32>),
-    Rescan(u32),
+    Follow(Vec<FolderId>),
+    Relist(Vec<FolderId>),
+    Rescan(FolderId),
     /// Stop, and answer with what a running scan found, if asked.
     Stop(Option<mpsc::Sender<Option<Tree>>>),
     /// The running scan's progress, for snapshots.
@@ -195,21 +200,25 @@ impl Live {
     /// Where the OS keeps no record of a whole tree and not every folder
     /// is watched, follows only the folders `dirs` of the latest tree,
     /// from now on. Ignored otherwise.
-    pub fn follow(&self, dirs: &[u32]) {
+    pub fn follow(&self, dirs: &[FolderId]) {
         self.send(Msg::Follow(dirs.into()));
     }
 
     /// Lists the folders `dirs` of the latest tree again, and reports what
     /// changed in them: for a folder looked at after changes were missed.
     /// What is below their subfolders stays as scanned.
-    pub fn relist(&self, dirs: &[u32]) {
+    pub fn relist(&self, dirs: &[FolderId]) {
         self.send(Msg::Relist(dirs.into()));
     }
 
     /// Scans folder `dir` of the latest tree again, then reports it as
-    /// `Changed`; the root is scanned all over, with snapshots. Ignored
-    /// while a scan runs.
-    pub fn rescan(&self, dir: u32) {
+    /// `Changed`; the root ([`FolderId::ROOT`]) is scanned all over, with
+    /// snapshots. Ignored while a scan runs.
+    ///
+    /// These three take ids of the latest tree reported: one the worker's
+    /// tree does not contain, as of a tree before folders gone were
+    /// dropped, is left out.
+    pub fn rescan(&self, dir: FolderId) {
         self.shared.scans.fetch_add(1, Ordering::Relaxed);
         self.send(Msg::Rescan(dir));
     }
@@ -378,37 +387,39 @@ impl Worker {
     }
 
     fn on(&mut self, msg: Msg) {
-        // ids of an earlier tree may be past this one's end
-        let there = |tree: &Tree, d: &u32| (*d as usize) < tree.len() && !tree.gone(*d);
+        // ids the tree does not contain are left out
+        let of = |tree: &Tree, dirs: &[FolderId]| -> Vec<u32> {
+            dirs.iter().filter_map(|d| d.of(tree)).collect()
+        };
         match (msg, &mut self.state) {
             (Msg::Started(progress), State::Scanning(job)) => job.progress = Some(progress),
             (Msg::Exited, State::Scanning(_)) => self.finish(),
-            (Msg::Follow(mut dirs), State::Following { tree, follow }) => {
-                dirs.retain(|d| there(tree, d));
+            (Msg::Follow(dirs), State::Following { tree, follow }) => {
                 if let Follow::Shown(watch) = &mut **follow {
-                    watch.show(tree, &dirs);
+                    watch.show(tree, &of(tree, &dirs));
                 }
             }
-            (Msg::Relist(mut dirs), State::Following { tree, .. }) => {
-                dirs.retain(|d| there(tree, d));
+            (Msg::Relist(dirs), State::Following { tree, .. }) => {
                 let changes = Changes {
-                    dirs,
+                    dirs: of(tree, &dirs),
                     ..Changes::default()
                 };
                 self.apply(&changes, false);
             }
             // its own scan, done when its thread is
-            (Msg::Rescan(0), State::Following { .. }) => self.start(),
-            (Msg::Rescan(dir), State::Following { tree, .. }) if there(tree, &dir) => {
-                let changes = Changes {
-                    rescan: vec![below(&**tree, dir).into()],
-                    ..Changes::default()
-                };
-                log::info!("live: scanning {} again", tree.path(dir).display());
-                self.apply(&changes, true);
+            (Msg::Rescan(FolderId::ROOT), State::Following { .. }) => self.start(),
+            (Msg::Rescan(dir), State::Following { tree, .. }) => {
+                if let Some(dir) = dir.of(&**tree).filter(|&d| d != 0) {
+                    let changes = Changes {
+                        rescan: vec![below(&**tree, dir).into()],
+                        ..Changes::default()
+                    };
+                    log::info!("live: scanning {} again", tree.path_at(dir).display());
+                    self.apply(&changes, true);
+                }
                 self.scanned();
             }
-            // while a scan runs, after one failed, or of a folder gone
+            // while a scan runs, or after one failed
             (Msg::Rescan(_), _) => self.scanned(),
             // nothing to follow or list then either. A scan thread's last
             // words come before the next one starts
@@ -505,8 +516,8 @@ impl Worker {
             "live: scanned {} in {:.1} s: {} folders, {} bytes",
             self.root.display(),
             took.as_secs_f64(),
-            tree.len(),
-            tree.size(0)
+            tree.count(),
+            tree.size_at(0)
         );
         let ignore = self.opts.ignore.as_deref();
         let every = || match self.opts.inotify && !self.opts.shown_only {
@@ -543,7 +554,7 @@ fn join(job: Job) -> Result<Tree, ScanError> {
 /// A copy of `tree` for an event: its sizes and children, derived first
 /// so the copy has them too, but not what only updates need.
 fn shared(tree: &Tree) -> Tree {
-    tree.size(0);
+    tree.size_at(0);
     let mut copy = tree.clone();
     copy.links.clear();
     copy

@@ -1,8 +1,8 @@
 //! The `--json` output: one object, the root dir, with its subdirectories
 //! nested in `children`. Written by hand, as the schema is small.
 
+use crate::read::{FolderId, ReadTree};
 use crate::report::largest_first;
-use crate::tree::ReadTree;
 use std::fmt::Write;
 use std::os::unix::ffi::OsStrExt;
 
@@ -11,16 +11,16 @@ use std::os::unix::ffi::OsStrExt;
 /// and `top` a `largest_files` list to the root. The root of a tree a
 /// stopped scan has `incomplete`.
 pub fn json(tree: &impl ReadTree, reclaimable: bool, depth: usize, top: Option<usize>) -> String {
-    let kids = |id: u32| {
-        let mut kids = tree.children(id).to_vec();
+    let kids = |id: FolderId| {
+        let mut kids: Vec<FolderId> = tree.children(id).collect();
         kids.sort_by(|&a, &b| {
-            let key = |i: u32| (tree.size(i), tree.name(i));
+            let key = |i: FolderId| (tree.size(i), tree.name(i));
             largest_first(key(a), key(b))
         });
         kids.into_iter()
     };
     // every key but `children`, and no closing brace
-    let node = |out: &mut String, id: u32| {
+    let node = |out: &mut String, id: FolderId| {
         out.push_str("{\"name\":");
         let lossy = string(out, tree.name(id));
         write!(out, ",\"size\":{}", tree.size(id)).unwrap();
@@ -44,7 +44,7 @@ pub fn json(tree: &impl ReadTree, reclaimable: bool, depth: usize, top: Option<u
     };
 
     let mut out = String::new();
-    node(&mut out, 0);
+    node(&mut out, FolderId::ROOT);
     if tree.stopped() {
         out.push_str(",\"incomplete\":true");
     }
@@ -53,7 +53,7 @@ pub fn json(tree: &impl ReadTree, reclaimable: bool, depth: usize, top: Option<u
     let mut stack = Vec::new();
     if depth > 0 {
         out.push_str(",\"children\":[");
-        stack.push(kids(0));
+        stack.push(kids(FolderId::ROOT));
     }
     while let Some(level) = stack.last_mut() {
         match level.next() {

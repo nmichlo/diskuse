@@ -9,7 +9,7 @@
 //! version is ignored, and the next scan replaces it. So is a damaged one.
 //! The CRC catches any one flipped bit and all but 1 in 2^32 other damage,
 //! and rkyv's checks and [`valid`] keep a file that still passes from making
-//! [`ReadTree`] index out of bounds.
+//! [`Raw`] index out of bounds.
 //!
 //! ```text
 //! magic     b"DUSE"
@@ -24,9 +24,10 @@
 //!
 //! [rkyv]: https://rkyv.org
 
+use crate::read::numbering;
 use crate::sys;
-use crate::tree::cache::{Cached, Derived};
-use crate::tree::{LargeFile, Links, ReadTree, Record, Tree};
+use crate::tree::cache::Derived;
+use crate::tree::{LargeFile, Links, Raw, Record, Tree};
 use rkyv::rancor::Failure;
 use rkyv::util::AlignedVec;
 use rkyv::with::AsVec;
@@ -217,6 +218,7 @@ impl SavedFile {
                 root: self.root.as_os_str().as_bytes(),
                 stopped: header[5] & STOPPED != 0,
                 cache: OnceLock::new(),
+                numbering: numbering(),
             },
             reclaimable: header[5] & RECLAIMABLE != 0,
             modified: self.modified,
@@ -230,6 +232,7 @@ pub struct SavedTree<'a> {
     root: &'a [u8],
     stopped: bool,
     cache: OnceLock<Derived>,
+    numbering: u32,
 }
 
 impl SavedTree<'_> {
@@ -256,18 +259,22 @@ impl SavedTree<'_> {
             since: 0,
             stopped: self.stopped,
             cache: OnceLock::new(),
+            // the same folders at the same places
+            numbering: self.numbering,
         }
     }
 }
 
-impl Cached for SavedTree<'_> {
+impl Raw for SavedTree<'_> {
     fn cache(&self) -> &OnceLock<Derived> {
         &self.cache
     }
-}
 
-impl ReadTree for SavedTree<'_> {
-    fn len(&self) -> usize {
+    fn numbering(&self) -> u32 {
+        self.numbering
+    }
+
+    fn count(&self) -> usize {
         self.body.records.len()
     }
 
@@ -302,7 +309,7 @@ impl ReadTree for SavedTree<'_> {
         files.map(|f| (f.bytes.to_native(), f.dir.to_native(), &f.name[..]))
     }
 
-    fn stopped(&self) -> bool {
+    fn is_stopped(&self) -> bool {
         self.stopped
     }
 }
@@ -323,7 +330,7 @@ struct Body<'a> {
     /// In no particular order.
     #[rkyv(with = AsVec)]
     largest: &'a [LargeFile],
-    /// [`ReadTree::own_private`] by record id, empty without reclaimable
+    /// [`Raw::own_private`] by record id, empty without reclaimable
     /// sizes.
     #[rkyv(with = AsVec)]
     private: &'a [u64],

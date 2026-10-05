@@ -8,7 +8,7 @@
 
 use crate::sys::{self, DirStat, Kind};
 use crate::tree::cache::Derived;
-use crate::tree::{Builder, LargeFile, Links, Progress, ReadTree, Record, Tree, derive};
+use crate::tree::{Builder, LargeFile, Links, Progress, Raw, Record, Tree, derive};
 use crate::watch::Changes;
 use rayon::ThreadPool;
 use rustix::fd::{AsFd, OwnedFd};
@@ -24,13 +24,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::{fmt, io};
 
+/// Start from [`ScanOptions::default`] and set what differs, as more
+/// options may come.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ScanOptions {
     /// Worker threads. `None` starts with 4 and adds threads, up to the
     /// number of cores, while they wait on the disk.
     pub threads: Option<NonZeroUsize>,
-    /// Also measure [`ReadTree::own_private`]. Only the macOS reader can see
-    /// clones; the portable reader leaves it 0.
+    /// Also measure [`crate::ReadTree::reclaimable`]. Only the macOS reader
+    /// can see clones; the portable reader leaves it 0.
     pub reclaimable: bool,
     pub reader: Reader,
     /// Stops the scan before it is done, as when the user quits.
@@ -39,7 +42,7 @@ pub struct ScanOptions {
 
 /// Asked before each directory below the root a scan lists, from any scan
 /// thread: `true` leaves it out, with everything below it, as when the user
-/// quits. The tree is then [`ReadTree::stopped`]. Never stops by default.
+/// quits. The tree is then [`crate::ReadTree::stopped`]. Never stops by default.
 #[derive(Clone, Default)]
 pub struct Stop(Option<Arc<dyn Fn() -> bool + Send + Sync>>);
 
@@ -71,6 +74,7 @@ pub enum Reader {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ScanError {
     /// The root could not be opened as a directory.
     Root(io::Error),
@@ -339,7 +343,7 @@ struct Walk {
     gate: Gate,
 }
 
-/// [`Record::own`] and [`ReadTree::own_private`], summed together.
+/// [`Record::own`] and [`Raw::own_private`], summed together.
 #[derive(Clone, Copy)]
 struct Own {
     bytes: u64,
@@ -628,7 +632,7 @@ impl Tree {
     ) -> Result<Applied, ApplyError> {
         if changes.is_empty() {
             return Ok(Applied {
-                new: self.len() as u32,
+                new: self.count() as u32,
                 ..Applied::default()
             });
         }
@@ -640,7 +644,8 @@ impl Tree {
         };
         let (dirty, fresh) = self.touched(&index, changes).ok_or(ApplyError::FullScan)?;
         let root_err = |e: Errno| ApplyError::Scan(ScanError::Root(e.into()));
-        let root = sys::open_root(Path::new(OsStr::from_bytes(self.name(0)))).map_err(root_err)?;
+        let root =
+            sys::open_root(Path::new(OsStr::from_bytes(self.name_at(0)))).map_err(root_err)?;
         let dev = sys::dir_stat(root.as_fd()).map_err(root_err)?.dev;
         let lister = lister(&root, opts).map_err(root_err)?;
         sys::raise_fd_limit();
@@ -742,16 +747,16 @@ impl Tree {
             }
             if gone(id) {
                 if id == 0 || !gone(r.parent) {
-                    out.push((self.path(id), -(index.size[id as usize] as i64)));
+                    out.push((self.path_at(id), -(index.size[id as usize] as i64)));
                 }
             } else if r.own != own_before(id) {
-                out.push((self.path(id), r.own as i64 - own_before(id) as i64));
+                out.push((self.path_at(id), r.own as i64 - own_before(id) as i64));
             }
         }
         for i in n..self.records.len() {
             let r = self.records[i];
             if (r.parent as usize) < n {
-                out.push((self.path(i as u32), size[i - n] as i64));
+                out.push((self.path_at(i as u32), size[i - n] as i64));
             }
         }
         if out.is_empty() {
@@ -786,7 +791,7 @@ impl Tree {
             for name in path.split(|&b| b == b'/') {
                 let kids = lookups.entry(d).or_insert_with(|| {
                     let kids = index.children(d).iter();
-                    kids.map(|&k| (self.name(k), k)).collect()
+                    kids.map(|&k| (self.name_at(k), k)).collect()
                 });
                 match kids.get(name) {
                     Some(&k) => d = k,
@@ -993,8 +998,8 @@ mod tests {
         let mut out = Vec::new();
         let mut stack = vec![0];
         while let Some(k) = stack.pop() {
-            out.push((crate::tree::below(tree, k), tree.size(k), tree.own(k)));
-            stack.extend_from_slice(tree.children(k));
+            out.push((crate::tree::below(tree, k), tree.size_at(k), tree.own_at(k)));
+            stack.extend_from_slice(tree.children_at(k));
         }
         out.sort();
         out
@@ -1161,7 +1166,7 @@ mod tests {
             }
             let mut tree = scan(root, &opts).unwrap();
             for batch in &batches {
-                let before = tree.size(0) as i64;
+                let before = tree.size_at(0) as i64;
                 let touched = batch.iter().flat_map(|op| make(root, op));
                 let changes = Changes {
                     changed: touched.map(|p| p.as_os_str().as_bytes().into()).collect(),
@@ -1170,7 +1175,7 @@ mod tests {
                 let applied = tree.apply(&changes, &opts, &pool).unwrap();
                 prop_assert_eq!(folders(&tree), folders(&scan(root, &opts).unwrap()));
                 let deltas: i64 = applied.deltas.iter().flatten().map(|&(_, d)| d).sum();
-                prop_assert_eq!(deltas, tree.size(0) as i64 - before);
+                prop_assert_eq!(deltas, tree.size_at(0) as i64 - before);
             }
             Ok(())
         });

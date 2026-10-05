@@ -6,9 +6,11 @@
 //! A live update appends the dirs new since, so the order holds, and flags
 //! the ones gone [`Record::REMOVED`] rather than moving any record. Once
 //! those are half the records, it drops them and numbers the rest again,
-//! in order. So an id is a folder of the tree it came from: a later tree
-//! may number it differently, and [`ReadTree::find`] finds it by path.
+//! in order. So a [`FolderId`] is a folder of the tree it came from, and
+//! of the later ones that number their folders alike; one that does not
+//! refuses it, and [`ReadTree::find`] finds the folder by path.
 
+use crate::read::numbering;
 use crate::sys;
 use hashbrown::HashTable;
 use std::cmp::Reverse;
@@ -28,7 +30,7 @@ pub const LARGEST: usize = 1000;
 pub struct Record {
     /// Index of the parent record, [`Record::NO_PARENT`] for the root.
     pub parent: u32,
-    /// Id for [`ReadTree::raw_name`].
+    /// Id for [`Raw::raw_name`].
     pub name: u32,
     /// [`Record::DENIED`], [`Record::OTHER_DEVICE`] and [`Record::REMOVED`]
     /// bits.
@@ -59,15 +61,13 @@ impl Record {
 }
 
 /// What [`ReadTree`]'s per-folder methods read, computed from the records
-/// on first use. Sealed: only this crate's trees hold one.
+/// on first use.
 pub(crate) mod cache {
-    use std::sync::OnceLock;
-
     #[derive(Clone, Debug)]
     pub struct Derived {
         /// `own` of each record plus that of all its descendants.
         pub size: Vec<u64>,
-        /// The same sum of [`super::ReadTree::own_private`].
+        /// The same sum of [`super::Raw::own_private`].
         pub private: Vec<u64>,
         /// Each record's flags plus [`super::Record::PARTIAL`].
         pub flags: Vec<u16>,
@@ -82,15 +82,11 @@ pub(crate) mod cache {
             &self.kids[self.start[id] as usize..self.start[id + 1] as usize]
         }
     }
-
-    pub trait Cached {
-        fn cache(&self) -> &OnceLock<Derived>;
-    }
 }
 
-use cache::{Cached, Derived};
+use cache::Derived;
 
-/// A file of a folder, from [`ReadTree::files`].
+/// A file of a folder, from [`crate::ReadTree::files`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct File {
     pub name: Box<[u8]>,
@@ -127,7 +123,7 @@ pub struct Tree {
     /// In no particular order.
     pub(crate) largest: Vec<LargeFile>,
     pub(crate) links: Links,
-    /// [`ReadTree::own_private`] by record id, empty unless scanned with
+    /// [`Raw::own_private`] by record id, empty unless scanned with
     /// reclaimable sizes, so other scans' records are 8 B smaller.
     pub(crate) private: Vec<u64>,
     /// The id of the OS's latest change when the scan started, so a live
@@ -138,19 +134,22 @@ pub struct Tree {
     pub(crate) stopped: bool,
     /// Reset by every change to the records.
     pub(crate) cache: OnceLock<Derived>,
+    /// Which [`FolderId`]s are of this tree: see [`numbering`].
+    pub(crate) numbering: u32,
 }
 
-/// Read access to a tree: an owned [`Tree`], or a saved one read in place
-/// ([`crate::SavedTree`]), so `show` prints a saved scan without building a
-/// [`Tree`]. Folders are record ids, the root is 0, and a parent's id is
-/// always below its children's.
-pub trait ReadTree: Cached {
-    /// How many records there are, including [`Record::REMOVED`] ones.
-    fn len(&self) -> usize;
+/// What a tree is made of, by record index: what [`ReadTree`] is built
+/// on, for this crate alone. Not exported, so only its trees are
+/// [`ReadTree`]s. The root is record 0, and a parent's index is always
+/// below its children's.
+pub trait Raw {
+    fn cache(&self) -> &OnceLock<Derived>;
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    /// Which [`FolderId`]s are of this tree.
+    fn numbering(&self) -> u32;
+
+    /// How many records there are, including [`Record::REMOVED`] ones.
+    fn count(&self) -> usize;
 
     fn record(&self, id: u32) -> Record;
 
@@ -169,41 +168,41 @@ pub trait ReadTree: Cached {
 
     /// The scan was stopped before it listed every dir, so sizes are lower
     /// bounds.
-    fn stopped(&self) -> bool;
+    fn is_stopped(&self) -> bool;
 
     /// The name of folder `id`; for the root, the scanned path as given.
-    fn name(&self, id: u32) -> &[u8] {
+    fn name_at(&self, id: u32) -> &[u8] {
         self.raw_name(self.record(id).name)
     }
 
     /// The path of folder `id`: the root's, then each name below it.
-    fn path(&self, id: u32) -> PathBuf {
+    fn path_at(&self, id: u32) -> PathBuf {
         OsString::from_vec(dir_path(self, id)).into()
     }
 
     /// The path of folder `id` below the root: empty for the root.
-    fn relative(&self, id: u32) -> PathBuf {
+    fn relative_at(&self, id: u32) -> PathBuf {
         OsString::from_vec(below(self, id)).into()
     }
 
     /// Allocated bytes of folder `id` and everything below it.
-    fn size(&self, id: u32) -> u64 {
+    fn size_at(&self, id: u32) -> u64 {
         derived(self).size[id as usize]
     }
 
     /// Allocated bytes of folder `id` itself and its files.
-    fn own(&self, id: u32) -> u64 {
+    fn own_at(&self, id: u32) -> u64 {
         self.record(id).own
     }
 
     /// Of [`ReadTree::size`], the bytes deleting the folder frees: see
-    /// [`ReadTree::own_private`].
-    fn reclaimable(&self, id: u32) -> u64 {
+    /// [`Raw::own_private`].
+    fn reclaimable_at(&self, id: u32) -> u64 {
         derived(self).private[id as usize]
     }
 
     /// Why folder `id` could not be read (`EACCES`, `EPERM`, `errno N`).
-    fn error(&self, id: u32) -> Option<String> {
+    fn error_at(&self, id: u32) -> Option<String> {
         let r = self.record(id);
         (r.flags & Record::DENIED != 0).then(|| match sys::errno_name(r.errno) {
             Some(name) => name.into(),
@@ -213,24 +212,24 @@ pub trait ReadTree: Cached {
 
     /// Something below folder `id` could not be read, so its size is a
     /// lower bound.
-    fn partial(&self, id: u32) -> bool {
+    fn partial_at(&self, id: u32) -> bool {
         derived(self).flags[id as usize] & Record::PARTIAL != 0
     }
 
     /// Folder `id` is a mount point, not scanned into (`du -x`).
-    fn other_device(&self, id: u32) -> bool {
+    fn other_device_at(&self, id: u32) -> bool {
         self.record(id).flags & Record::OTHER_DEVICE != 0
     }
 
     /// The subfolders of `id`, in no particular order, leaving out
     /// [`Record::REMOVED`] ones.
-    fn children(&self, id: u32) -> &[u32] {
+    fn children_at(&self, id: u32) -> &[u32] {
         derived(self).children(id)
     }
 
     /// The folder at `path`: relative to the root, or absolute and below
     /// it. `.` parts are skipped.
-    fn find(&self, path: &Path) -> Option<u32> {
+    fn find_index(&self, path: &Path) -> Option<u32> {
         let root = Path::new(OsStr::from_bytes(self.raw_name(0)));
         let below = match path.is_absolute() {
             true => path.strip_prefix(root).ok()?,
@@ -243,7 +242,7 @@ pub trait ReadTree: Cached {
                 Component::Normal(name) => name.as_bytes(),
                 _ => return None,
             };
-            id = *self.children(id).iter().find(|&&k| self.name(k) == name)?;
+            id = *(self.children_at(id).iter()).find(|&&k| self.name_at(k) == name)?;
         }
         Some(id)
     }
@@ -253,9 +252,9 @@ pub trait ReadTree: Cached {
     /// `reclaimable` of those the ones not shared with a clone (macOS),
     /// else 0. None for a folder on another device, which the scan did not
     /// go into.
-    fn files(&self, id: u32, reclaimable: bool) -> std::io::Result<Vec<File>> {
+    fn files_at(&self, id: u32, reclaimable: bool) -> std::io::Result<Vec<File>> {
         let mut files = Vec::new();
-        if self.other_device(id) {
+        if self.other_device_at(id) {
             return Ok(files);
         }
         let path = dir_path(self, id);
@@ -281,7 +280,7 @@ pub trait ReadTree: Cached {
 
     /// The `n` largest files, of the [`LARGEST`] kept, as `(path, bytes)`,
     /// largest first, ties by path.
-    fn largest_files(&self, n: usize) -> Vec<(PathBuf, u64)> {
+    fn largest_paths(&self, n: usize) -> Vec<(PathBuf, u64)> {
         let mut files: Vec<_> = (self.largest())
             .map(|(bytes, dir, name)| (file_path(self, dir, name), bytes))
             .collect();
@@ -294,7 +293,7 @@ pub trait ReadTree: Cached {
 }
 
 /// The path of folder `id` as bytes, as [`ReadTree::path`].
-pub(crate) fn dir_path(tree: &(impl ReadTree + ?Sized), id: u32) -> Vec<u8> {
+pub(crate) fn dir_path(tree: &(impl Raw + ?Sized), id: u32) -> Vec<u8> {
     let mut names = Vec::new();
     let mut i = id;
     while i != 0 {
@@ -310,20 +309,20 @@ pub(crate) fn dir_path(tree: &(impl ReadTree + ?Sized), id: u32) -> Vec<u8> {
 }
 
 /// The path of file `name` in folder `dir`, as [`dir_path`].
-pub(crate) fn file_path(tree: &(impl ReadTree + ?Sized), dir: u32, name: &[u8]) -> Vec<u8> {
+pub(crate) fn file_path(tree: &(impl Raw + ?Sized), dir: u32, name: &[u8]) -> Vec<u8> {
     let mut path = dir_path(tree, dir);
     join(&mut path, name);
     path
 }
 
-fn derived<T: ReadTree + ?Sized>(tree: &T) -> &Derived {
+fn derived<T: Raw + ?Sized>(tree: &T) -> &Derived {
     tree.cache().get_or_init(|| derive(tree))
 }
 
 /// One backwards pass for the sums, as children come after parents, and
 /// two forward ones for the children of each record.
-pub(crate) fn derive(tree: &(impl ReadTree + ?Sized)) -> Derived {
-    let n = tree.len();
+pub(crate) fn derive(tree: &(impl Raw + ?Sized)) -> Derived {
+    let n = tree.count();
     let (mut size, mut private, mut flags) = (vec![0; n], vec![0; n], vec![0; n]);
     for i in (0..n).rev() {
         let r = tree.record(i as u32);
@@ -369,14 +368,16 @@ pub(crate) fn derive(tree: &(impl ReadTree + ?Sized)) -> Derived {
     }
 }
 
-impl Cached for Tree {
+impl Raw for Tree {
     fn cache(&self) -> &OnceLock<Derived> {
         &self.cache
     }
-}
 
-impl ReadTree for Tree {
-    fn len(&self) -> usize {
+    fn numbering(&self) -> u32 {
+        self.numbering
+    }
+
+    fn count(&self) -> usize {
         self.records.len()
     }
 
@@ -396,17 +397,12 @@ impl ReadTree for Tree {
         (self.largest.iter()).map(|f| (f.bytes, f.dir, &f.name[..]))
     }
 
-    fn stopped(&self) -> bool {
+    fn is_stopped(&self) -> bool {
         self.stopped
     }
 }
 
 impl Tree {
-    /// How many names there are; name ids count from 0.
-    pub fn name_count(&self) -> u32 {
-        self.names.count() as u32
-    }
-
     /// Whether `id` or a dir above it is [`Record::REMOVED`].
     pub(crate) fn gone(&self, id: u32) -> bool {
         let mut i = id;
@@ -434,7 +430,7 @@ impl Tree {
         self.set_private(id, 0);
     }
 
-    /// Sets [`ReadTree::own_private`] of record `id`, if the tree has
+    /// Sets [`Raw::own_private`] of record `id`, if the tree has
     /// reclaimable sizes.
     pub(crate) fn set_private(&mut self, id: u32, bytes: u64) {
         if let Some(p) = self.private.get_mut(id as usize) {
@@ -509,6 +505,8 @@ impl Tree {
         }
         (self.records, self.private, self.names) = (records, private, Arc::new(names));
         self.cache = OnceLock::new();
+        // the ids before name other folders now
+        self.numbering = numbering();
         Some(id)
     }
 
@@ -544,11 +542,11 @@ fn scatter(base: Vec<u64>, pairs: impl Iterator<Item = (u32, u64)>, len: usize) 
 
 /// The path of folder `d` below the root: its names joined by `/`, empty
 /// for the root.
-pub(crate) fn below(tree: &(impl ReadTree + ?Sized), d: u32) -> Vec<u8> {
+pub(crate) fn below(tree: &(impl Raw + ?Sized), d: u32) -> Vec<u8> {
     let mut names = Vec::new();
     let mut i = d;
     while i != 0 {
-        names.push(tree.name(i));
+        names.push(tree.name_at(i));
         i = tree.record(i).parent;
     }
     names.reverse();
@@ -570,7 +568,7 @@ pub(crate) struct Builder {
     /// records come after them, so their ids count from its length.
     base: Arc<Vec<Record>>,
     records: Arc<boxcar::Vec<Record>>,
-    /// `(id, bytes)` of [`ReadTree::own_private`], with reclaimable sizes.
+    /// `(id, bytes)` of [`Raw::own_private`], with reclaimable sizes.
     private: Option<Arc<boxcar::Vec<(u32, u64)>>>,
     /// Those of the records of `base`.
     base_private: Vec<u64>,
@@ -581,6 +579,8 @@ pub(crate) struct Builder {
     ids: Mutex<HashTable<u32>>,
     hasher: RandomState,
     pub largest: Arc<Largest>,
+    /// Of the tree built: a scan's own, or that of the tree appended to.
+    numbering: u32,
 }
 
 /// Read access to a tree while [`crate::scan_live`] builds it, or an update
@@ -592,6 +592,7 @@ pub struct Progress {
     private: Option<Arc<boxcar::Vec<(u32, u64)>>>,
     names: Names,
     largest: Arc<Largest>,
+    numbering: u32,
 }
 
 impl Progress {
@@ -627,6 +628,7 @@ impl Progress {
             since: 0,
             stopped: false,
             cache: OnceLock::new(),
+            numbering: self.numbering,
         })
     }
 }
@@ -681,7 +683,7 @@ impl Largest {
 impl Builder {
     /// `root` becomes name id 0, the root's, outside the dedup map so no
     /// directory shares it and a saved scan can drop it. `reclaimable`
-    /// keeps [`ReadTree::own_private`].
+    /// keeps [`Raw::own_private`].
     pub fn new(root: &[u8], reclaimable: bool) -> Self {
         let names = boxcar::Vec::new();
         names.push(root.into());
@@ -694,6 +696,8 @@ impl Builder {
             ids: Mutex::default(),
             hasher: RandomState::new(),
             largest: Arc::default(),
+            // every snapshot of the scan, and its tree, number alike
+            numbering: numbering(),
         }
     }
 
@@ -712,6 +716,7 @@ impl Builder {
             ids: Mutex::default(),
             hasher: RandomState::new(),
             largest: Arc::new(largest),
+            numbering: tree.numbering,
         }
     }
 
@@ -752,6 +757,7 @@ impl Builder {
             private: self.private.clone(),
             names: Arc::clone(&self.names),
             largest: Arc::clone(&self.largest),
+            numbering: self.numbering,
         }
     }
 
@@ -782,6 +788,7 @@ impl Builder {
             since,
             stopped,
             cache: OnceLock::new(),
+            numbering: self.numbering,
         }
     }
 }
