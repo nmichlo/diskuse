@@ -37,6 +37,53 @@ def live(
     to `Live.follow`, not every folder. `close()` it, or use `with`.
     """
 
+def load(path: str | PathLike[str]) -> Tree:
+    """The scan `Tree.save` wrote to `path` (`~` expanded).
+
+    `ValueError` if the file is not one, or is of another version of
+    diskuse. The tree names its root by its real path.
+    """
+
+def mounts() -> list[Mount]:
+    """Every mounted filesystem, with its sizes."""
+
+@final
+class Mount:
+    """A mounted filesystem, as the OS lists it."""
+
+    point: Path
+    fs: str
+    """The filesystem type: `apfs`, `ext4`, `proc`..."""
+    hidden: bool
+    """Hidden from Finder (macOS `nobrowse`). Never set on Linux."""
+    total: int
+    """Bytes in all."""
+    used: int
+    """Bytes in use. On APFS, of the whole container, all its volumes."""
+    free: int
+    """Bytes free for users other than root."""
+
+@final
+class Tier:
+    """How safe deleting a labelled folder is."""
+
+    System: ClassVar[Tier]
+    """macOS protects it: do not delete."""
+    Cache: ClassVar[Tier]
+    """A tool rebuilds it on demand."""
+    Known: ClassVar[Tier]
+    """A big folder macOS or an app keeps, to clean up from that app."""
+
+@final
+class Label:
+    """What a folder is. diskuse deletes nothing: this only says."""
+
+    tier: Tier
+    text: str
+    """In a word or two: `cache: npm`."""
+    why: str
+    """What it is and how to clean it up: `npm install rebuilds it`."""
+
 @final
 class Tree:
     """A scanned tree. Every method takes a folder id; the root is 0."""
@@ -62,6 +109,14 @@ class Tree:
         """The files of folder `id` and their allocated bytes, listed from
         disk now, as the tree keeps only folder totals. None for a folder on
         another device."""
+    def label(self, id: int) -> Label | None:
+        """What folder `id` is, if a rule knows it: a cache a tool rebuilds,
+        a folder macOS protects, a big folder an app keeps. By its name and
+        a look at the disk now, so for the folders someone looks at, not
+        for every folder of a tree."""
+    def save(self, path: str | PathLike[str]) -> None:
+        """Saves the scan as the file `path` (`~` expanded), over any file
+        there, for `diskuse.load`. Only the owner can read it."""
     def largest_files(self, n: int = 100) -> list[tuple[Path, int]]:
         """The `n` largest files, largest first. Only 1000 are kept."""
     def stopped(self) -> bool:

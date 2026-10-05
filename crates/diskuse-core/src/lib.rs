@@ -3,7 +3,8 @@
 //! in it that does not draw on a terminal.
 //!
 //! Nothing here deletes, renames or changes the files it scans. The only
-//! files it writes are saved scans, in the cache dir ([`CacheDir`]).
+//! files it writes are saved scans: in the cache dir ([`CacheDir`]), and
+//! where [`Tree::save`] is told to.
 
 #![deny(unsafe_code)]
 

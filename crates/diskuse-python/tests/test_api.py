@@ -3,6 +3,7 @@ so the expectations hold on APFS (0-byte dirs) and ext4 (4 KiB dirs)."""
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import time
@@ -92,6 +93,43 @@ def test_files_and_largest_files(root: Path) -> None:
     a = t.find("a")
     assert a is not None
     assert (t.files(0), t.files(a)) == ([("top", blocks(root / "top"))], [("f", blocks(root / "a/f"))])
+
+
+def test_a_saved_scan_loads_as_it_was(root: Path, tmp_path_factory: pytest.TempPathFactory) -> None:
+    # a loaded tree names its root by its real path
+    t = diskuse.scan(root.resolve())
+    file = tmp_path_factory.mktemp("saved") / "scan"
+    t.save(file)
+    loaded = diskuse.load(file)
+    assert (summary(loaded, 0), loaded.largest_files(), loaded.stopped()) == (summary(t, 0), t.largest_files(), False)
+
+
+def test_loading_what_is_no_saved_scan(tmp_path: Path) -> None:
+    file = tmp_path / "notes"
+    file.write_bytes(b"not a scan")
+    with pytest.raises(ValueError, match=f"^{re.escape(str(file))}: not a scan saved by this version of diskuse$"):
+        diskuse.load(file)
+    with pytest.raises(FileNotFoundError):
+        diskuse.load(tmp_path / "nope")
+
+
+def test_mounts_has_the_root_filesystem() -> None:
+    st = os.statvfs("/")
+    at_root = [(m.point, m.total, m.hidden) for m in diskuse.mounts() if m.point == Path("/")]
+    assert at_root == [(Path("/"), st.f_blocks * st.f_frsize, False)]
+
+
+def test_label_says_what_a_folder_is(root: Path) -> None:
+    (root / "node_modules").mkdir()
+    t = diskuse.scan(root)
+    modules, a = t.find("node_modules"), t.find("a")
+    assert modules is not None and a is not None
+    label = t.label(modules)
+    assert label is not None
+    assert ((label.tier, label.text, label.why), t.label(a)) == (
+        (diskuse.Tier.Cache, "cache: npm", "npm install rebuilds it"),
+        None,
+    )
 
 
 def test_a_missing_root_is_file_not_found(tmp_path: Path) -> None:

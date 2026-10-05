@@ -1,7 +1,8 @@
 //! Saved scans, one file per scanned root, so `show` can print a result
 //! without scanning, and the browser can show one while it scans afresh.
 //! A saved scan is never brought up to date ([`crate::watch`] says why).
-//! The only module that writes files, and only inside [`CacheDir`].
+//! The only module that writes files: inside [`CacheDir`], and the one
+//! file [`Tree::save`] is given.
 //!
 //! A file is a fixed header, then an [rkyv] archive of [`Body`], which
 //! `show` reads in place ([`SavedTree`]), then a CRC-32 of all the bytes
@@ -136,24 +137,7 @@ impl CacheDir {
             .recursive(true)
             .mode(0o700)
             .create(&self.0)?;
-        let path = self.0.join(name);
-        let tmp = self.0.join(format!("{name}.{}.tmp", std::process::id()));
-        // the store may write and rename its own files in the cache dir
-        #[allow(clippy::disallowed_methods)]
-        let saved = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .and_then(|mut f| f.write_all(bytes))
-            .and_then(|()| std::fs::rename(&tmp, &path));
-        if saved.is_err() {
-            // the disk is often full when diskuse runs, so leave no
-            // partial file behind. The store may delete its own temp file.
-            #[allow(clippy::disallowed_methods)]
-            let _ = std::fs::remove_file(&tmp);
-        }
-        saved
+        write(&self.0.join(name), bytes)
     }
 
     /// The saved file of `root`, unchecked: see [`SavedFile::check`].
@@ -186,6 +170,78 @@ impl CacheDir {
     }
 }
 
+/// Writes the file `path`, owner-only, over any earlier one, by a file
+/// beside it renamed over it: readers see the old file or the new one,
+/// never half of one.
+fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    // the store may write and rename the files it is asked to save
+    #[allow(clippy::disallowed_methods)]
+    let saved = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if saved.is_err() {
+        // the disk is often full when diskuse runs, so leave no
+        // partial file behind. The store may delete its own temp file.
+        #[allow(clippy::disallowed_methods)]
+        let _ = std::fs::remove_file(&tmp);
+    }
+    saved
+}
+
+impl Tree {
+    /// Saves this scan as the file `path`, over any file there, in the
+    /// format the cache dir's are in: for [`Tree::load`], by this version
+    /// of diskuse. The root is saved by its real path, so it must still
+    /// be there.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let root = std::fs::canonicalize(self.path_at(0))?;
+        write(path, &encode(&root, self, !self.private.is_empty()))
+    }
+
+    /// The scan [`Tree::save`] wrote to `path`, its root named by its real
+    /// path. An [`io::ErrorKind::InvalidData`] error if the file is not
+    /// one, is damaged, or is of another version of diskuse.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        // copied, not mapped: another program may write to a file out of
+        // the cache dir
+        let mut bytes = AlignedVec::<16>::new();
+        bytes.extend_from_reader(&mut File::open(path)?)?;
+        let (header, body) = archive(&bytes).ok_or_else(|| {
+            let why = "not a scan saved by this version of diskuse";
+            io::Error::new(io::ErrorKind::InvalidData, why)
+        })?;
+        let saved = SavedTree {
+            body,
+            root: &body.root,
+            stopped: header[5] & STOPPED != 0,
+            cache: OnceLock::new(),
+            numbering: numbering(),
+        };
+        Ok(saved.to_tree())
+    }
+}
+
+/// The header and the archive of `bytes`, a saved file. `None` if it is
+/// damaged or of another version.
+fn archive(bytes: &[u8]) -> Option<(&[u8; HEADER_LEN], &ArchivedBody<'_>)> {
+    let (data, crc) = bytes.split_last_chunk::<4>()?;
+    let (header, archive) = data.split_first_chunk::<HEADER_LEN>()?;
+    if header[..4] != *MAGIC || header[4] != VERSION {
+        return None;
+    }
+    if crc32fast::hash(data) != u32::from_le_bytes(*crc) {
+        return None;
+    }
+    let body = rkyv::access::<ArchivedBody<'_>, Failure>(archive).ok()?;
+    valid(body).then_some((header, body))
+}
+
 /// A saved file as read by [`CacheDir::read`], to check and read in place.
 pub struct SavedFile {
     bytes: memmap2::Mmap,
@@ -199,17 +255,9 @@ impl SavedFile {
     /// The scan in the file, read in place. `None` if the file is damaged
     /// or of another version.
     pub fn check(&self) -> Option<Saved<SavedTree<'_>>> {
-        let (data, crc) = self.bytes.split_last_chunk::<4>()?;
-        let (header, archive) = data.split_first_chunk::<HEADER_LEN>()?;
-        if header[..4] != *MAGIC || header[4] != VERSION {
-            return None;
-        }
-        if crc32fast::hash(data) != u32::from_le_bytes(*crc) {
-            return None;
-        }
-        let body = rkyv::access::<ArchivedBody<'_>, Failure>(archive).ok()?;
+        let (header, body) = archive(&self.bytes)?;
         // guards against FNV collisions
-        if body.root[..] != *self.canonical.as_os_str().as_bytes() || !valid(body) {
+        if body.root[..] != *self.canonical.as_os_str().as_bytes() {
             return None;
         }
         Some(Saved {
