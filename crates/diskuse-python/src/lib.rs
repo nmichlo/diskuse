@@ -9,9 +9,12 @@ use arrow_array::{
     ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, RecordBatch, RecordBatchIterator,
     UInt32Array, UInt64Array,
 };
-use diskuse_core::{Event, FolderId, LiveOptions, ReadTree, Reason, ScanError, ScanOptions, Tree};
+use diskuse_core::{
+    Event, FolderId, Label, Labels, LiveOptions, Mount, ReadTree, Reason, ScanError, ScanOptions,
+    Tier, Tree,
+};
 use pyo3::exceptions::{
-    PyBaseException, PyIndexError, PyOSError, PyStopAsyncIteration, PyStopIteration,
+    PyBaseException, PyIndexError, PyOSError, PyStopAsyncIteration, PyStopIteration, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyCapsule, PyTuple};
@@ -21,7 +24,7 @@ use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::Duration;
 
 /// How often a sync `for` over a live scan checks for Ctrl-C: Python only
@@ -80,6 +83,114 @@ fn scan(py: Python<'_>, path: PathBuf, threads: Option<usize>) -> PyResult<PyTre
     Ok(PyTree::new(tree))
 }
 
+/// The scan `Tree.save` wrote to `path` (`~` expanded). `ValueError` if
+/// the file is not one, or is of another version of diskuse.
+#[pyfunction]
+fn load(py: Python<'_>, path: PathBuf) -> PyResult<PyTree> {
+    let path = expand(py, path)?;
+    match py.detach(|| Tree::load(&path)) {
+        Ok(tree) => Ok(PyTree::new(tree)),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Err(PyValueError::new_err(format!("{}: {e}", path.display())))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Every mounted filesystem, with its sizes.
+#[pyfunction]
+fn mounts(py: Python<'_>) -> PyResult<Vec<PyMount>> {
+    let mounts = py.detach(diskuse_core::mounts)?;
+    Ok(mounts.into_iter().map(PyMount::from).collect())
+}
+
+/// A mounted filesystem, as in Rust.
+#[pyclass(frozen, eq, get_all, name = "Mount", module = "diskuse")]
+#[derive(PartialEq)]
+struct PyMount {
+    point: PathBuf,
+    fs: String,
+    hidden: bool,
+    total: u64,
+    used: u64,
+    free: u64,
+}
+
+impl From<Mount> for PyMount {
+    fn from(m: Mount) -> Self {
+        Self {
+            point: m.point,
+            fs: m.fs,
+            hidden: m.hidden,
+            total: m.total,
+            used: m.used,
+            free: m.free,
+        }
+    }
+}
+
+#[pymethods]
+impl PyMount {
+    fn __repr__(&self) -> String {
+        format!(
+            "Mount(point={:?}, fs={:?}, hidden={}, total={}, used={}, free={})",
+            self.point.display().to_string(),
+            self.fs,
+            if self.hidden { "True" } else { "False" },
+            self.total,
+            self.used,
+            self.free
+        )
+    }
+}
+
+/// How safe deleting a labelled folder is, as in Rust.
+#[pyclass(frozen, eq, from_py_object, name = "Tier", module = "diskuse")]
+#[derive(Clone, Copy, PartialEq)]
+enum PyTier {
+    System,
+    Cache,
+    Known,
+}
+
+/// What a folder is and how to clean it up, as in Rust.
+#[pyclass(frozen, eq, get_all, name = "Label", module = "diskuse")]
+#[derive(PartialEq)]
+struct PyLabel {
+    tier: PyTier,
+    text: &'static str,
+    why: &'static str,
+}
+
+impl From<Label> for PyLabel {
+    fn from(label: Label) -> Self {
+        Self {
+            tier: match label.tier {
+                Tier::System => PyTier::System,
+                Tier::Cache => PyTier::Cache,
+                Tier::Known => PyTier::Known,
+            },
+            text: label.text,
+            why: label.why,
+        }
+    }
+}
+
+#[pymethods]
+impl PyLabel {
+    fn __repr__(&self) -> String {
+        let tier = match self.tier {
+            PyTier::System => "System",
+            PyTier::Cache => "Cache",
+            PyTier::Known => "Known",
+        };
+        format!(
+            "Label(tier=Tier.{tier}, text={:?}, why={:?})",
+            self.text, self.why
+        )
+    }
+}
+
 /// The `diskuse` console script: the command line, from `sys.argv`.
 #[pyfunction]
 fn _cli(py: Python<'_>) -> PyResult<u8> {
@@ -90,13 +201,20 @@ fn _cli(py: Python<'_>) -> PyResult<u8> {
 /// A scanned tree. Every method takes a folder id.
 #[pyclass(frozen, from_py_object, name = "Tree", module = "diskuse")]
 #[derive(Clone)]
-struct PyTree(Arc<Tree>);
+struct PyTree {
+    tree: Arc<Tree>,
+    /// For `label`, made when first asked for.
+    labels: Arc<OnceLock<Labels>>,
+}
 
 impl PyTree {
     fn new(tree: Tree) -> Self {
         // derived here, not on the first call, which holds the GIL
         tree.size(FolderId::ROOT);
-        Self(Arc::new(tree))
+        Self {
+            tree: Arc::new(tree),
+            labels: Arc::default(),
+        }
     }
 
     /// `id`, if it is a folder of this tree, not one removed since the
@@ -104,7 +222,7 @@ impl PyTree {
     /// not checked.
     fn id(&self, id: u32) -> PyResult<FolderId> {
         let folder = FolderId::unchecked(id);
-        match self.0.contains(folder) {
+        match self.tree.contains(folder) {
             true => Ok(folder),
             false => Err(PyIndexError::new_err(format!("no folder {id}"))),
         }
@@ -124,57 +242,77 @@ fn folders(ids: Vec<u32>) -> Vec<FolderId> {
 #[pymethods]
 impl PyTree {
     fn name(&self, id: u32) -> PyResult<OsString> {
-        Ok(OsString::from_vec(self.0.name(self.id(id)?).to_vec()))
+        Ok(OsString::from_vec(self.tree.name(self.id(id)?).to_vec()))
     }
 
     fn path(&self, id: u32) -> PyResult<PathBuf> {
-        Ok(self.0.path(self.id(id)?))
+        Ok(self.tree.path(self.id(id)?))
     }
 
     fn size(&self, id: u32) -> PyResult<u64> {
-        Ok(self.0.size(self.id(id)?))
+        Ok(self.tree.size(self.id(id)?))
     }
 
     fn own(&self, id: u32) -> PyResult<u64> {
-        Ok(self.0.own(self.id(id)?))
+        Ok(self.tree.own(self.id(id)?))
     }
 
     fn error(&self, id: u32) -> PyResult<Option<String>> {
-        Ok(self.0.error(self.id(id)?))
+        Ok(self.tree.error(self.id(id)?))
     }
 
     fn partial(&self, id: u32) -> PyResult<bool> {
-        Ok(self.0.partial(self.id(id)?))
+        Ok(self.tree.partial(self.id(id)?))
     }
 
     fn other_device(&self, id: u32) -> PyResult<bool> {
-        Ok(self.0.other_device(self.id(id)?))
+        Ok(self.tree.other_device(self.id(id)?))
     }
 
     fn children(&self, id: u32) -> PyResult<Vec<u32>> {
-        Ok(self.0.children(self.id(id)?).map(index).collect())
+        Ok(self.tree.children(self.id(id)?).map(index).collect())
     }
 
     fn find(&self, path: PathBuf) -> Option<u32> {
-        self.0.find(&path).map(index)
+        self.tree.find(&path).map(index)
     }
 
     /// Listed from disk now, as the tree keeps only folder totals.
     fn files(&self, py: Python<'_>, id: u32) -> PyResult<Vec<(OsString, u64)>> {
         let id = self.id(id)?;
-        let files = py.detach(|| self.0.files(id, false))?;
+        let files = py.detach(|| self.tree.files(id, false))?;
         Ok((files.into_iter())
             .map(|f| (OsString::from_vec(f.name.into()), f.bytes))
             .collect())
     }
 
+    /// What folder `id` is, if a rule knows it, by its name and a look at
+    /// the disk now.
+    fn label(&self, py: Python<'_>, id: u32) -> PyResult<Option<PyLabel>> {
+        let id = self.id(id)?;
+        Ok(py.detach(|| {
+            let labels = self.labels.get_or_init(|| {
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                Labels::new(&self.tree.path(FolderId::ROOT), home.as_deref())
+            });
+            labels.label(&*self.tree, id).map(PyLabel::from)
+        }))
+    }
+
+    /// Saves the scan as the file `path` (`~` expanded), over any file
+    /// there, for `diskuse.load`.
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let path = expand(py, path)?;
+        Ok(py.detach(|| self.tree.save(&path))?)
+    }
+
     #[pyo3(signature = (n = 100))]
     fn largest_files(&self, n: usize) -> Vec<(PathBuf, u64)> {
-        self.0.largest_files(n)
+        self.tree.largest_files(n)
     }
 
     fn stopped(&self) -> bool {
-        self.0.stopped()
+        self.tree.stopped()
     }
 
     /// Every folder as a row, for `pyarrow.table(tree)`, polars, duckdb.
@@ -186,7 +324,7 @@ impl PyTree {
     ) -> PyResult<Bound<'py, PyCapsule>> {
         // the one schema there is
         let _ = requested_schema;
-        let batch = batch(&self.0);
+        let batch = batch(&self.tree);
         let schema = batch.schema();
         let reader = RecordBatchIterator::new([Ok(batch)], schema);
         let stream = FFI_ArrowArrayStream::new(Box::new(reader));
@@ -196,8 +334,8 @@ impl PyTree {
     fn __repr__(&self) -> String {
         format!(
             "<Tree {} {} bytes>",
-            self.0.path(FolderId::ROOT).display(),
-            self.0.size(FolderId::ROOT)
+            self.tree.path(FolderId::ROOT).display(),
+            self.tree.size(FolderId::ROOT)
         )
     }
 }
@@ -634,8 +772,13 @@ impl Next {
 fn diskuse_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan, m)?)?;
     m.add_function(wrap_pyfunction!(live, m)?)?;
+    m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_function(wrap_pyfunction!(mounts, m)?)?;
     m.add_function(wrap_pyfunction!(_cli, m)?)?;
     m.add_class::<PyTree>()?;
+    m.add_class::<PyMount>()?;
+    m.add_class::<PyLabel>()?;
+    m.add_class::<PyTier>()?;
     m.add_class::<PyEvent>()?;
     m.add_class::<PyReason>()?;
     m.add_class::<PyLive>()?;

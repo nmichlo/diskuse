@@ -4,24 +4,11 @@
 
 mod common;
 
-use diskuse_core::{
-    Event, FolderId, LiveOptions, ReadTree, ScanError, ScanOptions, Tree, live, scan,
-};
-use std::path::{Path, PathBuf};
+use common::folders;
+use diskuse_core::{Event, LiveOptions, ReadTree, ScanError, ScanOptions, live, scan};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
-
-/// Every folder by path, with its size and own bytes, sorted.
-fn folders(t: &Tree) -> Vec<(PathBuf, u64, u64)> {
-    let mut out = Vec::new();
-    let mut stack = vec![FolderId::ROOT];
-    while let Some(k) = stack.pop() {
-        out.push((t.path(k), t.size(k), t.own(k)));
-        stack.extend(t.children(k));
-    }
-    out.sort();
-    out
-}
 
 type Events = Receiver<Result<Event, ScanError>>;
 

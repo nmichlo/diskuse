@@ -85,6 +85,7 @@ for k in tree.children(FolderId::ROOT) {
     println!("{} {}", tree.size(k), tree.path(k).display()); // allocated bytes, like du
 }
 tree.find(Path::new("a/b")); // Some(id), good for this tree only
+tree.save(Path::new("src.scan"))?; // and Tree::load: the only file it writes, and only when asked
 tree.largest_files(10); // [(path, bytes), ...]
 tree.files(FolderId::ROOT, false)?; // the root's files, listed from disk now
 
@@ -117,7 +118,12 @@ for k in tree.children(0):
 tree.find("a/b")  # id or None
 tree.largest_files(10)  # [(path, bytes), ...]
 tree.files(0)  # the root's files, listed from disk now
+tree.label(k)  # Label(tier=Tier.Cache, text="cache: npm", why="npm install rebuilds it") or None
 pyarrow.table(tree)  # every folder as a row, also polars and duckdb
+
+tree.save("src.scan")  # the only file it writes, and only when asked
+tree = diskuse.load("src.scan")
+diskuse.mounts()  # [Mount(point="/", fs="apfs", hidden=False, total=..., used=..., free=...), ...]
 
 with diskuse.live("~/src") as live:
     for event in live:  # or: async for
@@ -180,7 +186,7 @@ Versions: dua 2.45.1, gdu 5.37.0, dust 1.2.6, pdu 0.24.0, ncdu 2.9.2, DiskScour 
 Run `just check` to format, lint and test, and `just demo` to re-record the demo above. Benchmarks are run with `just bench`, see [bench/README.md](bench/README.md).
 
 Scans are cached in `~/Library/Caches/diskuse` (or `~/.cache/diskuse` on Linux), which can be changed with `DISKUSE_CACHE_DIR`.
-This is the only place diskuse ever writes to.
+This is the only place the `diskuse` command ever writes to. The library also writes the one file `Tree::save` (`tree.save` in Python) is given.
 
 <br/>
 

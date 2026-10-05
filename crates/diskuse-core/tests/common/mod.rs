@@ -3,11 +3,24 @@
 // each test crate uses only part of this
 #![allow(dead_code, clippy::disallowed_methods)] // fixtures create files
 
+use diskuse_core::{FolderId, ReadTree, Tree};
 use std::fs::{self, File, Permissions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// Every folder of `tree` by path, with its size and own bytes, sorted.
+pub fn folders(tree: &Tree) -> Vec<(PathBuf, u64, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![FolderId::ROOT];
+    while let Some(k) = stack.pop() {
+        out.push((tree.path(k), tree.size(k), tree.own(k)));
+        stack.extend(tree.children(k));
+    }
+    out.sort();
+    out
+}
 
 /// A temp dir at `/tmp/du-XXXXXX`: the same place and length on every
 /// machine, so a screen that shows the path is the same everywhere but for
