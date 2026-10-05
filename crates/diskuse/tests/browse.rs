@@ -844,6 +844,17 @@ fn watched<'a>(root: &Path, dirs: &[&'a str]) -> Vec<&'a str> {
     watched
 }
 
+/// Waits until `watched` gives `want`: the scan's thread sets the watches,
+/// after the key that asked for them.
+#[cfg(target_os = "linux")]
+fn assert_watched(root: &Path, dirs: &[&str], want: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while watched(root, dirs) != want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(watched(root, dirs), want);
+}
+
 /// ```text
 /// root/
 ///   a/x/f    8192
@@ -860,13 +871,13 @@ fn watches_only_the_dirs_shown() {
     let dirs = ["", "a", "a/x", "b"];
     let mut b = scanned(root, Desktop::None);
     // the root, and `a/` previewed
-    assert_eq!(watched(root, &dirs), ["", "a"]);
+    assert_watched(root, &dirs, &["", "a"]);
     press(&mut b, &[KeyCode::Right]);
-    assert_eq!(watched(root, &dirs), ["", "a", "a/x"]);
+    assert_watched(root, &dirs, &["", "a", "a/x"]);
     press(&mut b, &[KeyCode::Left, KeyCode::Down]);
-    assert_eq!(watched(root, &dirs), ["", "b"]);
+    assert_watched(root, &dirs, &["", "b"]);
     drop(b);
-    assert_eq!(watched(root, &dirs), [""; 0]);
+    assert_watched(root, &dirs, &[]);
 }
 
 /// ```text
