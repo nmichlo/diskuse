@@ -163,6 +163,10 @@ pub struct Browser {
     events: Option<Events>,
     /// Changes the OS missed, until everything is scanned again.
     stale: Option<Stale>,
+    /// A scan of all of the root was asked for, and has not finished or
+    /// failed. Changed by events alone, so the screen follows what was
+    /// polled, not where the scan's thread is.
+    scanning: bool,
     /// The dir scanned again, by its path below the root, while the tree
     /// shown stays.
     rescanning: Option<Vec<u8>>,
@@ -421,6 +425,7 @@ impl Browser {
             live: None,
             events: None,
             stale: None,
+            scanning: false,
             rescanning: None,
             scanned: SystemTime::UNIX_EPOCH,
             files: HashMap::new(),
@@ -465,6 +470,7 @@ impl Browser {
     pub fn scan(&mut self) {
         self.keep_baseline();
         self.stale = None;
+        self.scanning = true;
         self.rescanning = None;
         (self.progress, self.started) = (None, None);
         let opts = LiveOptions {
@@ -579,6 +585,7 @@ impl Browser {
     fn on_event(&mut self, event: Result<Event, ScanError>, now: SystemTime) {
         match event {
             Err(e) => {
+                self.scanning = false;
                 self.rescanning = None;
                 self.message = Some(format!("cannot scan: {e}"));
             }
@@ -593,6 +600,7 @@ impl Browser {
                 }
             }
             Ok(Event::Ready(tree)) => {
+                self.scanning = false;
                 (self.progress, self.started) = (None, None);
                 self.scanned = now;
                 self.save(&tree);
@@ -1339,8 +1347,7 @@ impl Browser {
         let mut parts: Vec<Span> = Vec::new();
         let status = self.view.as_ref().map(|v| v.status);
         // a snapshot, or a full scan runs while no finished tree is shown
-        let scanning = self.busy() && status != Some(Status::Done);
-        if scanning || status == Some(Status::Scanning) {
+        if self.scanning || status == Some(Status::Scanning) {
             let (bytes, folders) = match (&self.view, self.progress) {
                 (_, Some(progress)) => progress,
                 (Some(v), None) if v.status == Status::Scanning => (v.tree.size(0), v.tree.len()),
