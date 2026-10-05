@@ -4,7 +4,9 @@
 
 mod common;
 
-use diskuse_core::{Event, LiveOptions, ReadTree, ScanError, ScanOptions, Tree, live, scan};
+use diskuse_core::{
+    Event, FolderId, LiveOptions, ReadTree, ScanError, ScanOptions, Tree, live, scan,
+};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -12,10 +14,10 @@ use std::time::Duration;
 /// Every folder by path, with its size and own bytes, sorted.
 fn folders(t: &Tree) -> Vec<(PathBuf, u64, u64)> {
     let mut out = Vec::new();
-    let mut stack = vec![0];
+    let mut stack = vec![FolderId::ROOT];
     while let Some(k) = stack.pop() {
         out.push((t.path(k), t.size(k), t.own(k)));
-        stack.extend_from_slice(t.children(k));
+        stack.extend(t.children(k));
     }
     out.sort();
     out
@@ -38,10 +40,8 @@ fn rescans_keep_the_tree_right_and_its_records_bounded() {
     common::file(&a.join("0/x/f"), 4096);
     let fresh = |p: &Path| folders(&scan(p, &ScanOptions::default()).unwrap());
 
-    let opts = LiveOptions {
-        interval: Duration::from_millis(50),
-        ..LiveOptions::default()
-    };
+    let mut opts = LiveOptions::default();
+    opts.interval = Duration::from_millis(50);
     let (tx, events) = mpsc::channel();
     let live = live(dir.path(), opts, tx);
     let mut tree = loop {
@@ -75,10 +75,8 @@ fn a_file_growing_in_place_is_a_change_of_its_folder() {
     let a = dir.path().join("a");
     std::fs::create_dir(&a).unwrap();
     common::file(&a.join("keep"), 4096);
-    let opts = LiveOptions {
-        interval: Duration::from_millis(50),
-        ..LiveOptions::default()
-    };
+    let mut opts = LiveOptions::default();
+    opts.interval = Duration::from_millis(50);
     let (tx, events) = mpsc::channel();
     let _live = live(dir.path(), opts, tx);
     loop {
@@ -109,11 +107,9 @@ fn relist_lists_a_folder_again() {
     let a = dir.path().join("a");
     std::fs::create_dir(&a).unwrap();
     common::file(&a.join("f"), 4096);
-    let opts = LiveOptions {
-        interval: Duration::from_millis(50),
-        shown_only: true,
-        ..LiveOptions::default()
-    };
+    let mut opts = LiveOptions::default();
+    opts.interval = Duration::from_millis(50);
+    opts.shown_only = true;
     let (tx, events) = mpsc::channel();
     let live = live(dir.path(), opts, tx);
     let tree = loop {

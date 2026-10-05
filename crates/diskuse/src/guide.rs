@@ -1,7 +1,7 @@
 //! What the browser says about folders a scan could not read: why, and
 //! the guide to Full Disk Access ([`diskuse_core::preflight`]).
 
-use diskuse_core::ReadTree;
+use diskuse_core::{FolderId, ReadTree};
 use ratatui::Frame;
 use ratatui::style::Style;
 use ratatui::text::Text;
@@ -28,7 +28,7 @@ pub(crate) fn terminal_app(term_program: Option<&str>) -> String {
 
 /// Why the denied dir `id` could not be read, and what would let it be.
 /// `terminal` is from [`terminal_app`].
-pub(crate) fn reason(tree: &impl ReadTree, id: u32, terminal: &str) -> String {
+pub(crate) fn reason(tree: &impl ReadTree, id: FolderId, terminal: &str) -> String {
     match tree.error(id).unwrap_or_default().as_str() {
         "EACCES" => "permission denied (try sudo)".into(),
         "EPERM" if cfg!(target_os = "macos") => format!("needs Full Disk Access for {terminal}"),

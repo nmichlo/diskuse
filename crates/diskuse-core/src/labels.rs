@@ -17,8 +17,8 @@
 //! one small read each, so [`Labels::label`] is for the dirs someone looks
 //! at, not for every dir of a tree.
 
+use crate::read::{FolderId, ReadTree};
 use crate::sys;
-use crate::tree::ReadTree;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -410,21 +410,21 @@ impl Labels {
     }
 
     /// The label of folder `id` of `tree`, if a rule matches.
-    pub fn label(&self, tree: &impl ReadTree, id: u32) -> Option<Label> {
+    pub fn label(&self, tree: &impl ReadTree, id: FolderId) -> Option<Label> {
         let at = tree.path(id);
         let name = tree.name(id);
         // the root's name is its whole path
-        let (above, parent) = match id {
-            0 => (at.parent().map(Path::to_path_buf), None),
-            _ => {
-                let parent = tree.path(tree.record(id).parent);
+        let (above, parent) = match tree.parent(id) {
+            None => (at.parent().map(Path::to_path_buf), None),
+            Some(parent) => {
+                let parent = tree.path(parent);
                 let name = parent.file_name().map(|n| n.as_bytes().to_vec());
                 (Some(parent), name)
             }
         };
-        let name = match id {
-            0 => at.file_name().map_or(name, OsStrExt::as_bytes),
-            _ => name,
+        let name = match id == FolderId::ROOT {
+            true => at.file_name().map_or(name, OsStrExt::as_bytes),
+            false => name,
         };
         let real = self.real.as_ref().map(|real| real.join(tree.relative(id)));
         let dir = Dir {
