@@ -15,7 +15,7 @@
 use crate::live::Reason;
 use crate::scan::Applied;
 use crate::sys::{self, Event};
-use crate::tree::{ReadTree, Record, Tree, dir_path};
+use crate::tree::{Raw, Record, Tree, dir_path};
 use rustix::fd::AsFd;
 use rustix::io::Errno;
 use std::collections::{BTreeSet, HashMap};
@@ -376,9 +376,9 @@ impl TreeWatch {
     /// Watches the folders of `tree` from id `from` on. False once the
     /// watches run out.
     fn add(&mut self, tree: &Tree, from: u32) -> bool {
-        self.wd.resize(tree.len(), None);
+        self.wd.resize(tree.count(), None);
         let skip = Record::OTHER_DEVICE | Record::DENIED | Record::REMOVED;
-        for d in from..tree.len() as u32 {
+        for d in from..tree.count() as u32 {
             if tree.record(d).flags & skip != 0 {
                 continue;
             }
@@ -436,7 +436,7 @@ impl TreeWatch {
     /// watches run out.
     pub fn applied(&mut self, tree: &Tree, applied: &Applied) -> bool {
         if let Some(moved) = &applied.moved {
-            let mut wd = vec![None; tree.len()];
+            let mut wd = vec![None; tree.count()];
             // the folders new to the tree have no watch yet
             for (old, &new) in moved.iter().enumerate().take(self.wd.len()) {
                 if new != u32::MAX {

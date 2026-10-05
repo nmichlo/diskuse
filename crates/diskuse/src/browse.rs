@@ -19,8 +19,8 @@ use crate::guide::{reason, terminal_app};
 use crate::reveal::Desktop;
 use crate::style::Styles;
 use diskuse_core::{
-    CacheDir, Event, File, LARGEST, Label, Labels, Live, LiveOptions, ReadTree, Reason, Saved,
-    ScanError, ScanOptions, Tree, Units, largest_first, live,
+    CacheDir, Event, File, FolderId, LARGEST, Label, Labels, Live, LiveOptions, ReadTree, Reason,
+    Saved, ScanError, Tree, Units, largest_first, live,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -61,13 +61,13 @@ enum Col {
 }
 
 /// The path of folder `id` of `tree`, as bytes.
-fn dir_path(tree: &Tree, id: u32) -> Vec<u8> {
+fn dir_path(tree: &Tree, id: FolderId) -> Vec<u8> {
     tree.path(id).into_os_string().into_vec()
 }
 
 /// The path of folder `id` below the root of `tree`, as bytes: empty for
 /// the root.
-fn below(tree: &Tree, id: u32) -> Vec<u8> {
+fn below(tree: &Tree, id: FolderId) -> Vec<u8> {
     tree.relative(id).into_os_string().into_vec()
 }
 
@@ -173,13 +173,13 @@ pub struct Browser {
     /// When the tree shown was scanned, as the dirs not followed stand.
     scanned: SystemTime,
     /// Listings by record id, kept until another scan's tree is shown.
-    files: HashMap<u32, Files>,
+    files: HashMap<FolderId, Files>,
     /// Sorted rows by record id, for the view shown.
-    rows: HashMap<u32, Vec<Row>>,
+    rows: HashMap<FolderId, Vec<Row>>,
     /// Names of the dirs entered, from the root down.
     trail: Vec<Box<[u8]>>,
     /// Record ids of the root and of each dir in `trail`.
-    dirs: Vec<u32>,
+    dirs: Vec<FolderId>,
     /// The name of the row the user moved to in the current dir, which
     /// keeps the cursor on that item while sizes change. `None`, or not
     /// among `current`: the top row.
@@ -241,8 +241,8 @@ struct Picks {
 /// The sizes of every dir when the first scan of the session was done, so
 /// each dir shows how much it grew or shrank since.
 struct Baseline {
-    /// Total bytes by record id of the tree shown. Dirs new since have no
-    /// entry, as their records come after.
+    /// Total bytes by [`FolderId::index`] in the tree shown. Dirs new
+    /// since have no entry, as they come after.
     sizes: Vec<u64>,
     at: SystemTime,
     /// The tree `sizes` are of, while a full scan, whose ids differ, runs.
@@ -251,68 +251,56 @@ struct Baseline {
 
 impl Baseline {
     /// The total bytes of dir `id` at the start, 0 if it is new since.
-    fn size(&self, id: u32) -> u64 {
-        self.sizes.get(id as usize).copied().unwrap_or(0)
+    fn size(&self, id: FolderId) -> u64 {
+        self.sizes.get(id.index()).copied().unwrap_or(0)
     }
 
-    /// Gives each record of `new` from id `from` on the start size of the
-    /// dir at the same path in `old`, an earlier tree of the same root, or
-    /// 0 if there is none: from `from` on, the ids of `new` are new or
-    /// numbered again ([`moved_from`]).
-    fn carry(&mut self, old: &Tree, new: &Tree, from: usize) {
+    /// Gives each folder of `new` the start size of the dir at the same
+    /// path in `old`, an earlier tree of the same root, or 0 if there is
+    /// none. Where `new` numbers its folders as `old` does, those of `old`
+    /// keep theirs, and only the ones after them are looked up.
+    fn carry(&mut self, old: &Tree, new: &Tree) {
+        let from = match new.numbered_as(old) {
+            true => old.len(),
+            false => 0,
+        };
         let mut sizes = self.sizes.clone();
         sizes.truncate(from);
         sizes.resize(new.len(), 0);
-        // the dir of `old` each record of `new` from `from` is at
-        let mut was: HashMap<u32, u32> = HashMap::new();
+        // the dir of `old` each folder of `new` from `from` is at
+        let mut was: HashMap<FolderId, FolderId> = HashMap::new();
         // children of dirs of `old` by name, built when first needed
-        let mut kids: HashMap<u32, HashMap<&[u8], u32>> = HashMap::new();
-        for k in from..new.len() {
-            let k = k as u32;
-            let at = match k {
-                0 => Some(0),
-                _ => {
-                    let r = new.record(k);
-                    let parent = match r.parent as usize >= from {
-                        true => was.get(&r.parent).copied(),
-                        false => Some(r.parent),
+        let mut kids: HashMap<FolderId, HashMap<&[u8], FolderId>> = HashMap::new();
+        for k in (from..new.len()).filter_map(|i| new.folder(i)) {
+            let at = match new.parent(k) {
+                None => Some(FolderId::ROOT),
+                Some(p) => {
+                    let parent = match p.index() >= from {
+                        true => was.get(&p).copied(),
+                        false => Some(p),
                     };
                     parent.and_then(|p| {
-                        let named = kids.entry(p).or_insert_with(|| {
-                            (old.children(p).iter())
-                                .map(|&c| (old.name(c), c))
-                                .collect()
-                        });
+                        let named = kids
+                            .entry(p)
+                            .or_insert_with(|| old.children(p).map(|c| (old.name(c), c)).collect());
                         named.get(new.name(k)).copied()
                     })
                 }
             };
             if let Some(o) = at {
                 was.insert(k, o);
-                sizes[k as usize] = self.size(o);
+                sizes[k.index()] = self.size(o);
             }
         }
         self.sizes = sizes;
     }
 }
 
-/// The first id of `new` that no longer names the folder it named in
-/// `old`, an earlier tree of the same root: where new records start, or
-/// where a compaction or a full scan numbered them again.
-fn moved_from(new: &Tree, old: &Tree) -> u32 {
-    let same = |k: u32| {
-        let (a, b) = (old.record(k), new.record(k));
-        a.parent == b.parent && old.name(k) == new.name(k)
-    };
-    let n = old.len().min(new.len()) as u32;
-    (0..n).find(|&k| !same(k)).unwrap_or(n)
-}
-
 /// A tree as shown, with what drawing it needs.
 struct View {
     tree: Tree,
-    /// Path and record id of every denied dir, by path.
-    denied: Vec<(Vec<u8>, u32)>,
+    /// Path and id of every denied dir, by path.
+    denied: Vec<(Vec<u8>, FolderId)>,
     /// `(bytes, path)` of the largest files, largest first.
     largest: Vec<(u64, Vec<u8>)>,
     status: Status,
@@ -334,8 +322,7 @@ enum Status {
 
 impl View {
     fn new(tree: Tree, status: Status, reclaimable: bool) -> Self {
-        let ids = 0..tree.len() as u32;
-        let mut denied: Vec<_> = (ids.filter(|&i| tree.error(i).is_some()))
+        let mut denied: Vec<_> = (tree.ids().filter(|&i| tree.error(i).is_some()))
             .map(|i| (dir_path(&tree, i), i))
             .collect();
         denied.sort_unstable();
@@ -372,8 +359,8 @@ struct Row {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Item {
-    /// A subdirectory, by record id.
-    Dir(u32),
+    /// A subdirectory.
+    Dir(FolderId),
     /// A file, by index in its dir's [`Files`].
     File(u32),
 }
@@ -431,7 +418,7 @@ impl Browser {
             files: HashMap::new(),
             rows: HashMap::new(),
             trail: Vec::new(),
-            dirs: vec![0],
+            dirs: vec![FolderId::ROOT],
             selected: None,
             current: Vec::new(),
             cursor: 0,
@@ -473,18 +460,14 @@ impl Browser {
         self.scanning = true;
         self.rescanning = None;
         (self.progress, self.started) = (None, None);
-        let opts = LiveOptions {
-            scan: ScanOptions {
-                reclaimable: self.reclaimable,
-                ..ScanOptions::default()
-            },
-            interval: self.env.interval,
-            ignore: self.env.cache.as_ref().map(|c| c.path().into()),
-            inotify: self.env.inotify,
-            // the dirs shown are followed: a watch on every dir costs kernel
-            // memory and seconds on a large tree
-            shown_only: true,
-        };
+        let mut opts = LiveOptions::default();
+        opts.scan.reclaimable = self.reclaimable;
+        opts.interval = self.env.interval;
+        opts.ignore = self.env.cache.as_ref().map(|c| c.path().into());
+        opts.inotify = self.env.inotify;
+        // the dirs shown are followed: a watch on every dir costs kernel
+        // memory and seconds on a large tree
+        opts.shown_only = true;
         // the scan before stops first, and what it sent goes with it
         self.live = None;
         let (tx, events) = mpsc::channel();
@@ -534,7 +517,7 @@ impl Browser {
             }) => *k,
             _ => self.dir(),
         };
-        if d == 0 {
+        if d == FolderId::ROOT {
             return self.rescan_all();
         }
         self.rescanning = Some(below(&view.tree, d));
@@ -591,7 +574,7 @@ impl Browser {
             }
             // a saved scan shows until the scan is done
             Ok(Event::Scanning(tree)) => {
-                self.progress = Some((tree.size(0), tree.len()));
+                self.progress = Some((tree.size(FolderId::ROOT), tree.len()));
                 if !matches!(
                     self.view.as_ref().map(|v| v.status),
                     Some(Status::Saved { .. })
@@ -607,12 +590,14 @@ impl Browser {
                 match &mut self.baseline {
                     Some(base) => {
                         if let Some(old) = base.of.take() {
-                            base.carry(&old, &tree, moved_from(&tree, &old) as usize);
+                            base.carry(&old, &tree);
                         }
                     }
                     None => {
                         self.baseline = Some(Baseline {
-                            sizes: (0..tree.len() as u32).map(|i| tree.size(i)).collect(),
+                            sizes: (0..tree.len())
+                                .map(|i| tree.folder(i).map_or(0, |id| tree.size(id)))
+                                .collect(),
                             at: now,
                             of: None,
                         });
@@ -623,7 +608,7 @@ impl Browser {
             Ok(Event::Changed(tree, _)) => {
                 // new records, or all of them numbered again
                 if let (Some(base), Some(old)) = (&mut self.baseline, &self.view) {
-                    base.carry(&old.tree, &tree, moved_from(&tree, &old.tree) as usize);
+                    base.carry(&old.tree, &tree);
                 }
                 if self.rescanning.take().is_some() {
                     self.save(&tree);
@@ -641,6 +626,9 @@ impl Browser {
                 stale.moved |= why == Reason::RootMoved;
                 self.refresh();
             }
+            // an event the library has since this was written: nothing
+            // here shows it
+            Ok(_) => {}
         }
     }
 
@@ -997,7 +985,7 @@ impl Browser {
     ///
     /// The columns of dirs above and the preview show sizes and names
     /// only; the current one adds each row's share and change.
-    fn listing(&self, col: Col, height: usize) -> Option<(u32, &[Row], usize, Option<usize>)> {
+    fn listing(&self, col: Col, height: usize) -> Option<(FolderId, &[Row], usize, Option<usize>)> {
         let d = self.dir();
         match col {
             Col::Above(level) => {
@@ -1037,7 +1025,7 @@ impl Browser {
         &self,
         buf: &mut Buffer,
         area: Rect,
-        d: u32,
+        d: FolderId,
         rows: &[Row],
         offset: usize,
         mark: Option<(usize, Style)>,
@@ -1098,8 +1086,8 @@ impl Browser {
         self.refresh();
     }
 
-    /// The record id of the current dir.
-    fn dir(&self) -> u32 {
+    /// The current dir.
+    fn dir(&self) -> FolderId {
         *self.dirs.last().unwrap()
     }
 
@@ -1109,11 +1097,11 @@ impl Browser {
         let Some(view) = &self.view else {
             return;
         };
-        let mut dirs = vec![0];
+        let mut dirs = vec![FolderId::ROOT];
         for name in &self.trail {
             let parent = *dirs.last().unwrap();
-            let named = |&k: &u32| view.tree.name(k) == &name[..];
-            match view.tree.children(parent).iter().copied().find(named) {
+            let named = |&k: &FolderId| view.tree.name(k) == &name[..];
+            match view.tree.children(parent).find(named) {
                 Some(k) => dirs.push(k),
                 None => break,
             }
@@ -1158,8 +1146,8 @@ impl Browser {
             // after missed changes, each dir is listed again when first shown
             if let Some(stale) = &mut self.stale {
                 let view = self.view.as_ref().unwrap();
-                let fresh = |d: &u32| stale.listed.insert(below(&view.tree, *d));
-                let again: Vec<u32> = shown.iter().copied().filter(fresh).collect();
+                let fresh = |d: &FolderId| stale.listed.insert(below(&view.tree, *d));
+                let again: Vec<FolderId> = shown.iter().copied().filter(fresh).collect();
                 if !again.is_empty() {
                     live.relist(&again);
                 }
@@ -1168,7 +1156,7 @@ impl Browser {
     }
 
     /// Lists and sorts dir `d`, unless done for this view.
-    fn ensure(&mut self, d: u32) {
+    fn ensure(&mut self, d: FolderId) {
         let Some(view) = &self.view else {
             return;
         };
@@ -1182,7 +1170,7 @@ impl Browser {
             None => view.tree.files(d, private).unwrap_or_default(),
         };
         let files = self.files.entry(d).or_insert_with(list);
-        let dirs = view.tree.children(d).iter().map(|&k| {
+        let dirs = view.tree.children(d).map(|k| {
             let size = view.tree.size(k);
             // snapshots of a scan are of other ids
             let delta = match (&self.baseline, view.status) {
@@ -1350,12 +1338,14 @@ impl Browser {
         if self.scanning || status == Some(Status::Scanning) {
             let (bytes, folders) = match (&self.view, self.progress) {
                 (_, Some(progress)) => progress,
-                (Some(v), None) if v.status == Status::Scanning => (v.tree.size(0), v.tree.len()),
+                (Some(v), None) if v.status == Status::Scanning => {
+                    (v.tree.size(FolderId::ROOT), v.tree.len())
+                }
                 _ => (0, 0),
             };
             // a whole volume's used bytes, else the last scan's total
             let saved = self.view.as_ref().filter(|v| v.status != Status::Scanning);
-            let goal = self.used.or(saved.map(|v| v.tree.size(0)));
+            let goal = self.used.or(saved.map(|v| v.tree.size(FolderId::ROOT)));
             match goal.filter(|&g| g > 0) {
                 // a scan counts each copy of a cloned file, the used bytes
                 // count it once: past them, they are no target
@@ -1385,7 +1375,7 @@ impl Browser {
                 }
             }
         } else if let Some(view) = &self.view {
-            let total = view.tree.size(0);
+            let total = view.tree.size(FolderId::ROOT);
             match self.used.filter(|_| view.status == Status::Done) {
                 Some(used) if total <= used => parts.push(Span::styled(
                     format!("{} of {}", fmt(total), fmt(used)),
@@ -1428,7 +1418,7 @@ impl Browser {
                 .as_ref()
                 .filter(|_| view.status == Status::Done)
             {
-                let d = view.tree.size(0) as i64 - base.size(0) as i64;
+                let d = view.tree.size(FolderId::ROOT) as i64 - base.size(FolderId::ROOT) as i64;
                 if d != 0 {
                     let age = age(now.duration_since(base.at).unwrap_or_default());
                     parts.push(Span::raw(format!(
@@ -1561,7 +1551,7 @@ impl Browser {
     }
 
     /// How many denied dirs are below dir `d`, not counting itself.
-    fn denied_below(&self, d: u32) -> usize {
+    fn denied_below(&self, d: FolderId) -> usize {
         let view = self.view.as_ref().unwrap();
         let mut path = dir_path(&view.tree, d);
         path.push(b'/');
@@ -1594,10 +1584,10 @@ impl Browser {
         }
         if let Item::Dir(k) = row.item {
             let mut below = 0u64;
-            let mut stack = view.tree.children(k).to_vec();
+            let mut stack: Vec<FolderId> = view.tree.children(k).collect();
             while let Some(c) = stack.pop() {
                 below += 1;
-                stack.extend_from_slice(view.tree.children(c));
+                stack.extend(view.tree.children(c));
             }
             facts.push(("folders", format!("{} below", thousands(below))));
             if let Some(error) = view.tree.error(k) {
@@ -1939,7 +1929,7 @@ fn top_files(
     // the list may have ended above the cursor
     top.cursor = top.cursor.min(shown.len().saturating_sub(1));
     top.offset = scroll(top.offset, top.cursor, height);
-    let root = view.tree.name(0).len();
+    let root = view.tree.name(FolderId::ROOT).len();
     let lines = (area.y..area.bottom()).zip(shown.iter().enumerate().skip(top.offset));
     for (y, (i, &(size, path))) in lines {
         let below = path[root..].strip_prefix(b"/").unwrap_or(&path[root..]);
@@ -2086,6 +2076,7 @@ fn age(d: Duration) -> String {
 #[allow(clippy::disallowed_methods)] // the tests make a tree of files
 mod tests {
     use super::*;
+    use diskuse_core::ScanOptions;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Modifier};
@@ -2218,7 +2209,7 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("f"), vec![0; 8192]).unwrap();
         let tree = diskuse_core::scan(root, &ScanOptions::default()).unwrap();
-        let total = tree.size(0);
+        let total = tree.size(FolderId::ROOT);
         let fmt = |n| Units::Binary.format(n);
 
         let mut b = Browser::new(root, "/vol", env(), None, Some(total * 4), false);
@@ -2261,7 +2252,7 @@ mod tests {
         b.scan();
         finish(&mut b);
         let fmt = |n| Units::Binary.format(n);
-        let total = b.view.as_ref().unwrap().tree.size(0);
+        let total = b.view.as_ref().unwrap().tree.size(FolderId::ROOT);
         // where only the dirs shown are followed (Linux), the scan's age
         let scanned = match cfg!(target_os = "macos") {
             true => "",
@@ -2275,7 +2266,8 @@ mod tests {
         assert!(!b.busy(), "nothing is scanned again by itself");
         let stale = "changes missed 0 s ago (S rescans)";
         // the root, shown, is listed again (and followed as before)
-        let listed = |b: &Browser| b.view.as_ref().unwrap().tree.size(0) == total + 8192;
+        let listed =
+            |b: &Browser| b.view.as_ref().unwrap().tree.size(FolderId::ROOT) == total + 8192;
         while !listed(&b) {
             b.poll(now);
             std::thread::sleep(Duration::from_millis(1));

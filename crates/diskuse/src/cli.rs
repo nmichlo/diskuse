@@ -197,12 +197,11 @@ fn scan(
         let enough = stop_after.is_some_and(|n| listed.fetch_add(1, Ordering::Relaxed) >= n);
         enough || stopped.load(Ordering::Relaxed) != 0
     });
-    let opts = ScanOptions {
-        threads,
-        reclaimable: output.reclaimable(),
-        reader: reader.into(),
-        stop,
-    };
+    let mut opts = ScanOptions::default();
+    opts.threads = threads;
+    opts.reclaimable = output.reclaimable();
+    opts.reader = reader.into();
+    opts.stop = stop;
     let tree = match diskuse_core::scan(path, &opts) {
         Ok(tree) => tree,
         Err(e) => {

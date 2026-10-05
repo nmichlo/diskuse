@@ -1,6 +1,7 @@
 //! The `diskuse scan` text output.
 
-use crate::tree::{ReadTree, Record};
+use crate::read::{FolderId, ReadTree};
+use crate::tree::Record;
 use std::cmp::Ordering;
 use std::fmt::Write;
 
@@ -10,6 +11,7 @@ use std::fmt::Write;
 /// files. The first line says so if the tree is partial or stopped. Sizes
 /// print in `units`.
 pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>, units: Units) -> String {
+    let root = FolderId::ROOT;
     let format_size = |n| units.format(n);
     let denied = count_denied(tree);
     let sizes = |size: u64, private: u64| match reclaimable {
@@ -19,8 +21,8 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>, units
 
     let mut out = format!(
         "{}  {}",
-        sizes(tree.size(0), tree.reclaimable(0)),
-        String::from_utf8_lossy(tree.name(0))
+        sizes(tree.size(root), tree.reclaimable(root)),
+        String::from_utf8_lossy(tree.name(root))
     );
     if denied > 0 {
         write!(out, "  (partial: {denied} denied)").unwrap();
@@ -31,16 +33,17 @@ pub fn report(tree: &impl ReadTree, reclaimable: bool, top: Option<usize>, units
     out.push('\n');
 
     // (size, private, name bytes for the tie-break, label)
-    let mut rows: Vec<(u64, u64, &[u8], String)> = (tree.children(0).iter())
-        .map(|&i| {
+    let mut rows: Vec<(u64, u64, &[u8], String)> = (tree.children(root))
+        .map(|i| {
             let name = tree.name(i);
             let label = format!("{}/{}", String::from_utf8_lossy(name), suffix(tree, i));
             (tree.size(i), tree.reclaimable(i), name, label)
         })
         .collect();
-    let root = tree.record(0);
-    if root.own > 0 {
-        rows.push((root.own, tree.own_private(0), b"[files]", "[files]".into()));
+    // the root's own files, and of them what deleting them frees
+    if tree.own(root) > 0 {
+        let private = tree.own_private(0);
+        rows.push((tree.own(root), private, b"[files]", "[files]".into()));
     }
     rows.sort_by(|a, b| largest_first((a.0, a.2), (b.0, b.2)));
     for (size, private, _, label) in rows {
@@ -66,14 +69,14 @@ pub fn largest_first(a: (u64, &[u8]), b: (u64, &[u8])) -> Ordering {
 
 /// How many directories could not be read.
 fn count_denied(tree: &impl ReadTree) -> usize {
-    (0..tree.len() as u32)
+    (0..tree.count() as u32)
         .filter(|&i| tree.record(i).flags & Record::DENIED != 0)
         .count()
 }
 
 /// The marker after a directory's name: ` (denied: EACCES)`,
 /// ` (other device)`, ` (partial)` or nothing.
-pub(crate) fn suffix(tree: &impl ReadTree, id: u32) -> String {
+pub(crate) fn suffix(tree: &impl ReadTree, id: FolderId) -> String {
     if let Some(error) = tree.error(id) {
         format!(" (denied: {error})")
     } else if tree.other_device(id) {
@@ -88,6 +91,7 @@ pub(crate) fn suffix(tree: &impl ReadTree, id: u32) -> String {
 /// How sizes print: in powers of 1024 (KiB, MiB, GiB), as `du` and ncdu,
 /// or of 1000 (kB, MB, GB), as Finder and disk makers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Units {
     #[default]
     Binary,
